@@ -734,6 +734,23 @@ async function registerCommandsGlobal() {
   } catch (e) { console.error("❌ Global command registration failed:", e.message); }
 }
 
+// Guild-scoped commands (e.g. left over from earlier testing/iteration, or a
+// stray script) sit ALONGSIDE identically-named global ones and show up as
+// duplicates in Discord's command picker for that server. We only ever
+// register globally, so wipe any leftover per-guild commands on every guild
+// we're currently in.
+async function clearStaleGuildCommands() {
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const existing = await rest.get(Routes.applicationGuildCommands(CLIENT_ID, guild.id));
+      if (!existing.length) continue;
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guild.id), { body: [] });
+      console.log(`🧹 Cleared ${existing.length} stale guild-scoped command(s) in ${guild.name} (${guild.id}) — was causing duplicates.`);
+    } catch (e) { console.error(`⚠️ Failed to clear guild commands for ${guild.name}:`, e.message); }
+  }
+}
+
 // ── Embed Helpers ─────────────────────────────────────────────
 const COLORS = {
   success: 0x00e5a0, warn: 0xf5a623, danger: 0xff3b5c, info: 0x5865f2,
@@ -2085,6 +2102,7 @@ client.once(Events.ClientReady, async () => {
   console.log(`👑 Owner: ${BOT_OWNER_ID}`);
   client.user.setActivity("Protecting the server 🛡️", { type: ActivityType.Watching });
   if (!client.shard || client.shard.ids.includes(0)) await registerCommandsGlobal();
+  await clearStaleGuildCommands(); // per-shard: only this shard's own cached guilds
   await recoverMutes();
 
   // Permission self-audit
@@ -2117,6 +2135,16 @@ process.on("unhandledRejection", e => console.error("unhandledRejection:", e));
 client.on(Events.GuildCreate, async (guild) => {
   console.log(`➕ Joined guild ${guild.name} (${guild.id})`);
   try { snapshotGuild(guild); } catch (_) {}
+  // Clear any stray guild-scoped commands (e.g. from earlier per-guild testing on
+  // this server before Guardian was invited) so nothing duplicates the global set.
+  try {
+    const rest = new REST({ version: "10" }).setToken(TOKEN);
+    const existing = await rest.get(Routes.applicationGuildCommands(CLIENT_ID, guild.id));
+    if (existing.length) {
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guild.id), { body: [] });
+      console.log(`🧹 Cleared ${existing.length} stale guild-scoped command(s) in ${guild.name}`);
+    }
+  } catch (_) {}
   if (config.ownerDM)
     client.users.fetch(BOT_OWNER_ID)
       .then(u => u.send(`➕ Guardian was added to **${guild.name}** (\`${guild.id}\`). Run \`/setup quick\` there to auto-provision a mute role + log channels in one step, then \`/setup roles mod_role:@YourStaffRole\` to finish.`))
