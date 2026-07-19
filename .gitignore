@@ -1,0 +1,16 @@
+node_modules/
+.env
+
+# runtime state (SQLite DB + WAL/SHM + forensic log)
+guardian.db
+guardian.db-wal
+guardian.db-shm
+security_log.jsonl
+
+# legacy JSON state files (migrated into guardian.db on first boot)
+antiping.json
+mutedroles.json
+warnings.json
+guildsettings.json
+guild_snapshot.json
+failsafe_backup.json

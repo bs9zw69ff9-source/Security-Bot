@@ -1,0 +1,20 @@
+{
+  "name": "guardian-bot",
+  "version": "3.0.0",
+  "description": "Multi-server Discord security bot: anti-nuke, anti-raid, anti-spam, snapshots/rollback, per-server config, SQLite persistence.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "start:sharded": "node shard.js",
+    "check": "node --check index.js && node --check shard.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7"
+  }
+}
