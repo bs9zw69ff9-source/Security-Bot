@@ -24,6 +24,26 @@ For very large deployments (~2500+ servers, where Discord requires
 sharding), run `npm run start:sharded` instead — this spawns `shard.js`,
 a `discord.js` `ShardingManager` wrapping `index.js`.
 
+### Per-server setup
+
+In each server, a bot/server owner runs:
+
+```
+/setup quick
+```
+
+This auto-creates a working **Muted** role (with send/speak denied on every
+existing channel) plus a private **Guardian** category with `#mod-logs`,
+`#mod-alerts`, and `#message-logs` channels, and wires them all up —
+no manual role/channel creation or ID-copying required. Pass
+`mod_role:@YourStaffRole` to set the mod role at the same time, or set it
+after with `/setup roles mod_role:@YourStaffRole`. Running `/setup quick`
+again reuses whatever it already created instead of duplicating it.
+
+Other subcommands: `/setup view` (show current config), `/setup roles`,
+`/setup channels`, `/setup whitelist` (anti-nuke immunity), `/setup
+failsafe` (roles targeted by `!failsafe`).
+
 ## Configuration
 
 Behavioral thresholds (spam/raid/nuke detection, rate limits, warn
@@ -32,9 +52,12 @@ escalation) are set via environment variables — see
 sensible defaults.
 
 Per-server identity settings (mod role, mute role, log channels, anti-nuke
-whitelist) are configured live with `/setup` in each server and stored in
-SQLite — they do **not** come from `.env`, so one server's configuration
-never leaks into another's.
+whitelist, failsafe roles) are configured live with `/setup` in each server
+and stored in SQLite — they do **not** come from `.env`, so one server's
+configuration never leaks into another's. Detection/rate-limit state
+(spam counters, join velocity, nuke-response tracking, mod action limits,
+raid/panic lockdown) is likewise tracked per guild in memory, so activity
+in one server never trips detection or drains limits in another.
 
 ### Owner override
 
@@ -50,7 +73,7 @@ permission guard. It also unlocks hidden, non-slash owner commands
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` `/setup` `/config` `/antiping` `/nuketest` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/config` `/antiping` `/nuketest` |
 
 ## Security systems
 
@@ -70,9 +93,10 @@ permission guard. It also unlocks hidden, non-slash owner commands
 - **Snapshots & rollback** — periodic full-guild snapshots (roles +
   channels incl. permission overwrites); `!rollback` recreates whatever a
   snapshot has that's currently missing.
-- **Failsafe** — `!failsafe` backs up and deletes a hardcoded set of
-  roles and kicks every bot in the server; `!restore` rebuilds them
-  (permissions, position, channel access, members) from that backup.
+- **Failsafe** — `!failsafe` backs up and deletes the roles configured
+  via `/setup failsafe` for that server and kicks every bot; `!restore`
+  rebuilds them (permissions, position, channel access, members) from
+  that backup.
 
 ## Data
 
