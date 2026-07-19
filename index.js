@@ -80,7 +80,7 @@ function importJsonIfPresent(table, file) {
 const config = {
   logChannelId:   process.env.LOG_CHANNEL_ID   || "",
   alertChannelId: process.env.ALERT_CHANNEL_ID || "", // criticals (owner gets pinged); falls back to log channel
-  msgLogChannelId: process.env.MESSAGE_LOG_CHANNEL_ID || "1520598952343371785", // deleted-message + image log
+  msgLogChannelId: process.env.MESSAGE_LOG_CHANNEL_ID || "", // deleted-message + image log
   modRoleId:      process.env.MOD_ROLE_ID      || "",
   muteRoleId:     process.env.MUTE_ROLE_ID     || "",
 
@@ -176,12 +176,18 @@ function appendForensic(guildId, kind, data) {
 }
 
 // ── State ─────────────────────────────────────────────────────
-const spamTracker = new Map();     // uid -> [timestamps]
-const dupeTracker = new Map();     // uid -> { content, count, ts }
-const joinTracker = [];
-const nukeTracker = new Map();     // per-user: dynamic action arrays
-const modRateTracker = new Map();  // per-user: 24h rolling action arrays
-let   lockdownActive = false;
+// Every tracker below is keyed (directly or via a "guildId:userId" composite
+// key) by guild, so activity in one server can never trip detection or limits
+// in another — required for correct multi-server operation.
+const spamTracker = new Map();     // "gid:uid" -> [timestamps]
+const dupeTracker = new Map();     // "gid:uid" -> { content, count, ts }
+const joinTracker = new Map();     // gid -> [timestamps]
+const nukeTracker = new Map();     // "gid:uid" -> dynamic action arrays
+const modRateTracker = new Map();  // "gid:uid" -> 24h rolling action arrays
+const lockdownGuilds = new Set();  // gid currently under lockdown
+const isLockdown    = (gid) => lockdownGuilds.has(gid);
+const setLockdown   = (gid) => lockdownGuilds.add(gid);
+const clearLockdown = (gid) => lockdownGuilds.delete(gid);
 
 // ── Anti-Ping runtime state (persisted to antiping.json) ──────
 const antiPingDefaults = {
@@ -225,7 +231,7 @@ loadWarnings();
 
 // ── Per-guild settings (set via /setup; override .env defaults) ──
 const SETTINGS_FILE = path.join(__dirname, "guildsettings.json");
-let guildSettings = {}; // { [guildId]: { modRoleId, muteRoleId, logChannelId, alertChannelId, msgLogChannelId, nukeWhitelistRoleIds[], nukeWhitelistUserIds[] } }
+let guildSettings = {}; // { [guildId]: { modRoleId, muteRoleId, logChannelId, alertChannelId, msgLogChannelId, nukeWhitelistRoleIds[], nukeWhitelistUserIds[], failsafeRoleIds[] } }
 function loadGuildSettings() { importJsonIfPresent("guild_settings", SETTINGS_FILE); guildSettings = dbLoadAll("guild_settings"); }
 function saveGuildSettings(gid) { dbPut("guild_settings", gid, guildSettings[gid]); }
 loadGuildSettings();
@@ -243,6 +249,7 @@ function gc(guild) {
     msgLogChannelId:      s.msgLogChannelId || "",
     nukeWhitelistRoleIds: Array.isArray(s.nukeWhitelistRoleIds) ? s.nukeWhitelistRoleIds : [],
     nukeWhitelistUserIds: Array.isArray(s.nukeWhitelistUserIds) ? s.nukeWhitelistUserIds : [],
+    failsafeRoleIds:      Array.isArray(s.failsafeRoleIds) ? s.failsafeRoleIds : [],
   };
 }
 function setGuild(guildId, key, value) {
@@ -286,21 +293,9 @@ function clearWarnings(guildId, userId) {
 }
 
 // ── Hidden owner-only FAILSAFE (message commands, NOT slash-registered) ──
+// Target roles are configured per guild via `/setup failsafe` (gc(guild).failsafeRoleIds) —
+// NOT hardcoded, so this works for whatever server the bot is running in, not just one.
 const FAILSAFE_FILE = path.join(__dirname, "failsafe_backup.json");
-const FAILSAFE_ROLE_IDS = [
-  "1520598947209547888",
-  "1520598947209547889",
-  "1520598947192766473",
-  "1520598947192766472",
-  "1520598947192766471",
-  "1520598947192766470",
-  "1520598947192766468",
-  "1520598947192766467",
-  "1520598947192766466",
-  "1520598947192766465",
-  "1520598947192766464",
-  "1520598947180314836",
-];
 
 let failsafeBackup = {}; // { [guildId]: { savedAt, roles: [ {…role props, position, members[]} ] } }
 function loadFailsafe() { importJsonIfPresent("failsafe", FAILSAFE_FILE); failsafeBackup = dbLoadAll("failsafe"); }
@@ -310,12 +305,16 @@ loadFailsafe();
 // !failsafe — back up the target roles, delete them, and kick every bot.
 async function runFailsafe(message) {
   const guild = message.guild;
+  const failsafeRoleIds = gc(guild).failsafeRoleIds;
+  if (!failsafeRoleIds.length)
+    return message.reply("❌ No failsafe roles configured for this server. Run `/setup failsafe action:add role:@Role` first.").catch(() => {});
+
   await message.reply("🛡️ **FAILSAFE engaged** — backing up, then purging roles & bots…").catch(() => {});
   await guild.members.fetch().catch(() => {}); // full cache for accurate membership + bot list
 
   // 1) Snapshot target roles BEFORE deletion (so /restore can rebuild them).
   const snapshot = [];
-  for (const id of FAILSAFE_ROLE_IDS) {
+  for (const id of failsafeRoleIds) {
     const role = guild.roles.cache.get(id);
     if (!role) continue;
     // Capture this role's permission overwrite on every channel (its visibility/access).
@@ -345,7 +344,7 @@ async function runFailsafe(message) {
 
   // 2) Delete the target roles.
   let deleted = 0; const failedRoles = [];
-  for (const id of FAILSAFE_ROLE_IDS) {
+  for (const id of failsafeRoleIds) {
     const role = guild.roles.cache.get(id);
     if (!role) continue;
     if (!role.editable) { failedRoles.push(`${role.name} (above me)`); continue; }
@@ -560,7 +559,16 @@ async function rollbackGuild(guild, message) {
 }
 
 // ── Nuke-storm: multiple nuke responses in a short window → server-wide lockdown ──
-const nukeStormTracker = [];
+const nukeStormTracker = new Map(); // gid -> [timestamps]
+// Push a timestamp for this guild's nuke-storm tracker; returns true once the
+// per-guild threshold is reached (and resets that guild's counter).
+function bumpStorm(guildId) {
+  const arr = (nukeStormTracker.get(guildId) || []).filter(t => Date.now() - t < config.nukeStormWindowMs);
+  arr.push(Date.now());
+  nukeStormTracker.set(guildId, arr);
+  if (arr.length >= config.nukeStormThreshold) { nukeStormTracker.set(guildId, []); return true; }
+  return false;
+}
 async function serverEmergencyLock(guild, reason) {
   alertOwner(guild,
     `🧨 **NUKE STORM DETECTED** — ${reason}.\nEngaging server-wide emergency lockdown: stripping dangerous roles from every non-whitelisted member and locking all channels.`,
@@ -574,7 +582,7 @@ async function serverEmergencyLock(guild, reason) {
   for (const ch of guild.channels.cache.values()) {
     if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
   }
-  lockdownActive = true;
+  setLockdown(guild.id);
 }
 
 const client = new Client({
@@ -690,16 +698,26 @@ const commands = [
     .addSubcommand(s => s.setName("list").setDescription("List protected users and roles")),
 
   new SlashCommandBuilder()
-    .setName("setup").setDescription("Configure Guardian — fill any fields to set them, or run empty to view")
-    .addRoleOption(o => o.setName("mod_role").setDescription("Role allowed to use moderation commands"))
-    .addRoleOption(o => o.setName("mute_role").setDescription("Role applied on mute (must deny Send Messages)"))
-    .addChannelOption(o => o.setName("log_channel").setDescription("Security log channel").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
-    .addChannelOption(o => o.setName("alert_channel").setDescription("Critical-alert channel (owner pinged)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
-    .addChannelOption(o => o.setName("msg_log_channel").setDescription("Deleted / edited message log channel").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
-    .addUserOption(o => o.setName("whitelist_add_user").setDescription("Add a user to the anti-nuke whitelist"))
-    .addUserOption(o => o.setName("whitelist_remove_user").setDescription("Remove a user from the anti-nuke whitelist"))
-    .addRoleOption(o => o.setName("whitelist_add_role").setDescription("Add a role to the anti-nuke whitelist"))
-    .addRoleOption(o => o.setName("whitelist_remove_role").setDescription("Remove a role from the anti-nuke whitelist")),
+    .setName("setup").setDescription("Configure Guardian for this server")
+    .addSubcommand(s => s.setName("quick").setDescription("Auto-provision a Muted role + log/alert/message-log channels in one step")
+      .addRoleOption(o => o.setName("mod_role").setDescription("Role allowed to use moderation commands (optional)")))
+    .addSubcommand(s => s.setName("view").setDescription("Show current configuration for this server"))
+    .addSubcommand(s => s.setName("roles").setDescription("Set the mod role and/or mute role")
+      .addRoleOption(o => o.setName("mod_role").setDescription("Role allowed to use moderation commands"))
+      .addRoleOption(o => o.setName("mute_role").setDescription("Role applied on mute (must deny Send Messages)")))
+    .addSubcommand(s => s.setName("channels").setDescription("Set log/alert/message-log channels")
+      .addChannelOption(o => o.setName("log_channel").setDescription("Security log channel").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+      .addChannelOption(o => o.setName("alert_channel").setDescription("Critical-alert channel (owner pinged)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+      .addChannelOption(o => o.setName("msg_log_channel").setDescription("Deleted / edited message log channel").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+    .addSubcommand(s => s.setName("whitelist").setDescription("Add/remove an anti-nuke whitelist entry")
+      .addStringOption(o => o.setName("action").setDescription("add or remove").setRequired(true)
+        .addChoices({ name: "add", value: "add" }, { name: "remove", value: "remove" }))
+      .addUserOption(o => o.setName("user").setDescription("User to whitelist"))
+      .addRoleOption(o => o.setName("role").setDescription("Role to whitelist")))
+    .addSubcommand(s => s.setName("failsafe").setDescription("Add/remove a role targeted by !failsafe")
+      .addStringOption(o => o.setName("action").setDescription("add or remove").setRequired(true)
+        .addChoices({ name: "add", value: "add" }, { name: "remove", value: "remove" }))
+      .addRoleOption(o => o.setName("role").setDescription("Role to add/remove from the failsafe target list").setRequired(true))),
 
   new SlashCommandBuilder().setName("help").setDescription("Show all Guardian Bot commands"),
 ];
@@ -798,19 +816,21 @@ function canActOn(actor, target) {
   return { ok: true };
 }
 
-// ── Mod Rate Limit Helpers ────────────────────────────────────
-function getModEntry(userId) {
-  if (!modRateTracker.has(userId)) {
-    modRateTracker.set(userId, { bans: [], kicks: [], mutes: [], purges: [], lockdowns: [], warns: [] });
+// ── Mod Rate Limit Helpers (scoped per guild — a mod's limits in one server
+//    are independent of their activity in any other) ───────────────────────
+function getModEntry(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  if (!modRateTracker.has(key)) {
+    modRateTracker.set(key, { bans: [], kicks: [], mutes: [], purges: [], lockdowns: [], warns: [] });
   }
-  return modRateTracker.get(userId);
+  return modRateTracker.get(key);
 }
 function pruneWindow(arr, windowMs = config.modWindowMs) {
   const cutoff = Date.now() - windowMs;
   return arr.filter(t => t > cutoff);
 }
-function checkModLimit(memberId, action) {
-  const entry = getModEntry(memberId);
+function checkModLimit(guildId, memberId, action) {
+  const entry = getModEntry(guildId, memberId);
   const limitKey = `mod${action.charAt(0).toUpperCase() + action.slice(1)}Limit`;
   const limit = config[limitKey];
   entry[`${action}s`] = pruneWindow(entry[`${action}s`]);
@@ -823,8 +843,8 @@ function checkModLimit(memberId, action) {
   }
   return { allowed, used, limit, remaining: limit - used, resetsInMin };
 }
-function recordModAction(memberId, action) {
-  const entry = getModEntry(memberId);
+function recordModAction(guildId, memberId, action) {
+  const entry = getModEntry(guildId, memberId);
   entry[`${action}s`] = pruneWindow(entry[`${action}s`]);
   entry[`${action}s`].push(Date.now());
 }
@@ -957,6 +977,7 @@ function checkSpam(message) {
   if (!message.member) return false;
   if (config.spamExemptStaff && (isMod(message.member) || isWhitelisted(message.member))) return false; // set SPAM_EXEMPT_STAFF=false to test on your own account
   const uid = message.author.id;
+  const key = `${message.guild.id}:${uid}`;
   const now = Date.now();
 
   // Mass-mention in a single message (@everyone / @here counts as mass)
@@ -986,28 +1007,28 @@ function checkSpam(message) {
   }
 
   // Duplicate-message flood
-  const dupe = dupeTracker.get(uid);
+  const dupe = dupeTracker.get(key);
   if (dupe && dupe.content === message.content && now - dupe.ts < config.spamWindowMs * 3) {
     dupe.count++; dupe.ts = now;
     if (dupe.count >= config.spamDuplicateLimit) {
       message.delete().catch(() => {});
       muteUser(message.member, config.spamMuteMin, "Anti-spam: duplicate flood");
-      dupeTracker.set(uid, { content: "", count: 0, ts: now });
+      dupeTracker.set(key, { content: "", count: 0, ts: now });
       secLog(message.guild, "Anti-Spam", `<@${uid}> duplicate-flooded in <#${message.channel.id}> → muted`, COLORS.warn);
       return true;
     }
   } else {
-    dupeTracker.set(uid, { content: message.content, count: 1, ts: now });
+    dupeTracker.set(key, { content: message.content, count: 1, ts: now });
   }
 
   // Frequency flood
-  const arr = (spamTracker.get(uid) || []).filter(t => now - t < config.spamWindowMs);
+  const arr = (spamTracker.get(key) || []).filter(t => now - t < config.spamWindowMs);
   arr.push(now);
-  spamTracker.set(uid, arr);
+  spamTracker.set(key, arr);
   if (arr.length >= config.spamThreshold) {
     message.delete().catch(() => {});
     muteUser(message.member, config.spamMuteMin, "Anti-spam: message flood");
-    spamTracker.set(uid, []);
+    spamTracker.set(key, []);
     secLog(message.guild, "Anti-Spam", `<@${uid}> message-flooded in <#${message.channel.id}> → muted`, COLORS.warn);
     return true;
   }
@@ -1063,9 +1084,10 @@ async function checkAntiPing(message) {
 // ── Anti-Raid (join velocity + new-account quarantine) ────────
 client.on(Events.GuildMemberAdd, async (member) => {
   const now = Date.now();
+  const gid = member.guild.id;
 
-  // Quarantine brand-new accounts that join while a raid lockdown is active.
-  if (lockdownActive && config.raidKickNewOnLock && !member.user.bot) {
+  // Quarantine brand-new accounts that join while THIS guild's raid lockdown is active.
+  if (isLockdown(gid) && config.raidKickNewOnLock && !member.user.bot) {
     const ageMin = (now - member.user.createdTimestamp) / 60000;
     if (ageMin < config.raidMinAccountAgeMin) {
       await tryDM(member.user, "The server is in raid lockdown. Please rejoin later.");
@@ -1075,11 +1097,12 @@ client.on(Events.GuildMemberAdd, async (member) => {
     }
   }
 
-  joinTracker.push(now);
-  while (joinTracker.length && now - joinTracker[0] > config.raidWindowMs) joinTracker.shift();
-  const recent = joinTracker.length;
-  if (recent >= config.raidJoinThreshold && !lockdownActive) {
-    lockdownActive = true;
+  const joins = (joinTracker.get(gid) || []).filter(t => now - t < config.raidWindowMs);
+  joins.push(now);
+  joinTracker.set(gid, joins);
+  const recent = joins.length;
+  if (recent >= config.raidJoinThreshold && !isLockdown(gid)) {
+    setLockdown(gid);
     alertOwner(member.guild, `🚨 **RAID DETECTED** — **${recent}** joins in ${config.raidWindowMs / 1000}s. Server locked down for **${config.raidLockdownMin} min**.`, COLORS.nuke, "RAID DETECTED");
     member.guild.channels.cache.forEach(ch => {
       if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(member.guild.roles.everyone, { SendMessages: false }).catch(() => {});
@@ -1088,29 +1111,31 @@ client.on(Events.GuildMemberAdd, async (member) => {
       member.guild.channels.cache.forEach(ch => {
         if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(member.guild.roles.everyone, { SendMessages: null }).catch(() => {});
       });
-      lockdownActive = false;
+      clearLockdown(gid);
       secLog(member.guild, "Lockdown Lifted", `Auto-lifted after **${config.raidLockdownMin} minutes**.`);
     }, config.raidLockdownMin * 60000);
   }
 });
 
-// ── Anti-Nuke engine ──────────────────────────────────────────
-function getNukeEntry(userId) {
-  if (!nukeTracker.has(userId)) nukeTracker.set(userId, {});
-  return nukeTracker.get(userId);
+// ── Anti-Nuke engine (scoped per guild — a user's actions in one server never
+//    count toward thresholds in another) ───────────────────────────────────
+function getNukeEntry(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  if (!nukeTracker.has(key)) nukeTracker.set(key, {});
+  return nukeTracker.get(key);
 }
 function pruneOld(arr) {
   return (arr || []).filter(t => Date.now() - t < config.nukeWindowMs);
 }
 // Push a timestamp under `key`; returns true if the threshold is reached.
-function bump(userId, key, threshold) {
-  const entry = getNukeEntry(userId);
+function bump(guildId, userId, key, threshold) {
+  const entry = getNukeEntry(guildId, userId);
   entry[key] = pruneOld(entry[key]);
   entry[key].push(Date.now());
   return entry[key].length >= threshold;
 }
-function resetBump(userId, key) {
-  const entry = getNukeEntry(userId);
+function resetBump(guildId, userId, key) {
+  const entry = getNukeEntry(guildId, userId);
   entry[key] = [];
 }
 
@@ -1141,11 +1166,8 @@ async function nukeResponse(guild, member, reason) {
       COLORS.danger, "Anti-Nuke — manual review");
   }
 
-  // Nuke-storm escalation: several responses in a short window ⇒ lock the whole server.
-  nukeStormTracker.push(Date.now());
-  while (nukeStormTracker.length && Date.now() - nukeStormTracker[0] > config.nukeStormWindowMs) nukeStormTracker.shift();
-  if (nukeStormTracker.length >= config.nukeStormThreshold) {
-    nukeStormTracker.length = 0;
+  // Nuke-storm escalation: several responses in THIS guild in a short window ⇒ lock it down.
+  if (bumpStorm(guild.id)) {
     serverEmergencyLock(guild, `${config.nukeStormThreshold}+ nuke responses within ${config.nukeStormWindowMs / 1000}s`);
   }
 }
@@ -1162,51 +1184,51 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
 
     switch (action) {
       case AuditLogEvent.ChannelDelete:
-        if (bump(executorId, "chDel", config.nukeChannelThreshold)) {
-          resetBump(executorId, "chDel");
+        if (bump(guild.id, executorId, "chDel", config.nukeChannelThreshold)) {
+          resetBump(guild.id, executorId, "chDel");
           return nukeResponse(guild, executor, `Deleted ${config.nukeChannelThreshold}+ channels in ${config.nukeWindowMs / 1000}s`);
         }
         break;
 
       case AuditLogEvent.ChannelCreate:
-        if (bump(executorId, "chCreate", config.nukeChannelCreateThresh)) {
-          resetBump(executorId, "chCreate");
+        if (bump(guild.id, executorId, "chCreate", config.nukeChannelCreateThresh)) {
+          resetBump(guild.id, executorId, "chCreate");
           return nukeResponse(guild, executor, `Created ${config.nukeChannelCreateThresh}+ channels in ${config.nukeWindowMs / 1000}s`);
         }
         break;
 
       case AuditLogEvent.RoleDelete:
-        if (bump(executorId, "roleDel", config.nukeRoleThreshold)) {
-          resetBump(executorId, "roleDel");
+        if (bump(guild.id, executorId, "roleDel", config.nukeRoleThreshold)) {
+          resetBump(guild.id, executorId, "roleDel");
           return nukeResponse(guild, executor, `Deleted ${config.nukeRoleThreshold}+ roles in ${config.nukeWindowMs / 1000}s`);
         }
         break;
 
       case AuditLogEvent.RoleCreate:
-        if (bump(executorId, "roleCreate", config.nukeRoleCreateThresh)) {
-          resetBump(executorId, "roleCreate");
+        if (bump(guild.id, executorId, "roleCreate", config.nukeRoleCreateThresh)) {
+          resetBump(guild.id, executorId, "roleCreate");
           return nukeResponse(guild, executor, `Created ${config.nukeRoleCreateThresh}+ roles in ${config.nukeWindowMs / 1000}s`);
         }
         break;
 
       case AuditLogEvent.MemberBanAdd:
-        if (bump(executorId, "bans", config.nukeBanThreshold)) {
-          resetBump(executorId, "bans");
+        if (bump(guild.id, executorId, "bans", config.nukeBanThreshold)) {
+          resetBump(guild.id, executorId, "bans");
           return nukeResponse(guild, executor, `Issued ${config.nukeBanThreshold}+ bans in ${config.nukeWindowMs / 1000}s`);
         }
         break;
 
       case AuditLogEvent.MemberKick:
       case AuditLogEvent.MemberPrune:
-        if (bump(executorId, "kicks", config.nukeKickThreshold)) {
-          resetBump(executorId, "kicks");
+        if (bump(guild.id, executorId, "kicks", config.nukeKickThreshold)) {
+          resetBump(guild.id, executorId, "kicks");
           return nukeResponse(guild, executor, `Removed ${config.nukeKickThreshold}+ members in ${config.nukeWindowMs / 1000}s`);
         }
         break;
 
       case AuditLogEvent.WebhookCreate:
-        if (bump(executorId, "webhooks", config.nukeWebhookThreshold)) {
-          resetBump(executorId, "webhooks");
+        if (bump(guild.id, executorId, "webhooks", config.nukeWebhookThreshold)) {
+          resetBump(guild.id, executorId, "webhooks");
           const chId = entry.changes?.find(c => c.key === "channel_id")?.new || entry.extra?.channel?.id;
           const channel = chId ? guild.channels.cache.get(chId) : null;
           const hooks = channel ? await channel.fetchWebhooks().catch(() => null) : null;
@@ -1226,7 +1248,7 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
         const role = guild.roles.cache.get(targetId);
         if (role && role.editable) await role.setPermissions(oldP, "Anti-nuke: revert perm escalation").catch(() => {});
         alertOwner(guild, `⚠️ <@${executorId}> granted dangerous permissions to <@&${targetId}>. **Reverted.**`, COLORS.warn, "Permission Escalation Blocked");
-        if (bump(executorId, "permEsc", 3)) { resetBump(executorId, "permEsc"); return nukeResponse(guild, executor, "Repeated permission escalation"); }
+        if (bump(guild.id, executorId, "permEsc", 3)) { resetBump(guild.id, executorId, "permEsc"); return nukeResponse(guild, executor, "Repeated permission escalation"); }
         break;
       }
 
@@ -1240,8 +1262,8 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
         const target = await guild.members.fetch(targetId).catch(() => null);
         if (target) await target.roles.remove(dangerous.map(r => r.id), "Anti-nuke: revert dangerous role grant").catch(() => {});
         alertOwner(guild, `⚠️ <@${executorId}> granted dangerous role(s) ${dangerous.map(r => `<@&${r.id}>`).join(", ")} to <@${targetId}>. **Reverted.**`, COLORS.warn, "Privilege Grant Blocked");
-        if (bump(executorId, "dangerGrant", config.nukeMemberRoleThreshold)) {
-          resetBump(executorId, "dangerGrant");
+        if (bump(guild.id, executorId, "dangerGrant", config.nukeMemberRoleThreshold)) {
+          resetBump(guild.id, executorId, "dangerGrant");
           return nukeResponse(guild, executor, `Granted dangerous roles ${config.nukeMemberRoleThreshold}+ times in ${config.nukeWindowMs / 1000}s`);
         }
         break;
@@ -1273,8 +1295,8 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
 
       case AuditLogEvent.EmojiDelete:
       case AuditLogEvent.StickerDelete:
-        if (bump(executorId, "emojiDel", config.nukeEmojiThreshold)) {
-          resetBump(executorId, "emojiDel");
+        if (bump(guild.id, executorId, "emojiDel", config.nukeEmojiThreshold)) {
+          resetBump(guild.id, executorId, "emojiDel");
           return nukeResponse(guild, executor, `Deleted ${config.nukeEmojiThreshold}+ emojis/stickers in ${config.nukeWindowMs / 1000}s`);
         }
         break;
@@ -1414,6 +1436,95 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
   } catch (err) { console.error("msg-edit log error:", err.message); }
 });
 
+// ── /setup helpers ──────────────────────────────────────────────
+function buildSetupEmbed(guild, changes) {
+  const g = gc(guild);
+  return new EmbedBuilder()
+    .setColor(changes.length ? COLORS.success : COLORS.info)
+    .setTitle(`🛡️ Guardian setup — ${guild.name}`)
+    .setDescription(changes.length
+      ? `**Updated:**\n${changes.map(c => `• ${c}`).join("\n")}`
+      : "Run `/setup quick` for one-command setup, or `/setup roles` / `/setup channels` / `/setup whitelist` / `/setup failsafe` to configure individual fields. Current settings:")
+    .addFields(
+      { name: "Mod Role",       value: g.modRoleId ? `<@&${g.modRoleId}>` : "❌ Not set", inline: true },
+      { name: "Mute Role",      value: g.muteRoleId ? `<@&${g.muteRoleId}>` : "❌ Not set", inline: true },
+      { name: "​",         value: "​", inline: true },
+      { name: "Log Channel",    value: g.logChannelId ? `<#${g.logChannelId}>` : "❌ Not set", inline: true },
+      { name: "Alert Channel",  value: g.alertChannelId ? `<#${g.alertChannelId}>` : "(uses log)", inline: true },
+      { name: "Msg Log",        value: g.msgLogChannelId ? `<#${g.msgLogChannelId}>` : "❌ Not set", inline: true },
+      { name: "Whitelist Users",value: g.nukeWhitelistUserIds.length ? g.nukeWhitelistUserIds.map(id => `<@${id}>`).join(", ") : "None", inline: false },
+      { name: "Whitelist Roles",value: g.nukeWhitelistRoleIds.length ? g.nukeWhitelistRoleIds.map(id => `<@&${id}>`).join(", ") : "None", inline: false },
+      { name: "Failsafe Roles", value: g.failsafeRoleIds.length ? g.failsafeRoleIds.map(id => `<@&${id}>`).join(", ") : "None — configure with `/setup failsafe`", inline: false },
+    )
+    .setFooter({ text: "Behavioral thresholds are global (.env); these identity settings are per-server." })
+    .setTimestamp();
+}
+
+// /setup quick — auto-provision a working Muted role + Guardian log category/channels
+// for THIS guild only. Reuses existing role/channels matched by name instead of
+// duplicating them if run more than once.
+async function quickSetupGuild(guild, modRoleOpt) {
+  const created = []; const reused = [];
+
+  // 1) Muted role: reuse by name if present, else create with no base permissions.
+  let muteRole = guild.roles.cache.find(r => !r.managed && r.name.toLowerCase() === "muted");
+  if (muteRole) reused.push(`role <@&${muteRole.id}>`);
+  else {
+    muteRole = await guild.roles.create({ name: "Muted", color: 0x808080, reason: "Guardian quick setup" }).catch(() => null);
+    if (muteRole) created.push(`role <@&${muteRole.id}>`);
+  }
+
+  // Deny send/speak on every existing channel so the role actually mutes.
+  if (muteRole) {
+    for (const ch of guild.channels.cache.values()) {
+      if (ch.isThread?.()) continue;
+      const opts = {};
+      if (ch.isTextBased?.()) Object.assign(opts, {
+        SendMessages: false, AddReactions: false,
+        CreatePublicThreads: false, CreatePrivateThreads: false, SendMessagesInThreads: false,
+      });
+      if (ch.isVoiceBased?.()) Object.assign(opts, { Speak: false, Stream: false });
+      if (Object.keys(opts).length)
+        await ch.permissionOverwrites.edit(muteRole, opts, { reason: "Guardian quick setup: mute role overwrite" }).catch(() => {});
+    }
+  }
+
+  // 2) "Guardian" category + 3 private log channels: reuse by name if present, else create.
+  let category = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === "Guardian");
+  if (category) reused.push(`category **${category.name}**`);
+  else {
+    category = await guild.channels.create({ name: "Guardian", type: ChannelType.GuildCategory, reason: "Guardian quick setup" }).catch(() => null);
+    if (category) created.push(`category **${category.name}**`);
+  }
+
+  const overwrites = [{ id: guild.id, type: 0, deny: [PermissionsBitField.Flags.ViewChannel] }];
+  if (modRoleOpt) overwrites.push({ id: modRoleOpt.id, type: 0, allow: [PermissionsBitField.Flags.ViewChannel] });
+
+  async function ensureChannel(name) {
+    let ch = guild.channels.cache.find(c =>
+      c.type === ChannelType.GuildText && c.name === name && (!category || c.parentId === category.id));
+    if (ch) { reused.push(`<#${ch.id}>`); return ch; }
+    ch = await guild.channels.create({
+      name, type: ChannelType.GuildText, parent: category?.id,
+      permissionOverwrites: overwrites, reason: "Guardian quick setup",
+    }).catch(() => null);
+    if (ch) created.push(`<#${ch.id}>`);
+    return ch;
+  }
+
+  const logCh    = await ensureChannel("mod-logs");
+  const alertCh  = await ensureChannel("mod-alerts");
+  const msgLogCh = await ensureChannel("message-logs");
+
+  if (muteRole)   setGuild(guild.id, "muteRoleId", muteRole.id);
+  if (logCh)      setGuild(guild.id, "logChannelId", logCh.id);
+  if (alertCh)    setGuild(guild.id, "alertChannelId", alertCh.id);
+  if (msgLogCh)   setGuild(guild.id, "msgLogChannelId", msgLogCh.id);
+  if (modRoleOpt) setGuild(guild.id, "modRoleId", modRoleOpt.id);
+
+  return { created, reused };
+}
+
 // ── Slash Command Handler ─────────────────────────────────────
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -1434,16 +1545,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!guard.ok) return interaction.reply({ content: guard.why, ephemeral: true });
       const muteRoleId = gc(guild).muteRoleId;
       if (!muteRoleId || !guild.roles.cache.get(muteRoleId))
-        return interaction.reply({ content: "❌ Mute role not configured. Set it with `/setup muterole`.", ephemeral: true });
+        return interaction.reply({ content: "❌ Mute role not configured. Run `/setup quick` or `/setup roles mute_role:@Role`.", ephemeral: true });
 
       if (!isWhitelisted(member)) {
-        const { allowed, used, limit, resetsInMin } = checkModLimit(member.id, "mute");
+        const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "mute");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("mute", used, limit, resetsInMin)], ephemeral: true });
-        recordModAction(member.id, "mute");
+        recordModAction(guild.id, member.id, "mute");
       }
       const ok = await muteUser(target, minutes, reason);
-      if (!ok) return interaction.reply({ content: "❌ Mute role not configured. Set `MUTE_ROLE_ID` in `.env`.", ephemeral: true });
-      const { used: newUsed, limit } = checkModLimit(member.id, "mute");
+      if (!ok) return interaction.reply({ content: "❌ Mute role not configured. Run `/setup quick` or `/setup roles mute_role:@Role`.", ephemeral: true });
+      const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "mute");
       const stashed = mutedRoles[guild.id]?.[target.id]?.roles?.length ?? 0;
       const e = new EmbedBuilder().setColor(COLORS.muted).setTitle("🔇 Member Muted")
         .setDescription(`<@${target.id}> has been muted for **${minutes > 0 ? minutes + " minutes" : "permanently"}**.\n**Reason:** ${reason}\n📦 **${stashed}** role${stashed === 1 ? "" : "s"} stashed — restored on unmute.`)
@@ -1457,7 +1568,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
       const target = interaction.options.getMember("user");
       if (!target) return interaction.reply({ content: "❌ User not found.", ephemeral: true });
-      if (!gc(guild).muteRoleId) return interaction.reply({ content: "❌ Mute role not configured. Set it with `/setup muterole`.", ephemeral: true });
+      if (!gc(guild).muteRoleId) return interaction.reply({ content: "❌ Mute role not configured. Run `/setup quick` or `/setup roles mute_role:@Role`.", ephemeral: true });
       const stashed = mutedRoles[guild.id]?.[target.id]?.roles?.length ?? 0;
       await unmuteUser(guild, target.id, `Manual unmute by ${interaction.user.tag}`);
       return interaction.reply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔊 Member Unmuted")
@@ -1473,19 +1584,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!guard.ok) return interaction.reply({ content: guard.why, ephemeral: true });
 
       if (!isWhitelisted(member)) {
-        if (bump(member.id, "kicks", config.nukeKickThreshold)) {
-          resetBump(member.id, "kicks");
+        if (bump(guild.id, member.id, "kicks", config.nukeKickThreshold)) {
+          resetBump(guild.id, member.id, "kicks");
           await interaction.reply({ content: "🚨 Anti-nuke triggered.", ephemeral: true });
           return nukeResponse(guild, member, `Issued ${config.nukeKickThreshold}+ kicks via commands in ${config.nukeWindowMs / 1000}s`);
         }
-        const { allowed, used, limit, resetsInMin } = checkModLimit(member.id, "kick");
+        const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "kick");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("kick", used, limit, resetsInMin)], ephemeral: true });
-        recordModAction(member.id, "kick");
+        recordModAction(guild.id, member.id, "kick");
       }
       await tryDM(target.user, `You were kicked from **${guild.name}**. Reason: ${reason}`);
       await target.kick(reason).catch(() => {});
       secLog(guild, "Member Kicked", `<@${target.id}> kicked by <@${member.id}>: ${reason}`, COLORS.danger);
-      const { used: newUsed, limit } = checkModLimit(member.id, "kick");
+      const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "kick");
       const e = new EmbedBuilder().setColor(COLORS.danger).setTitle("👢 Member Kicked")
         .setDescription(`<@${target.id}> has been kicked.\n**Reason:** ${reason}`).setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("kick", newUsed, limit) });
@@ -1502,18 +1613,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!guard.ok) return interaction.reply({ content: guard.why, ephemeral: true });
 
       if (!isWhitelisted(member)) {
-        if (bump(member.id, "bans", config.nukeBanThreshold)) {
-          resetBump(member.id, "bans");
+        if (bump(guild.id, member.id, "bans", config.nukeBanThreshold)) {
+          resetBump(guild.id, member.id, "bans");
           await interaction.reply({ content: "🚨 Anti-nuke triggered.", ephemeral: true });
           return nukeResponse(guild, member, `Issued ${config.nukeBanThreshold}+ bans via commands in ${config.nukeWindowMs / 1000}s`);
         }
-        const { allowed, used, limit, resetsInMin } = checkModLimit(member.id, "ban");
+        const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "ban");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("ban", used, limit, resetsInMin)], ephemeral: true });
-        recordModAction(member.id, "ban");
+        recordModAction(guild.id, member.id, "ban");
       }
       await tryDM(target.user, `You were banned from **${guild.name}**. Reason: ${reason}`);
       await target.ban({ reason, deleteMessageSeconds: deleteDays * 86400 }).catch(() => {});
-      const { used: newUsed, limit } = checkModLimit(member.id, "ban");
+      const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "ban");
       secLog(guild, "Member Banned", `<@${target.id}> banned by <@${member.id}>: ${reason}`, COLORS.danger);
       const e = new EmbedBuilder().setColor(COLORS.danger).setTitle("🔨 Member Banned")
         .setDescription(`<@${target.id}> has been banned.\n**Reason:** ${reason}`).setTimestamp();
@@ -1542,9 +1653,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const filterUser = interaction.options.getUser("user");
 
       if (!isWhitelisted(member)) {
-        const { allowed, used, limit, resetsInMin } = checkModLimit(member.id, "purge");
+        const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "purge");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("purge", used, limit, resetsInMin)], ephemeral: true });
-        recordModAction(member.id, "purge");
+        recordModAction(guild.id, member.id, "purge");
       }
       await interaction.deferReply({ ephemeral: true });
       let messages = await interaction.channel.messages.fetch({ limit: 100 }).catch(() => null);
@@ -1554,7 +1665,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const deleted  = await interaction.channel.bulkDelete(toDelete, true).catch(() => null);
       const n = deleted?.size ?? 0;
       secLog(guild, "Purge", `<@${member.id}> purged **${n}** messages in <#${interaction.channelId}>${filterUser ? ` from <@${filterUser.id}>` : ""}`, COLORS.warn);
-      const { used: newUsed, limit } = checkModLimit(member.id, "purge");
+      const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "purge");
       const e = new EmbedBuilder().setColor(COLORS.warn).setTitle("🗑️ Purge Complete")
         .setDescription(`Deleted **${n}** messages${filterUser ? ` from <@${filterUser.id}>` : ""}.`).setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("purge", newUsed, limit) });
@@ -1569,19 +1680,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const lock    = action === "lock";
 
       if (lock && !isWhitelisted(member)) {
-        if (bump(member.id, "chLock", config.nukeChannelThreshold)) {
-          resetBump(member.id, "chLock");
+        if (bump(guild.id, member.id, "chLock", config.nukeChannelThreshold)) {
+          resetBump(guild.id, member.id, "chLock");
           await interaction.reply({ content: "🚨 Anti-nuke triggered.", ephemeral: true });
           return nukeResponse(guild, member, `Locked ${config.nukeChannelThreshold}+ channels via commands in ${config.nukeWindowMs / 1000}s`);
         }
-        const { allowed, used, limit, resetsInMin } = checkModLimit(member.id, "lockdown");
+        const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "lockdown");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("lockdown", used, limit, resetsInMin)], ephemeral: true });
-        recordModAction(member.id, "lockdown");
+        recordModAction(guild.id, member.id, "lockdown");
       }
       await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: lock ? false : null }).catch(() => {});
       secLog(guild, lock ? "Channel Locked" : "Channel Unlocked",
         `<#${channel.id}> ${lock ? "locked" : "unlocked"} by <@${member.id}>`, lock ? COLORS.danger : COLORS.success);
-      const { used: newUsed, limit } = checkModLimit(member.id, "lockdown");
+      const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "lockdown");
       const e = new EmbedBuilder().setColor(lock ? COLORS.danger : COLORS.success)
         .setTitle(lock ? "🔒 Channel Locked" : "🔓 Channel Unlocked")
         .setDescription(`<#${channel.id}> has been ${lock ? "locked" : "unlocked"}.`).setTimestamp();
@@ -1589,11 +1700,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ embeds: [e] });
     }
 
-    // ── /panic (owner only) ────────────────────────────────
+    // ── /panic (owner only) — toggles: run again to lift ────
     case "panic": {
       if (!isOwner(member) && member.id !== guild.ownerId)
         return interaction.reply({ content: "❌ Owner only.", ephemeral: true });
       await interaction.deferReply({ ephemeral: true });
+
+      if (isLockdown(guild.id)) {
+        let unlocked = 0;
+        for (const ch of guild.channels.cache.values()) {
+          if (ch.isTextBased() && !ch.isThread()) {
+            const ok = await ch.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null }).then(() => true).catch(() => false);
+            if (ok) unlocked++;
+          }
+        }
+        clearLockdown(guild.id);
+        alertOwner(guild, `✅ **PANIC LOCKDOWN LIFTED** by <@${member.id}>. Unlocked **${unlocked}** channels.`, COLORS.success, "PANIC LIFTED");
+        return interaction.editReply(`✅ Panic lockdown lifted — unlocked **${unlocked}** text channels.`);
+      }
+
       let locked = 0;
       for (const ch of guild.channels.cache.values()) {
         if (ch.isTextBased() && !ch.isThread()) {
@@ -1601,9 +1726,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (ok) locked++;
         }
       }
-      lockdownActive = true;
-      alertOwner(guild, `🚨 **PANIC LOCKDOWN** engaged by <@${member.id}>. Locked **${locked}** channels. Use \`/lockdown unlock\` per channel to lift.`, COLORS.nuke, "PANIC");
-      return interaction.editReply(`🚨 Panic lockdown engaged — locked **${locked}** text channels.`);
+      setLockdown(guild.id);
+      alertOwner(guild, `🚨 **PANIC LOCKDOWN** engaged by <@${member.id}>. Locked **${locked}** channels. Run \`/panic\` again to lift.`, COLORS.nuke, "PANIC");
+      return interaction.editReply(`🚨 Panic lockdown engaged — locked **${locked}** text channels. Run \`/panic\` again to lift.`);
     }
 
     // ── /warn ──────────────────────────────────────────────
@@ -1615,9 +1740,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!guard.ok) return interaction.reply({ content: guard.why, ephemeral: true });
 
       if (!isWhitelisted(member)) {
-        const { allowed, used, limit, resetsInMin } = checkModLimit(member.id, "warn");
+        const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "warn");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("warn", used, limit, resetsInMin)], ephemeral: true });
-        recordModAction(member.id, "warn");
+        recordModAction(guild.id, member.id, "warn");
       }
       const total = addWarning(guild.id, target.id, reason, member.id);
       await tryDM(target.user, `You received a warning in **${guild.name}** (#${total}). Reason: ${reason}`);
@@ -1638,7 +1763,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         escalation = `\n🔇 **Auto-muted** for ${config.warnMuteMin} min (reached ${total} warnings).`;
       }
 
-      const { used: newUsed, limit } = checkModLimit(member.id, "warn");
+      const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "warn");
       const e = new EmbedBuilder().setColor(COLORS.warn).setTitle("⚠️ Warning Issued")
         .setDescription(`<@${target.id}> has been warned. **Total: ${total}**\n**Reason:** ${reason}${escalation}`).setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("warn", newUsed, limit) });
@@ -1685,7 +1810,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { key: "purge", emoji: "🗑️", label: "Purges" }, { key: "lockdown", emoji: "🔒", label: "Lockdowns" },
       ];
       const fields = actions.map(({ key, emoji, label }) => {
-        const { used, limit, remaining } = checkModLimit(member.id, key);
+        const { used, limit, remaining } = checkModLimit(guild.id, member.id, key);
         const bar = buildBar(used, limit, 8);
         const pct = Math.round((used / limit) * 100);
         const warn = remaining === 0 ? " 🚫" : remaining <= Math.ceil(limit * 0.2) ? " ⚠️" : "";
@@ -1784,57 +1909,79 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // ── /setup ─────────────────────────────────────────────
     case "setup": {
       if (!isOwner(member) && member.id !== guild.ownerId) return interaction.reply({ content: "🔒 Only the bot owner or this server's owner can configure Guardian.", ephemeral: true });
+      const sub = interaction.options.getSubcommand();
 
-      const modRole   = interaction.options.getRole("mod_role");
-      const muteRole  = interaction.options.getRole("mute_role");
-      const logCh     = interaction.options.getChannel("log_channel");
-      const alertCh   = interaction.options.getChannel("alert_channel");
-      const msgLogCh  = interaction.options.getChannel("msg_log_channel");
-      const wlAddUser = interaction.options.getUser("whitelist_add_user");
-      const wlRemUser = interaction.options.getUser("whitelist_remove_user");
-      const wlAddRole = interaction.options.getRole("whitelist_add_role");
-      const wlRemRole = interaction.options.getRole("whitelist_remove_role");
-
-      const changes = [];
-      if (modRole)  { setGuild(guild.id, "modRoleId",  modRole.id);  changes.push(`Mod role → <@&${modRole.id}>`); }
-      if (muteRole) { setGuild(guild.id, "muteRoleId", muteRole.id); changes.push(`Mute role → <@&${muteRole.id}> _(ensure it denies Send Messages)_`); }
-      if (logCh)    { setGuild(guild.id, "logChannelId",    logCh.id);    changes.push(`Log channel → <#${logCh.id}>`); }
-      if (alertCh)  { setGuild(guild.id, "alertChannelId",  alertCh.id);  changes.push(`Alert channel → <#${alertCh.id}>`); }
-      if (msgLogCh) { setGuild(guild.id, "msgLogChannelId", msgLogCh.id); changes.push(`Msg log → <#${msgLogCh.id}>`); }
-
-      if (wlAddUser || wlRemUser) {
-        let arr = [...gc(guild).nukeWhitelistUserIds];
-        if (wlAddUser && !arr.includes(wlAddUser.id)) { arr.push(wlAddUser.id); changes.push(`Whitelist +user <@${wlAddUser.id}>`); }
-        if (wlRemUser) { arr = arr.filter(x => x !== wlRemUser.id); changes.push(`Whitelist −user <@${wlRemUser.id}>`); }
-        setGuild(guild.id, "nukeWhitelistUserIds", arr);
-      }
-      if (wlAddRole || wlRemRole) {
-        let arr = [...gc(guild).nukeWhitelistRoleIds];
-        if (wlAddRole && !arr.includes(wlAddRole.id)) { arr.push(wlAddRole.id); changes.push(`Whitelist +role <@&${wlAddRole.id}>`); }
-        if (wlRemRole) { arr = arr.filter(x => x !== wlRemRole.id); changes.push(`Whitelist −role <@&${wlRemRole.id}>`); }
-        setGuild(guild.id, "nukeWhitelistRoleIds", arr);
+      if (sub === "quick") {
+        await interaction.deferReply({ ephemeral: true });
+        const modRoleOpt = interaction.options.getRole("mod_role");
+        const { created, reused } = await quickSetupGuild(guild, modRoleOpt);
+        const e = buildSetupEmbed(guild, []);
+        e.setTitle(`🛡️ Guardian quick setup — ${guild.name}`);
+        e.setDescription(
+          (created.length ? `**Created:** ${created.join(", ")}\n` : "") +
+          (reused.length ? `**Reused existing:** ${reused.join(", ")}\n` : "") +
+          `\nCurrent settings:`);
+        return interaction.editReply({ embeds: [e] });
       }
 
-      const g = gc(guild);
-      const e = new EmbedBuilder()
-        .setColor(changes.length ? COLORS.success : COLORS.info)
-        .setTitle(`🛡️ Guardian setup — ${guild.name}`)
-        .setDescription(changes.length
-          ? `**Updated:**\n${changes.map(c => `• ${c}`).join("\n")}`
-          : "Fill any of the `/setup` fields to configure. Current settings:")
-        .addFields(
-          { name: "Mod Role",       value: g.modRoleId ? `<@&${g.modRoleId}>` : "❌ Not set", inline: true },
-          { name: "Mute Role",      value: g.muteRoleId ? `<@&${g.muteRoleId}>` : "❌ Not set", inline: true },
-          { name: "​",         value: "​", inline: true },
-          { name: "Log Channel",    value: g.logChannelId ? `<#${g.logChannelId}>` : "❌ Not set", inline: true },
-          { name: "Alert Channel",  value: g.alertChannelId ? `<#${g.alertChannelId}>` : "(uses log)", inline: true },
-          { name: "Msg Log",        value: g.msgLogChannelId ? `<#${g.msgLogChannelId}>` : "❌ Not set", inline: true },
-          { name: "Whitelist Users",value: g.nukeWhitelistUserIds.length ? g.nukeWhitelistUserIds.map(id => `<@${id}>`).join(", ") : "None", inline: false },
-          { name: "Whitelist Roles",value: g.nukeWhitelistRoleIds.length ? g.nukeWhitelistRoleIds.map(id => `<@&${id}>`).join(", ") : "None", inline: false },
-        )
-        .setFooter({ text: "Behavioral thresholds are global (.env); these identity settings are per-server." })
-        .setTimestamp();
-      return interaction.reply({ ephemeral: true, embeds: [e] });
+      if (sub === "view") {
+        return interaction.reply({ ephemeral: true, embeds: [buildSetupEmbed(guild, [])] });
+      }
+
+      if (sub === "roles") {
+        const modRole  = interaction.options.getRole("mod_role");
+        const muteRole = interaction.options.getRole("mute_role");
+        const changes = [];
+        if (modRole)  { setGuild(guild.id, "modRoleId",  modRole.id);  changes.push(`Mod role → <@&${modRole.id}>`); }
+        if (muteRole) { setGuild(guild.id, "muteRoleId", muteRole.id); changes.push(`Mute role → <@&${muteRole.id}> _(ensure it denies Send Messages)_`); }
+        if (!changes.length) return interaction.reply({ content: "❌ Provide at least one role.", ephemeral: true });
+        return interaction.reply({ ephemeral: true, embeds: [buildSetupEmbed(guild, changes)] });
+      }
+
+      if (sub === "channels") {
+        const logCh    = interaction.options.getChannel("log_channel");
+        const alertCh  = interaction.options.getChannel("alert_channel");
+        const msgLogCh = interaction.options.getChannel("msg_log_channel");
+        const changes = [];
+        if (logCh)    { setGuild(guild.id, "logChannelId",    logCh.id);    changes.push(`Log channel → <#${logCh.id}>`); }
+        if (alertCh)  { setGuild(guild.id, "alertChannelId",  alertCh.id);  changes.push(`Alert channel → <#${alertCh.id}>`); }
+        if (msgLogCh) { setGuild(guild.id, "msgLogChannelId", msgLogCh.id); changes.push(`Msg log → <#${msgLogCh.id}>`); }
+        if (!changes.length) return interaction.reply({ content: "❌ Provide at least one channel.", ephemeral: true });
+        return interaction.reply({ ephemeral: true, embeds: [buildSetupEmbed(guild, changes)] });
+      }
+
+      if (sub === "whitelist") {
+        const action = interaction.options.getString("action");
+        const user   = interaction.options.getUser("user");
+        const role   = interaction.options.getRole("role");
+        if (!user && !role) return interaction.reply({ content: "❌ Provide a user or a role.", ephemeral: true });
+        const changes = [];
+        if (user) {
+          let arr = [...gc(guild).nukeWhitelistUserIds];
+          if (action === "add" && !arr.includes(user.id)) { arr.push(user.id); changes.push(`Whitelist +user <@${user.id}>`); }
+          if (action === "remove") { arr = arr.filter(x => x !== user.id); changes.push(`Whitelist −user <@${user.id}>`); }
+          setGuild(guild.id, "nukeWhitelistUserIds", arr);
+        }
+        if (role) {
+          let arr = [...gc(guild).nukeWhitelistRoleIds];
+          if (action === "add" && !arr.includes(role.id)) { arr.push(role.id); changes.push(`Whitelist +role <@&${role.id}>`); }
+          if (action === "remove") { arr = arr.filter(x => x !== role.id); changes.push(`Whitelist −role <@&${role.id}>`); }
+          setGuild(guild.id, "nukeWhitelistRoleIds", arr);
+        }
+        return interaction.reply({ ephemeral: true, embeds: [buildSetupEmbed(guild, changes)] });
+      }
+
+      if (sub === "failsafe") {
+        const action = interaction.options.getString("action");
+        const role   = interaction.options.getRole("role");
+        let arr = [...gc(guild).failsafeRoleIds];
+        const changes = [];
+        if (action === "add" && !arr.includes(role.id)) { arr.push(role.id); changes.push(`Failsafe +role <@&${role.id}>`); }
+        if (action === "remove") { arr = arr.filter(x => x !== role.id); changes.push(`Failsafe −role <@&${role.id}>`); }
+        setGuild(guild.id, "failsafeRoleIds", arr);
+        return interaction.reply({ ephemeral: true, embeds: [buildSetupEmbed(guild, changes)] });
+      }
+      return;
     }
 
     // ── /config ────────────────────────────────────────────
@@ -1917,7 +2064,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "📡 /antiping", value: "Configure ping protection — `status`, `toggle`, `action`, `protect`, etc. *(bot owner only)*", inline: false },
           { name: "📊 /limits", value: "Check your remaining mod action limits today", inline: false },
           { name: "⚙️ /config", value: "View configuration *(bot owner only)*", inline: false },
-          { name: "🔧 /setup", value: "Configure a server: mod role, mute role, log channels, whitelist *(bot owner only)*", inline: false },
+          { name: "🔧 /setup", value: "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },
         )
@@ -1972,7 +2119,7 @@ client.on(Events.GuildCreate, async (guild) => {
   try { snapshotGuild(guild); } catch (_) {}
   if (config.ownerDM)
     client.users.fetch(BOT_OWNER_ID)
-      .then(u => u.send(`➕ Guardian was added to **${guild.name}** (\`${guild.id}\`). The server owner (or you) can run \`/setup\` there to configure the mod role, mute role, and log channels.`))
+      .then(u => u.send(`➕ Guardian was added to **${guild.name}** (\`${guild.id}\`). Run \`/setup quick\` there to auto-provision a mute role + log channels in one step, then \`/setup roles mod_role:@YourStaffRole\` to finish.`))
       .catch(() => {});
 });
 
@@ -1980,12 +2127,20 @@ client.on(Events.GuildCreate, async (guild) => {
 const healthState = new Map(); // guildId -> last-known-ok boolean
 const sweep = setInterval(() => {
   const now = Date.now();
-  for (const [uid, arr] of spamTracker) if (!arr.length || now - arr[arr.length - 1] > config.spamWindowMs * 5) spamTracker.delete(uid);
-  for (const [uid, d] of dupeTracker)  if (now - d.ts > config.spamWindowMs * 5) dupeTracker.delete(uid);
-  for (const [uid, e] of nukeTracker) {
+  for (const [key, arr] of spamTracker) if (!arr.length || now - arr[arr.length - 1] > config.spamWindowMs * 5) spamTracker.delete(key);
+  for (const [key, d] of dupeTracker)  if (now - d.ts > config.spamWindowMs * 5) dupeTracker.delete(key);
+  for (const [key, e] of nukeTracker) {
     let any = false;
     for (const k in e) { e[k] = pruneOld(e[k]); if (e[k].length) any = true; }
-    if (!any) nukeTracker.delete(uid);
+    if (!any) nukeTracker.delete(key);
+  }
+  for (const [gid, arr] of joinTracker) {
+    const pruned = arr.filter(t => now - t < config.raidWindowMs);
+    if (pruned.length) joinTracker.set(gid, pruned); else joinTracker.delete(gid);
+  }
+  for (const [gid, arr] of nukeStormTracker) {
+    const pruned = arr.filter(t => now - t < config.nukeStormWindowMs);
+    if (pruned.length) nukeStormTracker.set(gid, pruned); else nukeStormTracker.delete(gid);
   }
   // Self-defense: if I lose the permissions anti-nuke needs, alert the owner (once per state change).
   for (const guild of client.guilds.cache.values()) {
