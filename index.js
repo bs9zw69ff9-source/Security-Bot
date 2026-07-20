@@ -1,6 +1,6 @@
 // ============================================================
-//  GUARDIAN BOT — Discord Security Bot (multi-server)
-//  v3 — SQLite persistence, global commands, shard-ready
+//  GUARDIAN BOT - Discord Security Bot (multi-server)
+//  v3 - SQLite persistence, global commands, shard-ready
 //  Required: npm install discord.js dotenv better-sqlite3
 //  Optional (scale >2500 servers): run `node shard.js` instead of `node index.js`
 // ============================================================
@@ -27,7 +27,7 @@ const GUILD_ID  = process.env.GUILD_ID;
 // BOT_OWNER_IDS (comma-separated) and/or BOT_OWNER_ID (singular, kept for
 // backward compatibility) are merged into one trusted set. Falls back to the
 // original hardcoded default if neither env var is set, so this still runs
-// out of the box — override it for any real deployment.
+// out of the box - override it for any real deployment.
 const configuredOwnerIds = [
   ...(process.env.BOT_OWNER_IDS || "").split(",").map(s => s.trim()).filter(Boolean),
   ...(process.env.BOT_OWNER_ID ? [process.env.BOT_OWNER_ID.trim()] : []),
@@ -134,7 +134,7 @@ const config = {
   scamBlock:          process.env.SCAM_BLOCK !== "false",                     // delete + mute on scam/phishing/grabber links
   ownerDM:            process.env.OWNER_DM   !== "false",                     // DM the owner on criticals (survives a nuked log channel)
 
-  // ── Mod rate limits (24-hour rolling window, mods only — whitelisted users exempt) ──
+  // ── Mod rate limits (24-hour rolling window, mods only - whitelisted users exempt) ──
   modBanLimit:      parseInt(process.env.MOD_BAN_LIMIT)      || 3,
   modKickLimit:     parseInt(process.env.MOD_KICK_LIMIT)     || 10,
   modMuteLimit:     parseInt(process.env.MOD_MUTE_LIMIT)     || 20,
@@ -178,7 +178,7 @@ const INVITE_RE = /(discord\.(gg|io|me|li)|discordapp\.com\/invite|discord\.com\
 // High-precision scam/grabber patterns (typo-squats + known IP grabbers). Kept tight to avoid false positives.
 const SCAM_RE = /(dlscord|disc0rd|discocrd|dlscordnitro|steamcommunilty|steancommunity|grabify\.link|iplogger\.(org|com|ru|co)|discordapp\.(ru|info)|free-?nitro-?gen|nitro-?free-?gift)/i;
 
-// Local forensic trail — appended for every security event; survives a wiped log channel.
+// Local forensic trail - appended for every security event; survives a wiped log channel.
 const FORENSIC_FILE = path.join(__dirname, "security_log.jsonl");
 function appendForensic(guildId, kind, data) {
   try { fs.appendFileSync(FORENSIC_FILE, JSON.stringify({ t: new Date().toISOString(), guildId, kind, ...data }) + "\n"); }
@@ -188,13 +188,13 @@ function appendForensic(guildId, kind, data) {
 // ── State ─────────────────────────────────────────────────────
 // Every tracker below is keyed (directly or via a "guildId:userId" composite
 // key) by guild, so activity in one server can never trip detection or limits
-// in another — required for correct multi-server operation.
+// in another - required for correct multi-server operation.
 //
 // spamTracker/dupeTracker/joinTracker/nukeTracker/nukeStormTracker are
 // deliberately in-memory only: their windows are seconds, so a restart
 // naturally (and safely) interrupting a fast burst is fine, and persisting
 // sub-minute counters isn't worth the write overhead. modRateTracker
-// (24h limits) and lockdown state are NOT — losing those on restart would
+// (24h limits) and lockdown state are NOT - losing those on restart would
 // silently reset a mod's daily limits or drop a guild out of an active
 // raid/panic lockdown, so both are persisted to SQLite (write-through, same
 // pattern as guild settings / warnings / muted roles).
@@ -281,7 +281,7 @@ function loadGuildSettings() { importJsonIfPresent("guild_settings", SETTINGS_FI
 function saveGuildSettings(gid) { dbPut("guild_settings", gid, guildSettings[gid]); }
 loadGuildSettings();
 
-// Effective per-guild config — STRICTLY per server (no global fallback, so one
+// Effective per-guild config - STRICTLY per server (no global fallback, so one
 // guild's channels/roles/whitelist can never leak into another).
 function gc(guild) {
   const id = typeof guild === "string" ? guild : guild?.id;
@@ -304,7 +304,7 @@ function setGuild(guildId, key, value) {
 }
 
 // One-time backward-compat: if legacy .env identity values are set, seed them into
-// the HOME guild (GUILD_ID) ONLY — never applied globally, so other servers stay clean.
+// the HOME guild (GUILD_ID) ONLY - never applied globally, so other servers stay clean.
 function migrateEnvToHomeGuild() {
   if (!GUILD_ID) return;
   const envDefaults = {
@@ -371,7 +371,7 @@ function findOpenTicketByUser(guildId, userId, typeKey) {
 
 // One-time seed: pre-configure the exact ticket types + panel channel requested
 // for the HOME guild (GUILD_ID) only, if nothing's configured yet. Never
-// overwrites an existing configuration, and never applies to any other guild —
+// overwrites an existing configuration, and never applies to any other guild -
 // use `/tickets addtype` / `/tickets panel` for any other server.
 function migrateTicketsToHomeGuild() {
   if (!GUILD_ID) return;
@@ -405,7 +405,7 @@ function clearWarnings(guildId, userId) {
 }
 
 // ── Hidden owner-only FAILSAFE (message commands, NOT slash-registered) ──
-// Target roles are configured per guild via `/setup failsafe` (gc(guild).failsafeRoleIds) —
+// Target roles are configured per guild via `/setup failsafe` (gc(guild).failsafeRoleIds) -
 // NOT hardcoded, so this works for whatever server the bot is running in, not just one.
 const FAILSAFE_FILE = path.join(__dirname, "failsafe_backup.json");
 
@@ -414,14 +414,14 @@ function loadFailsafe() { importJsonIfPresent("failsafe", FAILSAFE_FILE); failsa
 function saveFailsafe(gid) { dbPut("failsafe", gid, failsafeBackup[gid]); }
 loadFailsafe();
 
-// !failsafe — back up the target roles, delete them, and kick every bot.
+// !failsafe - back up the target roles, delete them, and kick every bot.
 async function runFailsafe(message) {
   const guild = message.guild;
   const failsafeRoleIds = gc(guild).failsafeRoleIds;
   if (!failsafeRoleIds.length)
     return message.reply("❌ No failsafe roles configured for this server. Run `/setup failsafe action:add role:@Role` first.").catch(() => {});
 
-  await message.reply("🛡️ **FAILSAFE engaged** — backing up, then purging roles & bots…").catch(() => {});
+  await message.reply("🛡️ **FAILSAFE engaged** - backing up, then purging roles & bots…").catch(() => {});
   await guild.members.fetch().catch(() => {}); // full cache for accurate membership + bot list
 
   // 1) Snapshot target roles BEFORE deletion (so /restore can rebuild them).
@@ -475,14 +475,14 @@ async function runFailsafe(message) {
   const report =
     `🛡️ **Failsafe complete.**\n` +
     `• Roles backed up: **${snapshot.length}**\n` +
-    `• Roles deleted: **${deleted}**` + (failedRoles.length ? ` — failed: ${failedRoles.join(", ")}` : "") + `\n` +
-    `• Bots kicked: **${kicked}**` + (failedBots.length ? ` — failed: ${failedBots.join(", ")}` : "") + `\n` +
+    `• Roles deleted: **${deleted}**` + (failedRoles.length ? ` - failed: ${failedRoles.join(", ")}` : "") + `\n` +
+    `• Bots kicked: **${kicked}**` + (failedBots.length ? ` - failed: ${failedBots.join(", ")}` : "") + `\n` +
     `Run \`!restore\` to rebuild the roles.`;
   await message.reply(report).catch(() => {});
   alertOwner(guild, report, COLORS.nuke, "FAILSAFE");
 }
 
-// !restore — recreate the backed-up roles exactly, in the same position, with members.
+// !restore - recreate the backed-up roles exactly, in the same position, with members.
 async function runRestore(message) {
   const guild = message.guild;
   const backup = failsafeBackup[guild.id];
@@ -542,10 +542,10 @@ async function runRestore(message) {
 
   const report =
     `♻️ **Restore complete.**\n` +
-    `• Roles recreated: **${created.length}/${backup.roles.length}**` + (failed.length ? ` — failed: ${failed.join(", ")}` : "") + `\n` +
+    `• Roles recreated: **${created.length}/${backup.roles.length}**` + (failed.length ? ` - failed: ${failed.join(", ")}` : "") + `\n` +
     `• Channel overwrites restored: **${owRestored}**\n` +
     `• Member assignments restored: **${reassigned}**\n` +
-    `_Note: recreated roles get new IDs (Discord assigns them) — names, colors, permissions, positions, channel access, and members are preserved._`;
+    `_Note: recreated roles get new IDs (Discord assigns them) - names, colors, permissions, positions, channel access, and members are preserved._`;
   await message.reply(report).catch(() => {});
   alertOwner(guild, report, COLORS.success, "FAILSAFE RESTORE");
 }
@@ -591,7 +591,7 @@ async function snapshotGuild(guild) {
 // not in the snapshot (roles/channels), corrects anything that drifted
 // (permissions, overwrites, channel settings), re-syncs role membership to
 // match exactly (adds AND removes), and recreates anything missing.
-// Destructive by design — requires a ✅ confirmation before touching anything.
+// Destructive by design - requires a ✅ confirmation before touching anything.
 async function rollbackGuild(guild, message) {
   const snap = (snapshots[guild.id] || []).slice(-1)[0];
   if (!snap) { message?.reply("❌ No snapshot available yet. Run `!snapshot` first."); return; }
@@ -614,7 +614,7 @@ async function rollbackGuild(guild, message) {
       `• **Delete ${extraChannels.size}** channel(s) not in that snapshot\n` +
       `• Correct permissions/overwrites on everything else to match exactly\n` +
       `• Re-sync role membership to match the snapshot (adds **and** removes members)\n\n` +
-      `Anything created since the snapshot was taken — legitimate or not — will be deleted. ` +
+      `Anything created since the snapshot was taken - legitimate or not - will be deleted. ` +
       `React with ✅ within 30s to confirm, or ignore to cancel.`
     ).catch(() => null);
     if (!warning) return;
@@ -624,12 +624,12 @@ async function rollbackGuild(guild, message) {
       max: 1, time: 30000,
     }).catch(() => null);
     if (!collected || !collected.size) {
-      await message.reply("❌ Rollback cancelled — no confirmation received within 30s.").catch(() => {});
+      await message.reply("❌ Rollback cancelled - no confirmation received within 30s.").catch(() => {});
       return;
     }
   }
 
-  message?.reply(`♻️ **Rolling back** to snapshot from <t:${Math.floor(snap.takenAt / 1000)}:R> — deleting extras, correcting drift, recreating missing…`).catch(() => {});
+  message?.reply(`♻️ **Rolling back** to snapshot from <t:${Math.floor(snap.takenAt / 1000)}:R> - deleting extras, correcting drift, recreating missing…`).catch(() => {});
 
   // 1) Delete anything not in the snapshot. Channels before categories so an
   //    emptied category isn't left behind pointlessly (not required, just tidy).
@@ -695,7 +695,7 @@ async function rollbackGuild(guild, message) {
     for (const o of ows) {
       let id = o.id;
       if (o.type === 0) { // role overwrite
-        if (id === guild.id) { /* @everyone — id stable */ }
+        if (id === guild.id) { /* @everyone - id stable */ }
         else if (roleMap[id]) id = roleMap[id].id;
         else continue; // references a role that no longer exists and wasn't recreated
       }
@@ -774,7 +774,7 @@ function bumpStorm(guildId) {
 }
 async function serverEmergencyLock(guild, reason) {
   alertOwner(guild,
-    `🧨 **NUKE STORM DETECTED** — ${reason}.\nEngaging server-wide emergency lockdown: stripping dangerous roles from every non-whitelisted member and locking all channels.`,
+    `🧨 **NUKE STORM DETECTED** - ${reason}.\nEngaging server-wide emergency lockdown: stripping dangerous roles from every non-whitelisted member and locking all channels.`,
     COLORS.nuke, "NUKE STORM LOCKDOWN");
   await guild.members.fetch().catch(() => {});
   for (const m of guild.members.cache.values()) {
@@ -889,7 +889,7 @@ const commands = [
       .addBooleanOption(o => o.setName("enabled").setDescription("True to delete").setRequired(true)))
     .addSubcommand(s => s.setName("ignorereplies").setDescription("Ignore reply-pings?")
       .addBooleanOption(o => o.setName("enabled").setDescription("True to ignore reply pings").setRequired(true)))
-    .addSubcommand(s => s.setName("response").setDescription("Customize the warning message — {user} {targets} {action}")
+    .addSubcommand(s => s.setName("response").setDescription("Customize the warning message - {user} {targets} {action}")
       .addStringOption(o => o.setName("text").setDescription("Template text, or 'default' to reset").setRequired(true)))
     .addSubcommand(s => s.setName("notify").setDescription("Post the public warning message in the channel?")
       .addBooleanOption(o => o.setName("enabled").setDescription("True to post warning in channel").setRequired(true)))
@@ -943,7 +943,7 @@ const commands = [
   new SlashCommandBuilder().setName("help").setDescription("Show all Guardian Bot commands"),
 ];
 
-// ── Register Commands (GLOBAL — one registration serves every server, present
+// ── Register Commands (GLOBAL - one registration serves every server, present
 //    and future; propagation can take up to ~1h, like Wick/large bots) ──
 const commandBody = () => commands.map(c => c.toJSON());
 async function registerCommandsGlobal() {
@@ -967,7 +967,7 @@ async function clearStaleGuildCommands() {
       const existing = await rest.get(Routes.applicationGuildCommands(CLIENT_ID, guild.id));
       if (!existing.length) continue;
       await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guild.id), { body: [] });
-      console.log(`🧹 Cleared ${existing.length} stale guild-scoped command(s) in ${guild.name} (${guild.id}) — was causing duplicates.`);
+      console.log(`🧹 Cleared ${existing.length} stale guild-scoped command(s) in ${guild.name} (${guild.id}) - was causing duplicates.`);
     } catch (e) { console.error(`⚠️ Failed to clear guild commands for ${guild.name}:`, e.message); }
   }
 }
@@ -1043,20 +1043,20 @@ async function tryDM(user, text) {
 // Guard: can `actor` moderate `target`? Protects owner/whitelist and respects hierarchy.
 function canActOn(actor, target) {
   if (!target) return { ok: false, why: "❌ User not found in this server." };
-  if (isOwner(target)) return { ok: false, why: "❌ That user is the bot owner — protected." };
-  if (target.id === target.guild.ownerId) return { ok: false, why: "❌ That user is the server owner — protected." };
-  if (isWhitelisted(target)) return { ok: false, why: "❌ That user is whitelisted — protected." };
+  if (isOwner(target)) return { ok: false, why: "❌ That user is the bot owner - protected." };
+  if (target.id === target.guild.ownerId) return { ok: false, why: "❌ That user is the server owner - protected." };
+  if (isWhitelisted(target)) return { ok: false, why: "❌ That user is whitelisted - protected." };
   if (target.id === actor.id) return { ok: false, why: "❌ You can't action yourself." };
   const me = target.guild.members.me;
   if (me && target.roles.highest.position >= me.roles.highest.position)
-    return { ok: false, why: "❌ That user's highest role is above mine — fix my role position." };
+    return { ok: false, why: "❌ That user's highest role is above mine - fix my role position." };
   const actorPrivileged = isOwner(actor) || actor.id === actor.guild.ownerId;
   if (!actorPrivileged && target.roles.highest.position >= actor.roles.highest.position)
     return { ok: false, why: "❌ That user's role is equal to or higher than yours." };
   return { ok: true };
 }
 
-// ── Mod Rate Limit Helpers (scoped + persisted per guild — a mod's limits in
+// ── Mod Rate Limit Helpers (scoped + persisted per guild - a mod's limits in
 //    one server are independent of, and survive restarts independently of,
 //    their activity in any other) ───────────────────────────────────────────
 function getModEntry(guildId, userId) {
@@ -1139,7 +1139,7 @@ async function muteUser(member, durationMin, reason) {
     r.id !== member.guild.id && r.id !== muteRole.id && (r.managed || !r.editable));
 
   try {
-    if (strippedIds.length) await member.roles.remove(strippedIds, `Mute: stash roles — ${reason}`);
+    if (strippedIds.length) await member.roles.remove(strippedIds, `Mute: stash roles - ${reason}`);
     await member.roles.add(muteRole, reason);
   } catch (e) { console.error("⚠️ mute role op failed:", e.message); }
 
@@ -1154,7 +1154,7 @@ async function muteUser(member, durationMin, reason) {
 
   const stash = mutedRoles[member.guild.id][member.id].roles;
   secLog(member.guild, "Member Muted",
-    `<@${member.id}> muted for **${durationMin > 0 ? durationMin + " min" : "permanent"}** — ${reason}\n` +
+    `<@${member.id}> muted for **${durationMin > 0 ? durationMin + " min" : "permanent"}** - ${reason}\n` +
     `📦 Stashed **${stash.length}** role${stash.length === 1 ? "" : "s"}: ${stash.length ? stash.map(id => `<@&${id}>`).join(", ") : "none"}` +
     (unstrippable.size ? `\n⚠️ Couldn't strip (managed / above bot): ${unstrippable.map(r => `<@&${r.id}>`).join(", ")}` : ""),
     COLORS.muted);
@@ -1182,13 +1182,13 @@ async function unmuteUser(guild, userId, reason = "Unmute") {
         return r && r.editable && !r.managed;
       });
       const lost = stash.roles.filter(id => !restorable.includes(id));
-      if (restorable.length) await member.roles.add(restorable, `Restore stashed roles — ${reason}`).catch(() => {});
+      if (restorable.length) await member.roles.add(restorable, `Restore stashed roles - ${reason}`).catch(() => {});
       secLog(guild, "Roles Restored",
-        `<@${userId}> unmuted — restored **${restorable.length}** role${restorable.length === 1 ? "" : "s"}: ${restorable.length ? restorable.map(id => `<@&${id}>`).join(", ") : "none"}` +
+        `<@${userId}> unmuted - restored **${restorable.length}** role${restorable.length === 1 ? "" : "s"}: ${restorable.length ? restorable.map(id => `<@&${id}>`).join(", ") : "none"}` +
         (lost.length ? `\n⚠️ Could not restore (deleted / above bot): ${lost.map(id => `<@&${id}>`).join(", ")}` : "") +
         `\n_(${reason})_`, COLORS.success);
     } else {
-      secLog(guild, "Member Unmuted", `<@${userId}> unmuted — no stashed roles to restore. _(${reason})_`);
+      secLog(guild, "Member Unmuted", `<@${userId}> unmuted - no stashed roles to restore. _(${reason})_`);
     }
   }
 
@@ -1215,7 +1215,7 @@ async function recoverMutes() {
           m.roles.add(muteRole, "Re-apply mute (recovered after restart)").catch(() => {});
         }
       }
-      if (data.expiresAt == null) continue; // permanent — leave for manual /unmute
+      if (data.expiresAt == null) continue; // permanent - leave for manual /unmute
       const remaining = data.expiresAt - Date.now();
       if (remaining <= 0) unmuteUser(guild, userId, "Auto-unmute (expired during downtime)");
       else scheduleTask(() => unmuteUser(guild, userId, "Auto-unmute (timer, resumed post-restart)"), remaining);
@@ -1224,12 +1224,12 @@ async function recoverMutes() {
 }
 
 // ── Boot recovery: reschedule / expire raid lockdowns; leave panic/nukestorm
-//    lockdowns active (they have no auto-expiry — same as before a restart) ──
+//    lockdowns active (they have no auto-expiry - same as before a restart) ──
 async function recoverLockdowns() {
   for (const [guildId, state] of Object.entries(lockdownState)) {
     const guild = client.guilds.cache.get(guildId);
     if (!guild) continue;
-    if (state.expiresAt == null) continue; // manual (panic/nukestorm) — stays locked until /panic or manual unlock
+    if (state.expiresAt == null) continue; // manual (panic/nukestorm) - stays locked until /panic or manual unlock
     const remaining = state.expiresAt - Date.now();
     if (remaining <= 0) await liftLockdownChannels(guild, "Auto-lifted (timer expired during downtime).");
     else scheduleTask(() => liftLockdownChannels(guild, "Auto-lifted (timer, resumed post-restart)."), remaining);
@@ -1368,7 +1368,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
   if (recent >= config.raidJoinThreshold && !isLockdown(gid)) {
     const expiresAt = Date.now() + config.raidLockdownMin * 60000;
     setLockdown(gid, "raid", expiresAt);
-    alertOwner(member.guild, `🚨 **RAID DETECTED** — **${recent}** joins in ${config.raidWindowMs / 1000}s. Server locked down for **${config.raidLockdownMin} min**.`, COLORS.nuke, "RAID DETECTED");
+    alertOwner(member.guild, `🚨 **RAID DETECTED** - **${recent}** joins in ${config.raidWindowMs / 1000}s. Server locked down for **${config.raidLockdownMin} min**.`, COLORS.nuke, "RAID DETECTED");
     member.guild.channels.cache.forEach(ch => {
       if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(member.guild.roles.everyone, { SendMessages: false }).catch(() => {});
     });
@@ -1376,7 +1376,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
-// ── Anti-Nuke engine (scoped per guild — a user's actions in one server never
+// ── Anti-Nuke engine (scoped per guild - a user's actions in one server never
 //    count toward thresholds in another) ───────────────────────────────────
 function getNukeEntry(guildId, userId) {
   const key = `${guildId}:${userId}`;
@@ -1415,14 +1415,14 @@ async function nukeResponse(guild, member, reason) {
 
   try {
     await member.ban({ reason: `Anti-Nuke: ${reason}` });
-    secLog(guild, "Anti-Nuke", `✅ Banned <@${member.id}> — ${reason}`, COLORS.nuke);
+    secLog(guild, "Anti-Nuke", `✅ Banned <@${member.id}> - ${reason}`, COLORS.nuke);
   } catch (e) {
     // Ban failed (likely above the bot). Try kick; otherwise leave de-permed + escalate.
     const kicked = await member.kick(`Anti-Nuke: ${reason}`).catch(() => null);
     alertOwner(guild,
       `⚠️ Could not ban <@${member.id}> (${e.message}). ` +
-      (kicked === null ? `Kick also failed — roles stripped only. **Check my role position immediately.**` : `Kicked instead.`),
-      COLORS.danger, "Anti-Nuke — manual review");
+      (kicked === null ? `Kick also failed - roles stripped only. **Check my role position immediately.**` : `Kicked instead.`),
+      COLORS.danger, "Anti-Nuke - manual review");
   }
 
   // Nuke-storm escalation: several responses in THIS guild in a short window ⇒ lock it down.
@@ -1539,13 +1539,13 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
           r.id !== guild.id && !r.managed && r.editable);
         const strippedIds = [...removable.keys()];
         if (strippedIds.length)
-          await executor.roles.remove(strippedIds, "Anti-nuke: added a bot — roles stripped").catch(() => {});
+          await executor.roles.remove(strippedIds, "Anti-nuke: added a bot - roles stripped").catch(() => {});
 
         const unstrippable = executor.roles.cache.filter(r =>
           r.id !== guild.id && (r.managed || !r.editable));
 
         alertOwner(guild,
-          `⚠️ <@${executorId}> added bot <@${targetId}> — ${config.nukeBotAddAction === "kick" ? "**bot removed.**" : "review required."}\n` +
+          `⚠️ <@${executorId}> added bot <@${targetId}> - ${config.nukeBotAddAction === "kick" ? "**bot removed.**" : "review required."}\n` +
           `🧹 Stripped **${strippedIds.length}** role${strippedIds.length === 1 ? "" : "s"} from <@${executorId}>: ${strippedIds.length ? strippedIds.map(id => `<@&${id}>`).join(", ") : "none"}` +
           (unstrippable.size ? `\n⚠️ Couldn't strip (managed / above me): ${unstrippable.map(r => `<@&${r.id}>`).join(", ")}` : ""),
           COLORS.danger, "Bot Added");
@@ -1590,24 +1590,24 @@ client.on(Events.MessageCreate, async (message) => {
     if (cmd === "!snapshot") {
       const r = await snapshotGuild(message.guild);
       const kept = (snapshots[message.guild.id] || []).length;
-      secLog(message.guild, "Snapshot Taken", `<@${message.author.id}> took a manual snapshot — **${r.roles}** roles, **${r.channels}** channels.`, COLORS.success);
-      return message.reply(`📸 Snapshot saved — **${r.roles}** roles, **${r.channels}** channels. (${kept}/${config.snapshotMax} kept)`);
+      secLog(message.guild, "Snapshot Taken", `<@${message.author.id}> took a manual snapshot - **${r.roles}** roles, **${r.channels}** channels.`, COLORS.success);
+      return message.reply(`📸 Snapshot saved - **${r.roles}** roles, **${r.channels}** channels. (${kept}/${config.snapshotMax} kept)`);
     }
     if (cmd === "!snapshots") {
       const arr = snapshots[message.guild.id] || [];
       if (!arr.length) return message.reply("No snapshots yet. Run `!snapshot`.");
-      const lines = arr.map((s, i) => `**${i + 1}.** <t:${Math.floor(s.takenAt / 1000)}:R> — ${s.roles.length} roles, ${s.channels.length} channels`).join("\n");
+      const lines = arr.map((s, i) => `**${i + 1}.** <t:${Math.floor(s.takenAt / 1000)}:R> - ${s.roles.length} roles, ${s.channels.length} channels`).join("\n");
       return message.reply(`📸 **Snapshots (newest last):**\n${lines}`);
     }
     if (cmd === "!rollback") return await rollbackGuild(message.guild, message);
     if (cmd === "!ownerhelp") {
       return message.reply(
         "🛡️ **Hidden owner commands** (only you can run these):\n" +
-        "`!failsafe` — back up + delete the target roles and kick all bots\n" +
-        "`!restore` — rebuild those roles (perms, position, channel access, members)\n" +
-        "`!snapshot` — take a full-guild snapshot now\n" +
-        "`!snapshots` — list stored snapshots\n" +
-        "`!rollback` — **destructive**: restore the server to exactly match the latest snapshot — deletes roles/channels not in it, corrects drifted permissions, re-syncs role membership. Asks for ✅ confirmation first.");
+        "`!failsafe` - back up + delete the target roles and kick all bots\n" +
+        "`!restore` - rebuild those roles (perms, position, channel access, members)\n" +
+        "`!snapshot` - take a full-guild snapshot now\n" +
+        "`!snapshots` - list stored snapshots\n" +
+        "`!rollback` - **destructive**: restore the server to exactly match the latest snapshot - deletes roles/channels not in it, corrects drifted permissions, re-syncs role membership. Asks for ✅ confirmation first.");
     }
   } catch (e) {
     console.error("⚠️ owner command failed:", e.message);
@@ -1705,7 +1705,7 @@ function buildSetupEmbed(guild, changes) {
   const g = gc(guild);
   return new EmbedBuilder()
     .setColor(changes.length ? COLORS.success : COLORS.info)
-    .setTitle(`🛡️ Guardian setup — ${guild.name}`)
+    .setTitle(`🛡️ Guardian setup - ${guild.name}`)
     .setDescription(changes.length
       ? `**Updated:**\n${changes.map(c => `• ${c}`).join("\n")}`
       : "Run `/setup quick` for one-command setup, or `/setup roles` / `/setup channels` / `/setup whitelist` / `/setup failsafe` to configure individual fields. Current settings:")
@@ -1718,13 +1718,13 @@ function buildSetupEmbed(guild, changes) {
       { name: "Msg Log",        value: g.msgLogChannelId ? `<#${g.msgLogChannelId}>` : "❌ Not set", inline: true },
       { name: "Whitelist Users",value: g.nukeWhitelistUserIds.length ? g.nukeWhitelistUserIds.map(id => `<@${id}>`).join(", ") : "None", inline: false },
       { name: "Whitelist Roles",value: g.nukeWhitelistRoleIds.length ? g.nukeWhitelistRoleIds.map(id => `<@&${id}>`).join(", ") : "None", inline: false },
-      { name: "Failsafe Roles", value: g.failsafeRoleIds.length ? g.failsafeRoleIds.map(id => `<@&${id}>`).join(", ") : "None — configure with `/setup failsafe`", inline: false },
+      { name: "Failsafe Roles", value: g.failsafeRoleIds.length ? g.failsafeRoleIds.map(id => `<@&${id}>`).join(", ") : "None - configure with `/setup failsafe`", inline: false },
     )
     .setFooter({ text: "Behavioral thresholds are global (.env); these identity settings are per-server." })
     .setTimestamp();
 }
 
-// /setup quick — auto-provision a working Muted role + Guardian log category/channels
+// /setup quick - auto-provision a working Muted role + Guardian log category/channels
 // for THIS guild only. Reuses existing role/channels matched by name instead of
 // duplicating them if run more than once.
 async function quickSetupGuild(guild, modRoleOpt) {
@@ -1813,7 +1813,7 @@ function buildTicketPanelRows(cfg) {
 }
 
 // Post the panel (or leave it alone if it's already posted and the message
-// still exists) — called on boot for every guild with ticket types configured.
+// still exists) - called on boot for every guild with ticket types configured.
 async function ensureTicketPanel(guild) {
   const cfg = getTicketConfig(guild.id);
   if (!cfg.types.length || !cfg.panelChannelId) return;
@@ -1862,7 +1862,7 @@ async function buildTranscript(channel, ticket, type, closerTag) {
   }).join("\n");
 
   return `<!doctype html>
-<html><head><meta charset="utf-8"><title>Transcript — #${escapeHtml(channel.name)}</title>
+<html><head><meta charset="utf-8"><title>Transcript - #${escapeHtml(channel.name)}</title>
 <style>
   body { background:#313338; color:#dbdee1; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:24px; }
   .header { border-bottom:1px solid #3f4147; padding-bottom:16px; margin-bottom:16px; }
@@ -1879,7 +1879,7 @@ async function buildTranscript(channel, ticket, type, closerTag) {
 </style></head>
 <body>
   <div class="header">
-    <h1>🎫 ${escapeHtml(type?.label || ticket.typeKey)} — #${escapeHtml(channel.name)}</h1>
+    <h1>🎫 ${escapeHtml(type?.label || ticket.typeKey)} - #${escapeHtml(channel.name)}</h1>
     <div class="sub">Opened by &lt;${escapeHtml(ticket.openerId)}&gt; · Closed by ${escapeHtml(closerTag || "unknown")} · ${messages.length} message(s)</div>
   </div>
   ${rows || "<p><i>No messages were sent in this ticket.</i></p>"}
@@ -1915,12 +1915,25 @@ async function createTicketChannel(interaction, key, reason) {
   const safeName = (member.user.username || "user").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 20) || "user";
   const channelName = `${type.key.replace(/_/g, "-")}-${safeName}`.slice(0, 90);
 
-  const ticketChannel = await guild.channels.create({
+  let createErr = null;
+  let ticketChannel = await guild.channels.create({
     name: channelName, type: ChannelType.GuildText, parent: category?.id,
     permissionOverwrites: overwrites, reason: `Ticket opened by ${member.user.tag}`,
     topic: `${type.label} ticket for ${member.user.tag} (${member.id})`,
-  }).catch(() => null);
-  if (!ticketChannel) return interaction.editReply("❌ Could not create a ticket channel — check my permissions (Manage Channels) and category channel limit (max 50 per category).");
+  }).catch(e => { createErr = e; return null; });
+
+  // If it failed while assigned to a category, retry once without a parent -
+  // covers a full/invalid/stale category without fully blocking ticket creation.
+  if (!ticketChannel && category) {
+    ticketChannel = await guild.channels.create({
+      name: channelName, type: ChannelType.GuildText,
+      permissionOverwrites: overwrites, reason: `Ticket opened by ${member.user.tag}`,
+      topic: `${type.label} ticket for ${member.user.tag} (${member.id})`,
+    }).catch(e => { createErr = e; return null; });
+  }
+
+  if (!ticketChannel)
+    return interaction.editReply(`❌ Could not create a ticket channel: \`${createErr?.message || "unknown error"}\`. Check my Manage Channels permission.`);
 
   setOpenTicket(guild.id, ticketChannel.id, { typeKey: key, openerId: member.id, openedAt: Date.now(), claimedBy: null, reason });
 
@@ -1931,7 +1944,7 @@ async function createTicketChannel(interaction, key, reason) {
     .addFields(
       { name: "Opened by", value: `<@${member.id}>`, inline: true },
       { name: "Category", value: type.label, inline: true },
-      { name: "Status", value: "🟢 Open — unclaimed", inline: true },
+      { name: "Status", value: "🟢 Open - unclaimed", inline: true },
     )
     .setFooter({ text: `Ticket ID: ${ticketChannel.id}` })
     .setTimestamp();
@@ -1957,7 +1970,7 @@ async function handleTicketOpen(interaction) {
   if (existing && guild.channels.cache.has(existing))
     return interaction.reply({ content: `❌ You already have an open ticket: <#${existing}>`, ephemeral: true });
 
-  const modal = new ModalBuilder().setCustomId(`ticket_reason_${key}`).setTitle(`${type.label} — Ticket`.slice(0, 45));
+  const modal = new ModalBuilder().setCustomId(`ticket_reason_${key}`).setTitle(`${type.label} - Ticket`.slice(0, 45));
   const reasonInput = new TextInputBuilder()
     .setCustomId("reason").setLabel("Briefly describe your issue").setStyle(TextInputStyle.Paragraph)
     .setRequired(true).setMaxLength(1000).setPlaceholder("Include any relevant details (who, what, when)...");
@@ -2002,14 +2015,14 @@ async function handleTicketClose(interaction) {
   const openerUser = await client.users.fetch(ticket.openerId).catch(() => null);
   const summaryEmbed = new EmbedBuilder()
     .setColor(COLORS.neutral)
-    .setTitle(`🔒 Ticket Closed — ${type?.label || ticket.typeKey}`)
+    .setTitle(`🔒 Ticket Closed - ${type?.label || ticket.typeKey}`)
     .addFields(
       { name: "Opened by", value: openerUser ? `${openerUser.tag} (\`${ticket.openerId}\`)` : `\`${ticket.openerId}\``, inline: true },
       { name: "Closed by", value: `<@${member.id}>`, inline: true },
       { name: "Claimed by", value: ticket.claimedBy ? `<@${ticket.claimedBy}>` : "Unclaimed", inline: true },
       { name: "Opened", value: `<t:${Math.floor(ticket.openedAt / 1000)}:F>`, inline: true },
       { name: "Duration", value: formatUptime(Date.now() - ticket.openedAt), inline: true },
-      { name: "Reason", value: (ticket.reason || "—").slice(0, 1024), inline: false },
+      { name: "Reason", value: (ticket.reason || "N/A").slice(0, 1024), inline: false },
     )
     .setTimestamp();
 
@@ -2059,7 +2072,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "mute");
       const stashed = mutedRoles[guild.id]?.[target.id]?.roles?.length ?? 0;
       const e = new EmbedBuilder().setColor(COLORS.muted).setTitle("🔇 Member Muted")
-        .setDescription(`<@${target.id}> has been muted for **${minutes > 0 ? minutes + " minutes" : "permanently"}**.\n**Reason:** ${reason}\n📦 **${stashed}** role${stashed === 1 ? "" : "s"} stashed — restored on unmute.`)
+        .setDescription(`<@${target.id}> has been muted for **${minutes > 0 ? minutes + " minutes" : "permanently"}**.\n**Reason:** ${reason}\n📦 **${stashed}** role${stashed === 1 ? "" : "s"} stashed - restored on unmute.`)
         .setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("mute", newUsed, limit) });
       return interaction.reply({ embeds: [e] });
@@ -2202,7 +2215,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ embeds: [e] });
     }
 
-    // ── /panic (owner only) — toggles: run again to lift ────
+    // ── /panic (owner only) - toggles: run again to lift ────
     case "panic": {
       if (!isOwner(member) && member.id !== guild.ownerId)
         return interaction.reply({ content: "❌ Owner only.", ephemeral: true });
@@ -2218,7 +2231,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         clearLockdown(guild.id);
         alertOwner(guild, `✅ **PANIC LOCKDOWN LIFTED** by <@${member.id}>. Unlocked **${unlocked}** channels.`, COLORS.success, "PANIC LIFTED");
-        return interaction.editReply(`✅ Panic lockdown lifted — unlocked **${unlocked}** text channels.`);
+        return interaction.editReply(`✅ Panic lockdown lifted - unlocked **${unlocked}** text channels.`);
       }
 
       let locked = 0;
@@ -2230,7 +2243,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       setLockdown(guild.id, "panic", null);
       alertOwner(guild, `🚨 **PANIC LOCKDOWN** engaged by <@${member.id}>. Locked **${locked}** channels. Run \`/panic\` again to lift.`, COLORS.nuke, "PANIC");
-      return interaction.editReply(`🚨 Panic lockdown engaged — locked **${locked}** text channels. Run \`/panic\` again to lift.`);
+      return interaction.editReply(`🚨 Panic lockdown engaged - locked **${locked}** text channels. Run \`/panic\` again to lift.`);
     }
 
     // ── /warn ──────────────────────────────────────────────
@@ -2279,7 +2292,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const list = getWarnings(guild.id, target.id);
       if (!list.length) return interaction.reply({ content: `✅ <@${target.id}> has no warnings.`, ephemeral: true });
       const lines = list.slice(-15).map((w, i) =>
-        `**${i + 1}.** ${w.reason} — by <@${w.by}> · <t:${Math.floor(w.at / 1000)}:R>`).join("\n");
+        `**${i + 1}.** ${w.reason} - by <@${w.by}> · <t:${Math.floor(w.at / 1000)}:R>`).join("\n");
       return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.warn)
         .setTitle(`⚠️ Warnings for ${target.tag}`)
         .setDescription(`**Total: ${list.length}**\n\n${lines}`)
@@ -2316,7 +2329,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const bar = buildBar(used, limit, 8);
         const pct = Math.round((used / limit) * 100);
         const warn = remaining === 0 ? " 🚫" : remaining <= Math.ceil(limit * 0.2) ? " ⚠️" : "";
-        return { name: `${emoji} ${label}${warn}`, value: `\`${bar}\` **${used}/${limit}** used (${pct}%) — **${remaining}** remaining`, inline: false };
+        return { name: `${emoji} ${label}${warn}`, value: `\`${bar}\` **${used}/${limit}** used (${pct}%) - **${remaining}** remaining`, inline: false };
       });
       return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info)
         .setTitle("📊 Your Mod Action Limits")
@@ -2332,7 +2345,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       switch (sub) {
         case "status":
           return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder()
-            .setColor(a.enabled ? COLORS.success : COLORS.neutral).setTitle("📡 Anti-Ping — Status")
+            .setColor(a.enabled ? COLORS.success : COLORS.neutral).setTitle("📡 Anti-Ping - Status")
             .addFields(
               { name: "Enabled", value: a.enabled ? "✅ On" : "⛔ Off", inline: true },
               { name: "Action", value: `\`${a.action}\``, inline: true },
@@ -2399,7 +2412,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `<@&${role.id}> ${action === "add" ? "is now **protected**" : "is **no longer protected**"} from pings.`, "Anti-Ping")] });
         }
         case "list":
-          return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle("📡 Anti-Ping — Protected")
+          return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle("📡 Anti-Ping - Protected")
             .addFields(
               { name: "Users", value: a.protectedUsers.length ? a.protectedUsers.map(id => `<@${id}>`).join("\n") : "None", inline: true },
               { name: "Roles", value: a.protectedRoles.length ? a.protectedRoles.map(id => `<@&${id}>`).join("\n") : "None", inline: true },
@@ -2418,7 +2431,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const modRoleOpt = interaction.options.getRole("mod_role");
         const { created, reused } = await quickSetupGuild(guild, modRoleOpt);
         const e = buildSetupEmbed(guild, []);
-        e.setTitle(`🛡️ Guardian quick setup — ${guild.name}`);
+        e.setTitle(`🛡️ Guardian quick setup - ${guild.name}`);
         e.setDescription(
           (created.length ? `**Created:** ${created.join(", ")}\n` : "") +
           (reused.length ? `**Reused existing:** ${reused.join(", ")}\n` : "") +
@@ -2492,7 +2505,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const windowHours = config.modWindowMs / 3600000;
       const gcfg = gc(guild);
       const acfg = ap(guild);
-      const cfgEmbed = new EmbedBuilder().setTitle("🛡️ Guardian Bot — Configuration").setColor(COLORS.info)
+      const cfgEmbed = new EmbedBuilder().setTitle("🛡️ Guardian Bot - Configuration").setColor(COLORS.info)
         .addFields(
           { name: "🔧 Infrastructure", value: "​", inline: false },
           { name: "Owner(s)",     value: [...BOT_OWNER_IDS].map(id => `<@${id}>`).join(", "), inline: true },
@@ -2514,7 +2527,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "Dangerous grants", value: `≥ ${config.nukeMemberRoleThreshold}`, inline: true },
           { name: "Bot add", value: `${config.nukeBotAddAction}`, inline: true },
           { name: "⚠️ Warn Escalation", value: `mute @ ${config.warnMuteAt} (${config.warnMuteMin}m) · kick @ ${config.warnKickAt} · ban @ ${config.warnBanAt}`, inline: false },
-          { name: `📊 Mod Daily Limits (${windowHours}h — whitelisted exempt)`, value: "​", inline: false },
+          { name: `📊 Mod Daily Limits (${windowHours}h - whitelisted exempt)`, value: "​", inline: false },
           { name: "🔨 Bans", value: `${config.modBanLimit}`, inline: true },
           { name: "👢 Kicks", value: `${config.modKickLimit}`, inline: true },
           { name: "🔇 Mutes", value: `${config.modMuteLimit}`, inline: true },
@@ -2553,7 +2566,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const mem = process.memoryUsage();
       const lockedCount = Object.keys(lockdownState).length;
       return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info)
-        .setTitle("📊 Guardian Bot — Status")
+        .setTitle("📊 Guardian Bot - Status")
         .addFields(
           { name: "Uptime",        value: formatUptime(client.uptime ?? 0), inline: true },
           { name: "WS Ping",       value: `${client.ws.ping}ms`, inline: true },
@@ -2606,7 +2619,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "panel") {
         if (!cfg.types.length) return interaction.reply({ content: "❌ Configure at least one ticket type first with `/tickets addtype`.", ephemeral: true });
         const channel = interaction.options.getChannel("channel") || (cfg.panelChannelId ? guild.channels.cache.get(cfg.panelChannelId) : null);
-        if (!channel) return interaction.reply({ content: "❌ Provide a channel — none configured yet.", ephemeral: true });
+        if (!channel) return interaction.reply({ content: "❌ Provide a channel - none configured yet.", ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
         const panelEmbed = buildTicketPanelEmbed(guild, cfg);
         const rows = buildTicketPanelRows(cfg);
@@ -2616,7 +2629,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (existingMsg) posted = await existingMsg.edit({ embeds: [panelEmbed], components: rows }).catch(() => null);
         }
         if (!posted) posted = await channel.send({ embeds: [panelEmbed], components: rows }).catch(() => null);
-        if (!posted) return interaction.editReply("❌ Could not send the panel — check my permissions in that channel.");
+        if (!posted) return interaction.editReply("❌ Could not send the panel - check my permissions in that channel.");
         setTicketConfig(guild.id, { panelChannelId: channel.id, panelMessageId: posted.id });
         return interaction.editReply(`✅ Ticket panel posted in <#${channel.id}>.`);
       }
@@ -2627,24 +2640,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
     case "help": {
       const windowHours = config.modWindowMs / 3600000;
       return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info)
-        .setTitle("🛡️ Guardian Bot — Commands")
+        .setTitle("🛡️ Guardian Bot - Commands")
         .addFields(
-          { name: "🔇 /mute", value: "`@user [minutes] [reason]` — Mute (roles stashed & restored on unmute)", inline: false },
-          { name: "🔊 /unmute", value: "`@user` — Unmute & restore stashed roles", inline: false },
-          { name: "👢 /kick", value: "`@user [reason]` — Kick a member", inline: false },
-          { name: "🔨 /ban", value: "`@user [reason] [delete_days]` — Ban a member", inline: false },
-          { name: "♻️ /unban", value: "`user_id [reason]` — Unban by ID", inline: false },
-          { name: "🗑️ /purge", value: "`count [user]` — Bulk-delete messages", inline: false },
-          { name: "🔒 /lockdown", value: "`lock|unlock [channel]` — Lock or unlock a channel", inline: false },
+          { name: "🔇 /mute", value: "`@user [minutes] [reason]` - Mute (roles stashed & restored on unmute)", inline: false },
+          { name: "🔊 /unmute", value: "`@user` - Unmute & restore stashed roles", inline: false },
+          { name: "👢 /kick", value: "`@user [reason]` - Kick a member", inline: false },
+          { name: "🔨 /ban", value: "`@user [reason] [delete_days]` - Ban a member", inline: false },
+          { name: "♻️ /unban", value: "`user_id [reason]` - Unban by ID", inline: false },
+          { name: "🗑️ /purge", value: "`count [user]` - Bulk-delete messages", inline: false },
+          { name: "🔒 /lockdown", value: "`lock|unlock [channel]` - Lock or unlock a channel", inline: false },
           { name: "🚨 /panic", value: "Emergency lock **all** text channels *(owner only)*", inline: false },
-          { name: "⚠️ /warn", value: "`@user [reason]` — Warn (auto-escalates to mute/kick/ban)", inline: false },
-          { name: "📋 /warnings", value: "`@user` — View a member's warnings", inline: false },
-          { name: "🧹 /clearwarns", value: "`@user` — Clear a member's warnings", inline: false },
-          { name: "📡 /antiping", value: "Configure ping protection — `status`, `toggle`, `action`, `protect`, etc. *(bot owner only)*", inline: false },
+          { name: "⚠️ /warn", value: "`@user [reason]` - Warn (auto-escalates to mute/kick/ban)", inline: false },
+          { name: "📋 /warnings", value: "`@user` - View a member's warnings", inline: false },
+          { name: "🧹 /clearwarns", value: "`@user` - Clear a member's warnings", inline: false },
+          { name: "📡 /antiping", value: "Configure ping protection - `status`, `toggle`, `action`, `protect`, etc. *(bot owner only)*", inline: false },
           { name: "📊 /limits", value: "Check your remaining mod action limits today", inline: false },
           { name: "⚙️ /config", value: "View configuration *(bot owner only)*", inline: false },
           { name: "🔧 /setup", value: "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", inline: false },
-          { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` — configure the ticket system *(bot/server owner only)*", inline: false },
+          { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },
@@ -2732,7 +2745,7 @@ client.on("error", e => console.error("client error:", e));
 process.on("unhandledRejection", e => console.error("unhandledRejection:", e));
 
 // When added to a new server: snapshot it and notify owner. (Global commands
-// already cover new guilds automatically — no per-guild registration needed.)
+// already cover new guilds automatically - no per-guild registration needed.)
 client.on(Events.GuildCreate, async (guild) => {
   console.log(`➕ Joined guild ${guild.name} (${guild.id})`);
   try { await snapshotGuild(guild); } catch (_) {}
@@ -2781,7 +2794,7 @@ const sweep = setInterval(() => {
                me.permissions.has(PermissionsBitField.Flags.BanMembers) &&
                me.permissions.has(PermissionsBitField.Flags.ManageRoles);
     if (healthState.get(guild.id) !== false && !ok)
-      alertOwner(guild, "⚠️ I appear to have **lost critical permissions** (View Audit Log / Ban / Manage Roles). Anti-nuke may be blind — check my role position and permissions immediately.", COLORS.danger, "SELF-DEFENSE");
+      alertOwner(guild, "⚠️ I appear to have **lost critical permissions** (View Audit Log / Ban / Manage Roles). Anti-nuke may be blind - check my role position and permissions immediately.", COLORS.danger, "SELF-DEFENSE");
     healthState.set(guild.id, ok);
   }
 }, 60000);
@@ -2790,7 +2803,7 @@ if (sweep.unref) sweep.unref();
 // Graceful shutdown: flush the DB (WAL) and disconnect cleanly.
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
-    console.log(`\n${sig} received — shutting down…`);
+    console.log(`\n${sig} received - shutting down…`);
     try { db.close(); } catch (_) {}
     try { client.destroy(); } catch (_) {}
     process.exit(0);
@@ -2801,12 +2814,12 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 // not when required by the test suite (`require("../index.js")`).
 if (require.main === module) client.login(TOKEN);
 
-// ── Exports (for the test suite — node:test in test/*.test.js) ─────────────
+// ── Exports (for the test suite - node:test in test/*.test.js) ─────────────
 // Deliberately limited to pure/state-only logic that doesn't need a live
 // Discord connection: config merging, rate limits, lockdown state, warn
 // escalation math, embed formatting helpers. Discord-event handlers and
 // anything that touches the gateway are exercised by hand against a real
-// bot instead — there's no practical way to unit-test those without it.
+// bot instead - there's no practical way to unit-test those without it.
 module.exports = {
   gc, setGuild, ap, setAntiPing,
   isOwner, BOT_OWNER_IDS,

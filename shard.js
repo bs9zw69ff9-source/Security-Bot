@@ -1,5 +1,5 @@
 // ============================================================
-//  GUARDIAN BOT — Sharding entry point
+//  GUARDIAN BOT - Sharding entry point
 //  Use this instead of index.js once a single process can no longer
 //  hold every guild (Discord requires sharding past ~2500 guilds).
 //  Usage: node shard.js
