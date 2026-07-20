@@ -54,18 +54,25 @@ sensible defaults.
 Per-server identity settings (mod role, mute role, log channels, anti-nuke
 whitelist, failsafe roles) are configured live with `/setup` in each server
 and stored in SQLite — they do **not** come from `.env`, so one server's
-configuration never leaks into another's. Detection/rate-limit state
-(spam counters, join velocity, nuke-response tracking, mod action limits,
-raid/panic lockdown) is likewise tracked per guild in memory, so activity
-in one server never trips detection or drains limits in another.
+configuration never leaks into another's. Detection state (spam counters,
+join velocity, nuke-response tracking) is tracked per guild in memory, so
+activity in one server never trips detection in another; those windows are
+seconds long, so losing them on a restart is fine by design. Mod rate
+limits and active lockdown state (raid/panic) are also per guild **and**
+persisted to SQLite, so a restart mid-lockdown or mid-rate-limit-window
+doesn't silently drop protection or reset a mod's daily limits — see
+`recoverLockdowns()`/`recoverMutes()` in `index.js`.
 
 ### Owner override
 
-`BOT_OWNER_ID` (env, falls back to a hardcoded default in `index.js`) is
-always fully trusted: immune to anti-nuke, rate limits, and every
-permission guard. It also unlocks hidden, non-slash owner commands
-(`!failsafe`, `!restore`, `!snapshot`, `!snapshots`, `!rollback`,
-`!ownerhelp`) usable only via plain messages from that account.
+`BOT_OWNER_IDS` (comma-separated; `BOT_OWNER_ID` singular also still works
+and is merged in) is always fully trusted: immune to anti-nuke, rate
+limits, and every permission guard. It also unlocks hidden, non-slash
+owner commands (`!failsafe`, `!restore`, `!snapshot`, `!snapshots`,
+`!rollback`, `!ownerhelp`) usable only via plain messages from one of
+those accounts. Falls back to a hardcoded default ID if unset. Every
+invocation of a hidden owner command is written to the local
+`security_log.jsonl` forensic trail regardless of outcome.
 
 ## Commands
 
@@ -73,7 +80,7 @@ permission guard. It also unlocks hidden, non-slash owner commands
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/config` `/antiping` `/nuketest` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/config` `/status` `/antiping` `/nuketest` |
 
 ## Security systems
 
@@ -113,4 +120,24 @@ wiped log channel.
 
 ```bash
 npm run check   # syntax check (node --check) for index.js and shard.js
+npm run lint    # eslint .
+npm test        # node --test — unit tests for config merging, per-guild rate
+                 # limits/lockdown isolation (incl. surviving a simulated
+                 # restart), permission checks, and formatting helpers
 ```
+
+`index.js` exports its pure/state-only logic (guarded behind
+`require.main === module` so `client.login()` never fires when the file is
+`require()`d by the test suite) — see the bottom of the file and
+`test/*.test.js`. GitHub Actions (`.github/workflows/ci.yml`) runs all
+three on every push/PR against Node 20 and 22.
+
+**What's covered by automated tests vs. only by manual testing:** the
+per-guild isolation of rate limits/lockdown/config (including that it
+survives a restart), and the permission-hierarchy logic, are covered by
+real regression tests. Anything that requires a live gateway connection —
+the actual anti-nuke/anti-raid/anti-spam detection firing against real
+Discord events, role/channel snapshot-and-restore, mute-role stashing —
+is not, and has only been exercised by hand. Treat this bot as reviewed-
+and-tested-where-practical, not as verified against live abuse scenarios
+at scale.

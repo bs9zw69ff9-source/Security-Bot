@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node index.js",
     "start:sharded": "node shard.js",
-    "check": "node --check index.js && node --check shard.js"
+    "check": "node --check index.js && node --check shard.js",
+    "test": "node --test",
+    "lint": "eslint ."
   },
   "engines": {
     "node": ">=18"
@@ -16,5 +18,8 @@
     "better-sqlite3": "^11.8.1",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "eslint": "^10.7.0"
   }
 }

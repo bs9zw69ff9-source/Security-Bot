@@ -1,0 +1,37 @@
+module.exports = [
+  {
+    files: ["**/*.js"],
+    ignores: ["node_modules/**"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "commonjs",
+      globals: {
+        require: "readonly",
+        module: "writable",
+        exports: "writable",
+        process: "readonly",
+        console: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        Buffer: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        setImmediate: "readonly",
+        global: "readonly",
+      },
+    },
+    rules: {
+      "no-unused-vars": ["warn", { args: "none", caughtErrors: "none" }],
+      "no-undef": "error",
+      "no-const-assign": "error",
+      "no-dupe-keys": "error",
+      "no-dupe-args": "error",
+      "no-unreachable": "error",
+      "no-fallthrough": "error",
+      "no-var": "error",
+      eqeqeq: ["error", "smart"],
+    },
+  },
+];

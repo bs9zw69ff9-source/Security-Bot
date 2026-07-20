@@ -11,7 +11,7 @@ const path = require("path");
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder,
   PermissionsBitField, AuditLogEvent, Events,
-  REST, Routes, SlashCommandBuilder, PermissionFlagsBits,
+  REST, Routes, SlashCommandBuilder,
   ActivityType, ChannelType,
 } = require("discord.js");
 
@@ -19,10 +19,18 @@ const TOKEN     = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID  = process.env.GUILD_ID;
 
-// ── HARDCODED OWNER ───────────────────────────────────────────
+// ── OWNER(S) ───────────────────────────────────────────────────
 // Always fully trusted: immune to anti-nuke, rate limits, and all guards.
-// Env override allowed, but defaults to the configured owner.
-const BOT_OWNER_ID = process.env.BOT_OWNER_ID || "1014251293159731310";
+// Also unlocks the hidden, non-slash owner commands (!failsafe, !restore, etc).
+// BOT_OWNER_IDS (comma-separated) and/or BOT_OWNER_ID (singular, kept for
+// backward compatibility) are merged into one trusted set. Falls back to the
+// original hardcoded default if neither env var is set, so this still runs
+// out of the box — override it for any real deployment.
+const configuredOwnerIds = [
+  ...(process.env.BOT_OWNER_IDS || "").split(",").map(s => s.trim()).filter(Boolean),
+  ...(process.env.BOT_OWNER_ID ? [process.env.BOT_OWNER_ID.trim()] : []),
+];
+const BOT_OWNER_IDS = new Set(configuredOwnerIds.length ? configuredOwnerIds : ["1014251293159731310"]);
 
 const ANTIPING_FILE = path.join(__dirname, "antiping.json");
 const MUTED_FILE    = path.join(__dirname, "mutedroles.json");
@@ -34,11 +42,11 @@ const WARN_FILE     = path.join(__dirname, "warnings.json");
 // the old JSON files (which corrupt under concurrent writes and don't scale).
 // Requires: npm install better-sqlite3
 const Database = require("better-sqlite3");
-const DB_FILE = path.join(__dirname, "guardian.db");
+const DB_FILE = process.env.GUARDIAN_DB_FILE || path.join(__dirname, "guardian.db");
 const db = new Database(DB_FILE);
 db.pragma("journal_mode = WAL");
 db.pragma("busy_timeout = 5000");
-for (const t of ["guild_settings", "antiping", "warnings", "muted_roles", "snapshots", "failsafe"])
+for (const t of ["guild_settings", "antiping", "warnings", "muted_roles", "snapshots", "failsafe", "mod_rates", "lockdown_state"])
   db.exec(`CREATE TABLE IF NOT EXISTS ${t} (guild_id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
 
 function dbLoadAll(table) {
@@ -179,15 +187,50 @@ function appendForensic(guildId, kind, data) {
 // Every tracker below is keyed (directly or via a "guildId:userId" composite
 // key) by guild, so activity in one server can never trip detection or limits
 // in another — required for correct multi-server operation.
+//
+// spamTracker/dupeTracker/joinTracker/nukeTracker/nukeStormTracker are
+// deliberately in-memory only: their windows are seconds, so a restart
+// naturally (and safely) interrupting a fast burst is fine, and persisting
+// sub-minute counters isn't worth the write overhead. modRateTracker
+// (24h limits) and lockdown state are NOT — losing those on restart would
+// silently reset a mod's daily limits or drop a guild out of an active
+// raid/panic lockdown, so both are persisted to SQLite (write-through, same
+// pattern as guild settings / warnings / muted roles).
 const spamTracker = new Map();     // "gid:uid" -> [timestamps]
 const dupeTracker = new Map();     // "gid:uid" -> { content, count, ts }
 const joinTracker = new Map();     // gid -> [timestamps]
 const nukeTracker = new Map();     // "gid:uid" -> dynamic action arrays
-const modRateTracker = new Map();  // "gid:uid" -> 24h rolling action arrays
-const lockdownGuilds = new Set();  // gid currently under lockdown
-const isLockdown    = (gid) => lockdownGuilds.has(gid);
-const setLockdown   = (gid) => lockdownGuilds.add(gid);
-const clearLockdown = (gid) => lockdownGuilds.delete(gid);
+
+// ── Mod rate limits (persisted to SQLite `mod_rates`) ──────────
+let modRates = {}; // { [guildId]: { [userId]: { bans:[], kicks:[], mutes:[], purges:[], lockdowns:[], warns:[] } } }
+function loadModRates() { modRates = dbLoadAll("mod_rates"); }
+function saveModRates(gid) { dbPut("mod_rates", gid, modRates[gid]); }
+loadModRates();
+
+// ── Lockdown state (persisted to SQLite `lockdown_state`) ──────
+// { [guildId]: { reason: "raid"|"panic"|"nukestorm", lockedAt, expiresAt: number|null } }
+let lockdownState = {};
+function loadLockdownState() { lockdownState = dbLoadAll("lockdown_state"); }
+function saveLockdownState(gid) { dbPut("lockdown_state", gid, lockdownState[gid]); }
+loadLockdownState();
+const isLockdown = (gid) => !!lockdownState[gid];
+function setLockdown(gid, reason = "manual", expiresAt = null) {
+  lockdownState[gid] = { reason, lockedAt: Date.now(), expiresAt };
+  saveLockdownState(gid);
+}
+function clearLockdown(gid) {
+  delete lockdownState[gid];
+  saveLockdownState(gid);
+}
+// Reopen every text channel and clear lockdown state for a guild (shared by
+// the raid auto-lift timer, /panic unlock, and boot recovery of an expired lock).
+async function liftLockdownChannels(guild, note) {
+  guild.channels.cache.forEach(ch => {
+    if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null }).catch(() => {});
+  });
+  clearLockdown(guild.id);
+  secLog(guild, "Lockdown Lifted", note);
+}
 
 // ── Anti-Ping runtime state (persisted to antiping.json) ──────
 const antiPingDefaults = {
@@ -582,7 +625,7 @@ async function serverEmergencyLock(guild, reason) {
   for (const ch of guild.channels.cache.values()) {
     if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
   }
-  setLockdown(guild.id);
+  setLockdown(guild.id, "nukestorm", null);
 }
 
 const client = new Client({
@@ -659,6 +702,9 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("nuketest").setDescription("Confirm anti-nuke system is active (owner only)"),
+
+  new SlashCommandBuilder()
+    .setName("status").setDescription("Bot health: uptime, latency, guild count, memory (bot owner only)"),
 
   new SlashCommandBuilder()
     .setName("limits").setDescription("Check your remaining mod action limits for today"),
@@ -778,20 +824,22 @@ function alertOwner(guild, desc, color = COLORS.nuke, title = "Security Alert") 
   const g = gc(guild);
   const chId = g.alertChannelId || g.logChannelId;
   const ch = chId ? guild.channels.cache.get(chId) : null;
+  const ownerIds = [...BOT_OWNER_IDS];
   if (ch) ch.send({
-    content: `<@${BOT_OWNER_ID}>`,
+    content: ownerIds.map(id => `<@${id}>`).join(" "),
     embeds: [embed(color, desc, title)],
-    allowedMentions: { users: [BOT_OWNER_ID] },
+    allowedMentions: { users: ownerIds },
   }).catch(() => {});
   if (config.ownerDM)
-    client.users.fetch(BOT_OWNER_ID)
-      .then(u => u.send({ embeds: [embed(color, `**[${guild.name}]** ${desc}`, title)] }))
-      .catch(() => {});
+    for (const id of ownerIds)
+      client.users.fetch(id)
+        .then(u => u.send({ embeds: [embed(color, `**[${guild.name}]** ${desc}`, title)] }))
+        .catch(() => {});
 }
 
 function isOwner(idOrMember) {
   const id = typeof idOrMember === "string" ? idOrMember : idOrMember?.id;
-  return id === BOT_OWNER_ID;
+  return BOT_OWNER_IDS.has(id);
 }
 
 function isMod(member) {
@@ -833,14 +881,15 @@ function canActOn(actor, target) {
   return { ok: true };
 }
 
-// ── Mod Rate Limit Helpers (scoped per guild — a mod's limits in one server
-//    are independent of their activity in any other) ───────────────────────
+// ── Mod Rate Limit Helpers (scoped + persisted per guild — a mod's limits in
+//    one server are independent of, and survive restarts independently of,
+//    their activity in any other) ───────────────────────────────────────────
 function getModEntry(guildId, userId) {
-  const key = `${guildId}:${userId}`;
-  if (!modRateTracker.has(key)) {
-    modRateTracker.set(key, { bans: [], kicks: [], mutes: [], purges: [], lockdowns: [], warns: [] });
+  if (!modRates[guildId]) modRates[guildId] = {};
+  if (!modRates[guildId][userId]) {
+    modRates[guildId][userId] = { bans: [], kicks: [], mutes: [], purges: [], lockdowns: [], warns: [] };
   }
-  return modRateTracker.get(key);
+  return modRates[guildId][userId];
 }
 function pruneWindow(arr, windowMs = config.modWindowMs) {
   const cutoff = Date.now() - windowMs;
@@ -864,6 +913,7 @@ function recordModAction(guildId, memberId, action) {
   const entry = getModEntry(guildId, memberId);
   entry[`${action}s`] = pruneWindow(entry[`${action}s`]);
   entry[`${action}s`].push(Date.now());
+  saveModRates(guildId);
 }
 function limitDeniedEmbed(action, used, limit, resetsInMin) {
   return embed(COLORS.danger,
@@ -881,6 +931,15 @@ function usageFooter(action, used, limit) {
 function buildBar(used, limit, width = 10) {
   const filled = Math.min(width, Math.round((used / Math.max(limit, 1)) * width));
   return "█".repeat(filled) + "░".repeat(width - filled);
+}
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${s % 60}s`;
 }
 
 // setTimeout overflows (and fires immediately) past ~24.8 days. Chunk long delays.
@@ -986,6 +1045,19 @@ async function recoverMutes() {
       if (remaining <= 0) unmuteUser(guild, userId, "Auto-unmute (expired during downtime)");
       else scheduleTask(() => unmuteUser(guild, userId, "Auto-unmute (timer, resumed post-restart)"), remaining);
     }
+  }
+}
+
+// ── Boot recovery: reschedule / expire raid lockdowns; leave panic/nukestorm
+//    lockdowns active (they have no auto-expiry — same as before a restart) ──
+async function recoverLockdowns() {
+  for (const [guildId, state] of Object.entries(lockdownState)) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    if (state.expiresAt == null) continue; // manual (panic/nukestorm) — stays locked until /panic or manual unlock
+    const remaining = state.expiresAt - Date.now();
+    if (remaining <= 0) await liftLockdownChannels(guild, "Auto-lifted (timer expired during downtime).");
+    else scheduleTask(() => liftLockdownChannels(guild, "Auto-lifted (timer, resumed post-restart)."), remaining);
   }
 }
 
@@ -1119,18 +1191,13 @@ client.on(Events.GuildMemberAdd, async (member) => {
   joinTracker.set(gid, joins);
   const recent = joins.length;
   if (recent >= config.raidJoinThreshold && !isLockdown(gid)) {
-    setLockdown(gid);
+    const expiresAt = Date.now() + config.raidLockdownMin * 60000;
+    setLockdown(gid, "raid", expiresAt);
     alertOwner(member.guild, `🚨 **RAID DETECTED** — **${recent}** joins in ${config.raidWindowMs / 1000}s. Server locked down for **${config.raidLockdownMin} min**.`, COLORS.nuke, "RAID DETECTED");
     member.guild.channels.cache.forEach(ch => {
       if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(member.guild.roles.everyone, { SendMessages: false }).catch(() => {});
     });
-    setTimeout(() => {
-      member.guild.channels.cache.forEach(ch => {
-        if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(member.guild.roles.everyone, { SendMessages: null }).catch(() => {});
-      });
-      clearLockdown(gid);
-      secLog(member.guild, "Lockdown Lifted", `Auto-lifted after **${config.raidLockdownMin} minutes**.`);
-    }, config.raidLockdownMin * 60000);
+    scheduleTask(() => liftLockdownChannels(member.guild, `Auto-lifted after **${config.raidLockdownMin} minutes**.`), expiresAt - Date.now());
   }
 });
 
@@ -1335,15 +1402,20 @@ client.on(Events.MessageCreate, (message) => {
 });
 
 // ── Hidden owner-only commands (never registered as slash → not shown in /) ──
+const HIDDEN_OWNER_COMMANDS = new Set(["!failsafe", "!restore", "!snapshot", "!snapshots", "!rollback", "!ownerhelp"]);
 client.on(Events.MessageCreate, async (message) => {
-  if (!message.guild || message.author.id !== BOT_OWNER_ID) return;
+  if (!message.guild || !isOwner(message.author.id)) return;
   const cmd = message.content.trim().toLowerCase();
+  if (!HIDDEN_OWNER_COMMANDS.has(cmd)) return;
+  // Full audit trail: every invocation of a hidden owner command, regardless of outcome.
+  appendForensic(message.guild.id, "owner_command", { cmd, by: message.author.id });
   try {
     if (cmd === "!failsafe") return await runFailsafe(message);
     if (cmd === "!restore")  return await runRestore(message);
     if (cmd === "!snapshot") {
       const r = snapshotGuild(message.guild);
       const kept = (snapshots[message.guild.id] || []).length;
+      secLog(message.guild, "Snapshot Taken", `<@${message.author.id}> took a manual snapshot — **${r.roles}** roles, **${r.channels}** channels.`, COLORS.success);
       return message.reply(`📸 Snapshot saved — **${r.roles}** roles, **${r.channels}** channels. (${kept}/${config.snapshotMax} kept)`);
     }
     if (cmd === "!snapshots") {
@@ -1743,7 +1815,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (ok) locked++;
         }
       }
-      setLockdown(guild.id);
+      setLockdown(guild.id, "panic", null);
       alertOwner(guild, `🚨 **PANIC LOCKDOWN** engaged by <@${member.id}>. Locked **${locked}** channels. Run \`/panic\` again to lift.`, COLORS.nuke, "PANIC");
       return interaction.editReply(`🚨 Panic lockdown engaged — locked **${locked}** text channels. Run \`/panic\` again to lift.`);
     }
@@ -2010,7 +2082,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const cfgEmbed = new EmbedBuilder().setTitle("🛡️ Guardian Bot — Configuration").setColor(COLORS.info)
         .addFields(
           { name: "🔧 Infrastructure", value: "​", inline: false },
-          { name: "Owner",        value: `<@${BOT_OWNER_ID}>`, inline: true },
+          { name: "Owner(s)",     value: [...BOT_OWNER_IDS].map(id => `<@${id}>`).join(", "), inline: true },
           { name: "Log Channel",  value: gcfg.logChannelId ? `<#${gcfg.logChannelId}>` : "❌ Not set", inline: true },
           { name: "Alert Channel",value: gcfg.alertChannelId ? `<#${gcfg.alertChannelId}>` : "(uses log)", inline: true },
           { name: "Msg Log",      value: gcfg.msgLogChannelId ? `<#${gcfg.msgLogChannelId}>` : "❌ Not set", inline: true },
@@ -2061,6 +2133,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp()] });
     }
 
+    // ── /status ────────────────────────────────────────────
+    case "status": {
+      if (!isOwner(interaction.user) && interaction.user.id !== guild.ownerId)
+        return interaction.reply({ content: "❌ Owner only.", ephemeral: true });
+      const mem = process.memoryUsage();
+      const lockedCount = Object.keys(lockdownState).length;
+      return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info)
+        .setTitle("📊 Guardian Bot — Status")
+        .addFields(
+          { name: "Uptime",        value: formatUptime(client.uptime ?? 0), inline: true },
+          { name: "WS Ping",       value: `${client.ws.ping}ms`, inline: true },
+          { name: "Shard",         value: client.shard ? `${client.shard.ids.join(",")}` : "unsharded", inline: true },
+          { name: "Guilds",        value: `${client.guilds.cache.size}`, inline: true },
+          { name: "Memory (RSS)",  value: `${Math.round(mem.rss / 1024 / 1024)} MB`, inline: true },
+          { name: "Guilds in lockdown", value: `${lockedCount}`, inline: true },
+          { name: "Node.js",       value: process.version, inline: true },
+        )
+        .setFooter({ text: "Use /nuketest to check my permissions in this server." })
+        .setTimestamp()] });
+    }
+
     // ── /help ──────────────────────────────────────────────
     case "help": {
       const windowHours = config.modWindowMs / 3600000;
@@ -2083,6 +2176,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "⚙️ /config", value: "View configuration *(bot owner only)*", inline: false },
           { name: "🔧 /setup", value: "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
+          { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },
         )
         .setFooter({ text: "Guardian Bot v2 • Security Suite" }).setTimestamp()] });
@@ -2099,11 +2193,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ── Boot ──────────────────────────────────────────────────────
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Guardian Bot online as ${client.user.tag}`);
-  console.log(`👑 Owner: ${BOT_OWNER_ID}`);
+  console.log(`👑 Owner(s): ${[...BOT_OWNER_IDS].join(", ")}`);
   client.user.setActivity("Protecting the server 🛡️", { type: ActivityType.Watching });
   if (!client.shard || client.shard.ids.includes(0)) await registerCommandsGlobal();
   await clearStaleGuildCommands(); // per-shard: only this shard's own cached guilds
   await recoverMutes();
+  await recoverLockdowns();
 
   // Permission self-audit
   for (const guild of client.guilds.cache.values()) {
@@ -2146,9 +2241,10 @@ client.on(Events.GuildCreate, async (guild) => {
     }
   } catch (_) {}
   if (config.ownerDM)
-    client.users.fetch(BOT_OWNER_ID)
-      .then(u => u.send(`➕ Guardian was added to **${guild.name}** (\`${guild.id}\`). Run \`/setup quick\` there to auto-provision a mute role + log channels in one step, then \`/setup roles mod_role:@YourStaffRole\` to finish.`))
-      .catch(() => {});
+    for (const id of BOT_OWNER_IDS)
+      client.users.fetch(id)
+        .then(u => u.send(`➕ Guardian was added to **${guild.name}** (\`${guild.id}\`). Run \`/setup quick\` there to auto-provision a mute role + log channels in one step, then \`/setup roles mod_role:@YourStaffRole\` to finish.`))
+        .catch(() => {});
 });
 
 // Periodic sweep: trim stale tracker entries + self-defense health check.
@@ -2194,4 +2290,22 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-client.login(TOKEN);
+// Only actually connect to Discord when run directly (`node index.js` / `npm start`),
+// not when required by the test suite (`require("../index.js")`).
+if (require.main === module) client.login(TOKEN);
+
+// ── Exports (for the test suite — node:test in test/*.test.js) ─────────────
+// Deliberately limited to pure/state-only logic that doesn't need a live
+// Discord connection: config merging, rate limits, lockdown state, warn
+// escalation math, embed formatting helpers. Discord-event handlers and
+// anything that touches the gateway are exercised by hand against a real
+// bot instead — there's no practical way to unit-test those without it.
+module.exports = {
+  gc, setGuild, ap, setAntiPing,
+  isOwner, BOT_OWNER_IDS,
+  checkModLimit, recordModAction, pruneWindow,
+  bump, resetBump, bumpStorm,
+  isLockdown, setLockdown, clearLockdown,
+  buildBar, usageFooter, renderAntiPingResponse,
+  canActOn,
+};
