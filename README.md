@@ -2,7 +2,8 @@
 
 A multi-server Discord security bot: anti-nuke, anti-raid, anti-spam,
 anti-ping, warnings with auto-escalation, full-guild snapshots/rollback,
-and per-server configuration — all backed by SQLite.
+a button-driven ticket system with transcripts, and per-server
+configuration — all backed by SQLite.
 
 ## Requirements
 
@@ -80,7 +81,7 @@ invocation of a hidden owner command is written to the local
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/config` `/status` `/antiping` `/nuketest` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/config` `/status` `/antiping` `/nuketest` |
 
 ## Security systems
 
@@ -110,10 +111,50 @@ invocation of a hidden owner command is written to the local
   rebuilds them (permissions, position, channel access, members) from
   that backup.
 
+## Ticket system
+
+A button-driven ticket panel: one embed with a button per ticket type,
+each type routing to its own log/transcript channel.
+
+**Configuring it:**
+
+- `/tickets addtype key:<id> label:<text> emoji:<emoji> log_channel:<#channel>` — add or update a type
+- `/tickets removetype key:<id>`
+- `/tickets listtypes`
+- `/tickets category category:<#category>` — where new ticket channels get created (auto-creates a "Tickets" category on first use if you never set one)
+- `/tickets panel [channel]` — post the panel, or refresh it in place if one's already posted
+
+**The flow, end to end:**
+
+1. A user clicks a type button on the panel → gets a short modal ("Briefly
+   describe your issue").
+2. Submitting it creates a private channel under the ticket category,
+   visible only to them, the configured mod role, and the bot. A welcome
+   embed posts with their reason and **Claim**/**Close Ticket** buttons.
+   One open ticket per user per type is enforced — clicking again just
+   points them at their existing one.
+3. **Claim** (staff only) marks who's handling it and updates the status
+   field on the welcome embed.
+4. **Close** (staff or the ticket opener) generates a full HTML transcript
+   of the channel (dark-themed, styled to resemble Discord itself),
+   posts it — along with a summary embed (opener, closer, claimer,
+   duration, reason) — to that ticket type's configured log channel, then
+   deletes the channel a few seconds later.
+
+**Zero-touch setup for this specific deployment:** if `GUILD_ID` is set in
+`.env`, the exact panel channel and five ticket types (Report Player,
+General Support, Ban Appeals, Staff Reports, Police Reports — each with
+its own log channel) requested for this bot are seeded automatically on
+first boot, and the panel is posted automatically once it's up — no
+commands needed. This seed only ever runs once, only for that one guild,
+and never overwrites an existing configuration; every other server (or
+this one, to reconfigure) uses the `/tickets` commands above.
+
 ## Data
 
 Runtime state (guild settings, anti-ping config, warnings, muted-role
-stashes, snapshots, failsafe backups) lives in `guardian.db`, a
+stashes, snapshots, failsafe backups, ticket config, open-ticket tracking)
+lives in `guardian.db`, a
 `better-sqlite3` database created automatically on first boot. Legacy
 JSON files (`antiping.json`, `mutedroles.json`, `warnings.json`, etc.) are
 imported into it once if present, then no longer used. All of these are
@@ -128,7 +169,8 @@ npm run check   # syntax check (node --check) for index.js and shard.js
 npm run lint    # eslint .
 npm test        # node --test — unit tests for config merging, per-guild rate
                  # limits/lockdown isolation (incl. surviving a simulated
-                 # restart), permission checks, and formatting helpers
+                 # restart), ticket config/open-ticket isolation, permission
+                 # checks, and formatting helpers
 ```
 
 `index.js` exports its pure/state-only logic (guarded behind
@@ -138,11 +180,12 @@ npm test        # node --test — unit tests for config merging, per-guild rate
 three on every push/PR against Node 20 and 22.
 
 **What's covered by automated tests vs. only by manual testing:** the
-per-guild isolation of rate limits/lockdown/config (including that it
-survives a restart), and the permission-hierarchy logic, are covered by
-real regression tests. Anything that requires a live gateway connection —
-the actual anti-nuke/anti-raid/anti-spam detection firing against real
-Discord events, role/channel snapshot-and-restore, mute-role stashing —
-is not, and has only been exercised by hand. Treat this bot as reviewed-
-and-tested-where-practical, not as verified against live abuse scenarios
-at scale.
+per-guild isolation of rate limits/lockdown/config/ticket state (including
+that it survives a restart), and the permission-hierarchy logic, are
+covered by real regression tests. Anything that requires a live gateway
+connection — the actual anti-nuke/anti-raid/anti-spam detection firing
+against real Discord events, role/channel snapshot-and-restore, mute-role
+stashing, and the whole ticket flow (button clicks, modal submission,
+channel creation, claim/close, transcript generation) — is not, and has
+only been exercised by hand. Treat this bot as reviewed-and-tested-where-
+practical, not as verified against live abuse scenarios at scale.
