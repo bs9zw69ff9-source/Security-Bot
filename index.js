@@ -523,7 +523,7 @@ async function runRestore(message) {
       for (const p of new PermissionsBitField(BigInt(ow.allow)).toArray()) opts[p] = true;
       for (const p of new PermissionsBitField(BigInt(ow.deny)).toArray())  opts[p] = false;
       const ok = await ch.permissionOverwrites
-        .edit(role.id, opts, { reason: "Failsafe restore: channel access" })
+        .edit(role, opts, { reason: "Failsafe restore: channel access" })
         .then(() => true).catch(() => false);
       if (ok) owRestored++;
     }
@@ -1905,12 +1905,16 @@ async function createTicketChannel(interaction, key, reason) {
     if (category) setTicketConfig(guild.id, { categoryId: category.id });
   }
 
+  // Explicit `type` (0 = role, 1 = member) on every overwrite — without it,
+  // discord.js tries to guess by checking caches and throws "Supplied
+  // parameter is not a cached User or Role" whenever it can't resolve one
+  // (e.g. a modRoleId that isn't cached at that instant).
   const g = gc(guild);
   const overwrites = [
-    { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-    { id: member.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles] },
+    { id: guild.id, type: 0, deny: [PermissionsBitField.Flags.ViewChannel] },
+    { id: member.id, type: 1, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles] },
   ];
-  if (g.modRoleId) overwrites.push({ id: g.modRoleId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.ManageMessages] });
+  if (g.modRoleId) overwrites.push({ id: g.modRoleId, type: 0, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.ManageMessages] });
 
   const safeName = (member.user.username || "user").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 20) || "user";
   const channelName = `${type.key.replace(/_/g, "-")}-${safeName}`.slice(0, 90);
