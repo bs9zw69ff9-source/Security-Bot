@@ -488,13 +488,17 @@ function loadSnapshots() { importJsonIfPresent("snapshots", SNAPSHOT_FILE); snap
 function saveSnapshots(gid) { dbPut("snapshots", gid, snapshots[gid]); }
 loadSnapshots();
 
-function snapshotGuild(guild) {
+async function snapshotGuild(guild) {
+  // Full member cache is required to capture accurate role membership (large
+  // guilds don't get a complete member list from the gateway by default).
+  await guild.members.fetch().catch(() => {});
   const roles = [...guild.roles.cache.values()]
     .filter(r => r.id !== guild.id && !r.managed)
     .sort((a, b) => a.position - b.position)
     .map(r => ({
       id: r.id, name: r.name, color: r.color, hoist: r.hoist, mentionable: r.mentionable,
       permissions: r.permissions.bitfield.toString(), position: r.position,
+      members: r.members.map(m => m.id),
     }));
   const channels = [...guild.channels.cache.values()]
     .filter(c => !(c.isThread && c.isThread()))
@@ -514,23 +518,78 @@ function snapshotGuild(guild) {
   return { roles: roles.length, channels: channels.length };
 }
 
-// Rebuild whatever the latest snapshot has that's currently missing (matched by name).
+// Restore the guild to look EXACTLY like the latest snapshot: deletes anything
+// not in the snapshot (roles/channels), corrects anything that drifted
+// (permissions, overwrites, channel settings), re-syncs role membership to
+// match exactly (adds AND removes), and recreates anything missing.
+// Destructive by design — requires a ✅ confirmation before touching anything.
 async function rollbackGuild(guild, message) {
   const snap = (snapshots[guild.id] || []).slice(-1)[0];
   if (!snap) { message?.reply("❌ No snapshot available yet. Run `!snapshot` first."); return; }
-  message?.reply(`♻️ **Rolling back** to snapshot from <t:${Math.floor(snap.takenAt / 1000)}:R> — recreating missing roles & channels…`).catch(() => {});
+
   await guild.roles.fetch().catch(() => {});
   await guild.channels.fetch().catch(() => {});
+  await guild.members.fetch().catch(() => {});
 
-  // Roles: map old-id → live role by name, recreating any that are gone.
-  const roleMap = {}; let rolesCreated = 0;
+  const snapRoleNames = new Set(snap.roles.map(r => r.name));
+  const extraRoles = guild.roles.cache.filter(r =>
+    r.id !== guild.id && !r.managed && !snapRoleNames.has(r.name));
+  const snapChanKeys = new Set(snap.channels.map(c => `${c.name}::${c.type}`));
+  const extraChannels = guild.channels.cache.filter(c =>
+    !(c.isThread && c.isThread()) && !snapChanKeys.has(`${c.name}::${c.type}`));
+
+  if (message) {
+    const warning = await message.reply(
+      `⚠️ **Full rollback to the snapshot from <t:${Math.floor(snap.takenAt / 1000)}:R>.** This will:\n` +
+      `• **Delete ${extraRoles.size}** role(s) not in that snapshot\n` +
+      `• **Delete ${extraChannels.size}** channel(s) not in that snapshot\n` +
+      `• Correct permissions/overwrites on everything else to match exactly\n` +
+      `• Re-sync role membership to match the snapshot (adds **and** removes members)\n\n` +
+      `Anything created since the snapshot was taken — legitimate or not — will be deleted. ` +
+      `React with ✅ within 30s to confirm, or ignore to cancel.`
+    ).catch(() => null);
+    if (!warning) return;
+    await warning.react("✅").catch(() => {});
+    const collected = await warning.awaitReactions({
+      filter: (reaction, user) => reaction.emoji.name === "✅" && user.id === message.author.id,
+      max: 1, time: 30000,
+    }).catch(() => null);
+    if (!collected || !collected.size) {
+      await message.reply("❌ Rollback cancelled — no confirmation received within 30s.").catch(() => {});
+      return;
+    }
+  }
+
+  message?.reply(`♻️ **Rolling back** to snapshot from <t:${Math.floor(snap.takenAt / 1000)}:R> — deleting extras, correcting drift, recreating missing…`).catch(() => {});
+
+  // 1) Delete anything not in the snapshot. Channels before categories so an
+  //    emptied category isn't left behind pointlessly (not required, just tidy).
+  let rolesDeleted = 0;
+  for (const role of extraRoles.values()) {
+    if (!role.editable) continue;
+    const ok = await role.delete("Rollback: not in snapshot").then(() => true).catch(() => false);
+    if (ok) rolesDeleted++;
+  }
+  let chansDeleted = 0;
+  const extraOrdered = [
+    ...extraChannels.filter(c => c.type !== ChannelType.GuildCategory).values(),
+    ...extraChannels.filter(c => c.type === ChannelType.GuildCategory).values(),
+  ];
+  for (const ch of extraOrdered) {
+    const ok = await ch.delete("Rollback: not in snapshot").then(() => true).catch(() => false);
+    if (ok) chansDeleted++;
+  }
+
+  // 2) Roles: correct existing ones (matched by name) to match exactly; create missing ones.
+  const roleMap = {}; let rolesCreated = 0, rolesCorrected = 0;
   for (const sr of [...snap.roles].sort((a, b) => a.position - b.position)) {
     let live = guild.roles.cache.find(r => r.name === sr.name && !r.managed && r.id !== guild.id);
-    if (!live) {
-      live = await guild.roles.create({
-        name: sr.name, color: sr.color, hoist: sr.hoist, mentionable: sr.mentionable,
-        permissions: BigInt(sr.permissions), reason: "Rollback: recreate role",
-      }).catch(() => null);
+    const props = { name: sr.name, color: sr.color, hoist: sr.hoist, mentionable: sr.mentionable, permissions: BigInt(sr.permissions) };
+    if (live) {
+      const ok = await live.edit({ ...props, reason: "Rollback: correct drifted role" }).then(() => true).catch(() => false);
+      if (ok) rolesCorrected++;
+    } else {
+      live = await guild.roles.create({ ...props, reason: "Rollback: recreate role" }).catch(() => null);
       if (live) rolesCreated++;
     }
     if (live) roleMap[sr.id] = live;
@@ -539,6 +598,27 @@ async function rollbackGuild(guild, message) {
     role: role.id, position: snap.roles.find(r => r.id === oldId)?.position || 1,
   }));
   if (rolePos.length) await guild.roles.setPositions(rolePos).catch(() => {});
+
+  // 2b) Re-sync role membership exactly to the snapshot: add whoever's missing,
+  //     remove whoever has the role now but isn't in the snapshot's member list.
+  let membersAdded = 0, membersRemoved = 0;
+  for (const sr of snap.roles) {
+    const live = roleMap[sr.id];
+    if (!live) continue;
+    const wanted = new Set(sr.members || []);
+    for (const uid of wanted) {
+      if (live.members.has(uid)) continue;
+      const m = await guild.members.fetch(uid).catch(() => null);
+      if (!m) continue;
+      const ok = await m.roles.add(live, "Rollback: restore role membership").then(() => true).catch(() => false);
+      if (ok) membersAdded++;
+    }
+    for (const m of live.members.values()) {
+      if (wanted.has(m.id)) continue;
+      const ok = await m.roles.remove(live, "Rollback: role membership not in snapshot").then(() => true).catch(() => false);
+      if (ok) membersRemoved++;
+    }
+  }
 
   // Remap overwrite targets: @everyone (guild.id) is stable, roles remap by name, members stay.
   const remapOw = (ows) => {
@@ -555,33 +635,43 @@ async function rollbackGuild(guild, message) {
     return out;
   };
 
-  // Channels: categories first (so children can attach), then everything else. Match by name+type.
-  const chanMap = {}; let chansCreated = 0;
+  // 3) Channels: correct existing ones (incl. overwrites) to match exactly; create missing ones.
+  //    Categories first so children can attach to a freshly created one.
+  const chanMap = {}; let chansCreated = 0, chansCorrected = 0;
   const cats = snap.channels.filter(c => c.type === ChannelType.GuildCategory);
   const rest = snap.channels.filter(c => c.type !== ChannelType.GuildCategory);
   for (const c of cats) {
     let live = guild.channels.cache.find(ch => ch.type === ChannelType.GuildCategory && ch.name === c.name);
-    if (!live) {
-      live = await guild.channels.create({ name: c.name, type: ChannelType.GuildCategory, permissionOverwrites: remapOw(c.overwrites), reason: "Rollback" }).catch(() => null);
+    const overwrites = remapOw(c.overwrites);
+    if (live) {
+      await live.permissionOverwrites.set(overwrites, "Rollback: correct category overwrites").catch(() => {});
+      chansCorrected++;
+    } else {
+      live = await guild.channels.create({ name: c.name, type: ChannelType.GuildCategory, permissionOverwrites: overwrites, reason: "Rollback" }).catch(() => null);
       if (live) chansCreated++;
     }
     if (live) chanMap[c.id] = live;
   }
   for (const c of rest) {
     let live = guild.channels.cache.find(ch => ch.name === c.name && ch.type === c.type);
-    if (!live) {
-      const opts = { name: c.name, type: c.type, permissionOverwrites: remapOw(c.overwrites), reason: "Rollback" };
-      if (c.parentId && chanMap[c.parentId]) opts.parent = chanMap[c.parentId].id;
-      if (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) {
-        if (c.topic) opts.topic = c.topic;
-        opts.nsfw = !!c.nsfw;
-        if (c.rateLimit) opts.rateLimitPerUser = c.rateLimit;
-      }
-      if (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice) {
-        if (c.bitrate) opts.bitrate = c.bitrate;
-        if (c.userLimit) opts.userLimit = c.userLimit;
-      }
-      live = await guild.channels.create(opts).catch(() => null);
+    const overwrites = remapOw(c.overwrites);
+    const opts = { name: c.name, type: c.type, reason: "Rollback" };
+    if (c.parentId && chanMap[c.parentId]) { opts.parent = chanMap[c.parentId].id; opts.lockPermissions = false; }
+    if (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) {
+      opts.topic = c.topic || null;
+      opts.nsfw = !!c.nsfw;
+      opts.rateLimitPerUser = c.rateLimit || 0;
+    }
+    if (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice) {
+      if (c.bitrate) opts.bitrate = c.bitrate;
+      opts.userLimit = c.userLimit || 0;
+    }
+    if (live) {
+      await live.edit(opts).catch(() => {});
+      await live.permissionOverwrites.set(overwrites, "Rollback: correct channel overwrites").catch(() => {});
+      chansCorrected++;
+    } else {
+      live = await guild.channels.create({ ...opts, permissionOverwrites: overwrites }).catch(() => null);
       if (live) chansCreated++;
     }
     if (live) chanMap[c.id] = live;
@@ -593,10 +683,11 @@ async function rollbackGuild(guild, message) {
   }
 
   const report =
-    `♻️ **Rollback complete.**\n` +
-    `• Roles recreated: **${rolesCreated}**\n` +
-    `• Channels recreated: **${chansCreated}**\n` +
-    `_Existing items (matched by name) were left untouched; only missing ones were rebuilt. Recreated items get new IDs._`;
+    `♻️ **Full rollback complete.**\n` +
+    `• Roles: **${rolesCreated}** created, **${rolesCorrected}** corrected, **${rolesDeleted}** deleted (not in snapshot)\n` +
+    `• Channels: **${chansCreated}** created, **${chansCorrected}** corrected, **${chansDeleted}** deleted (not in snapshot)\n` +
+    `• Role membership: **${membersAdded}** added, **${membersRemoved}** removed to match the snapshot\n` +
+    `_Recreated items get new Discord-assigned IDs; matched-by-name items were corrected in place._`;
   message?.reply(report).catch(() => {});
   alertOwner(guild, report, COLORS.success, "ROLLBACK");
 }
@@ -1413,7 +1504,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (cmd === "!failsafe") return await runFailsafe(message);
     if (cmd === "!restore")  return await runRestore(message);
     if (cmd === "!snapshot") {
-      const r = snapshotGuild(message.guild);
+      const r = await snapshotGuild(message.guild);
       const kept = (snapshots[message.guild.id] || []).length;
       secLog(message.guild, "Snapshot Taken", `<@${message.author.id}> took a manual snapshot — **${r.roles}** roles, **${r.channels}** channels.`, COLORS.success);
       return message.reply(`📸 Snapshot saved — **${r.roles}** roles, **${r.channels}** channels. (${kept}/${config.snapshotMax} kept)`);
@@ -1432,7 +1523,7 @@ client.on(Events.MessageCreate, async (message) => {
         "`!restore` — rebuild those roles (perms, position, channel access, members)\n" +
         "`!snapshot` — take a full-guild snapshot now\n" +
         "`!snapshots` — list stored snapshots\n" +
-        "`!rollback` — rebuild missing roles & channels from the latest snapshot");
+        "`!rollback` — **destructive**: restore the server to exactly match the latest snapshot — deletes roles/channels not in it, corrects drifted permissions, re-syncs role membership. Asks for ✅ confirmation first.");
     }
   } catch (e) {
     console.error("⚠️ owner command failed:", e.message);
@@ -2214,10 +2305,10 @@ client.once(Events.ClientReady, async () => {
 
   // Take an initial full-guild snapshot, then keep rolling snapshots for nuke recovery.
   for (const guild of client.guilds.cache.values()) {
-    try { const r = snapshotGuild(guild); console.log(`📸 [${guild.name}] snapshot: ${r.roles} roles, ${r.channels} channels`); } catch (_) {}
+    try { const r = await snapshotGuild(guild); console.log(`📸 [${guild.name}] snapshot: ${r.roles} roles, ${r.channels} channels`); } catch (_) {}
   }
-  const snapTimer = setInterval(() => {
-    for (const guild of client.guilds.cache.values()) { try { snapshotGuild(guild); } catch (_) {} }
+  const snapTimer = setInterval(async () => {
+    for (const guild of client.guilds.cache.values()) { try { await snapshotGuild(guild); } catch (_) {} }
   }, config.snapshotIntervalMs);
   if (snapTimer.unref) snapTimer.unref();
 });
@@ -2229,7 +2320,7 @@ process.on("unhandledRejection", e => console.error("unhandledRejection:", e));
 // already cover new guilds automatically — no per-guild registration needed.)
 client.on(Events.GuildCreate, async (guild) => {
   console.log(`➕ Joined guild ${guild.name} (${guild.id})`);
-  try { snapshotGuild(guild); } catch (_) {}
+  try { await snapshotGuild(guild); } catch (_) {}
   // Clear any stray guild-scoped commands (e.g. from earlier per-guild testing on
   // this server before Guardian was invited) so nothing duplicates the global set.
   try {

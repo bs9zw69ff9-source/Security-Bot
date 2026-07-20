@@ -97,9 +97,14 @@ invocation of a hidden owner command is written to the local
   invite links, and scam/phishing/IP-grabber links.
 - **Anti-ping** — configurable per-server protection for staff/VIPs from
   being pinged, with warn/mute/timeout responses (`/antiping`).
-- **Snapshots & rollback** — periodic full-guild snapshots (roles +
-  channels incl. permission overwrites); `!rollback` recreates whatever a
-  snapshot has that's currently missing.
+- **Snapshots & rollback** — periodic full-guild snapshots (roles + role
+  membership, channels + permission overwrites). `!rollback` is a full,
+  destructive restore to exactly match the latest snapshot: deletes any
+  role/channel not in it, corrects permissions/overwrites that drifted on
+  everything else, and re-syncs role membership (adds *and* removes
+  members to match). Requires a ✅ reaction to confirm before it touches
+  anything, since it will delete anything created since the snapshot was
+  taken — legitimate or not.
 - **Failsafe** — `!failsafe` backs up and deletes the roles configured
   via `/setup failsafe` for that server and kicks every bot; `!restore`
   rebuilds them (permissions, position, channel access, members) from
