@@ -445,12 +445,12 @@ function migrateApplicationsToHomeGuild() {
       reviewChannelId: "1528754486678392875",
       acceptedRoleIds: ["1528754350963556466"],
       questions: [
-        "How old are you?",
-        "Whats your discord and ingame name",
-        "Why do you want to join the staff team?",
-        "How will you help?",
-        "What will you provide for the community?",
-        "What would you do if a higher up is abusing?",
+        "DOB",
+        "IGN",
+        "Do you have any previous experience and how did you learn from that",
+        "Why do you wish to join",
+        "How will you make a meaningful impact to the community",
+        "How are you better than other applicants",
       ],
       minAge: 15, minMemberTime: "2 weeks",
     },
@@ -495,6 +495,27 @@ function migrateApplicationRequirements() {
   console.log(`📝 Applied per-application requirements (staff 15/2wk, family 14/3d, nypd 14/1wk) for home guild (${GUILD_ID})`);
 }
 migrateApplicationRequirements();
+
+// Backfill the new staff application questions onto the home guild's
+// already-seeded staff app. Runs once, guarded by staffQuestionsV2, so it
+// never clobbers a later manual edit via /applications setquestions.
+function migrateStaffQuestionsV2() {
+  if (!GUILD_ID) return;
+  const cfg = applicationConfigs[GUILD_ID];
+  if (!cfg || !cfg.apps || cfg.staffQuestionsV2) return;
+  if (cfg.apps.staff) cfg.apps.staff.questions = [
+    "DOB",
+    "IGN",
+    "Do you have any previous experience and how did you learn from that",
+    "Why do you wish to join",
+    "How will you make a meaningful impact to the community",
+    "How are you better than other applicants",
+  ];
+  cfg.staffQuestionsV2 = true;
+  saveApplicationConfig(GUILD_ID);
+  console.log(`📝 Applied updated staff application questions for home guild (${GUILD_ID})`);
+}
+migrateStaffQuestionsV2();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
@@ -1065,6 +1086,9 @@ const commands = [
     .addSubcommand(s => s.setName("removerole").setDescription("Remove an accepted-role from an application")
       .addStringOption(o => o.setName("key").setDescription("The application's key").setRequired(true))
       .addRoleOption(o => o.setName("role").setDescription("Role to remove").setRequired(true)))
+    .addSubcommand(s => s.setName("setquestions").setDescription("Replace an application's questions")
+      .addStringOption(o => o.setName("key").setDescription("The application's key").setRequired(true))
+      .addStringOption(o => o.setName("questions").setDescription("Questions separated by | (pipe), in order").setRequired(true).setMaxLength(4000)))
     .addSubcommand(s => s.setName("open").setDescription("Open an application so users can apply (or 'all')")
       .addStringOption(o => o.setName("key").setDescription("The application's key, or 'all' for every application").setRequired(true)))
     .addSubcommand(s => s.setName("close").setDescription("Close an application so users can't apply (or 'all')")
@@ -3414,6 +3438,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         setApplication(guild.id, key, { acceptedRoleIds: (app.acceptedRoleIds || []).filter(id => id !== role.id) });
         return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `<@&${role.id}> removed from **${app.label}** accepted-roles.`, "Applications")] });
       }
+      if (sub === "setquestions") {
+        const questions = interaction.options.getString("questions").split("|").map(q => q.trim()).filter(Boolean);
+        if (!questions.length) return interaction.reply({ content: "Give at least one question, separated by `|`.", ephemeral: true });
+        setApplication(guild.id, key, { questions });
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success,
+          `**${app.label}** now has **${questions.length}** question(s):\n${questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}`, "Applications")] });
+      }
       return;
     }
 
@@ -3455,7 +3486,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "⚙️ /config", value: "View configuration *(bot owner only)*", inline: false },
           { name: "🔧 /setup", value: "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", inline: false },
           { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", inline: false },
-          { name: "📝 /applications", value: "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole` - configure the application system *(bot/server owner only)*", inline: false },
+          { name: "📝 /applications", value: "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole`/`setquestions` - configure the application system *(bot/server owner only)*", inline: false },
           { name: "👮 /police", value: "`manual setup [channel]` - post the officer guide & procedures manual *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },

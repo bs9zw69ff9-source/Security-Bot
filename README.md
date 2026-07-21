@@ -171,6 +171,7 @@ posts/refreshes the whole panel for that application's channel.
 - `/applications setreview key:<key> channel:<#channel>` - where submitted applications go for staff review
 - `/applications setpanelchannel key:<key> channel:<#channel>` - where the Apply button panel is posted
 - `/applications addrole key:<key> role:<@role>` / `removerole` - roles granted on acceptance
+- `/applications setquestions key:<key> questions:<q1|q2|q3>` - replace an application's questions, in order, separated by `|`
 
 **The flow, end to end:**
 
