@@ -48,7 +48,7 @@ const DB_FILE = process.env.GUARDIAN_DB_FILE || path.join(__dirname, "guardian.d
 const db = new Database(DB_FILE);
 db.pragma("journal_mode = WAL");
 db.pragma("busy_timeout = 5000");
-for (const t of ["guild_settings", "antiping", "warnings", "muted_roles", "snapshots", "failsafe", "mod_rates", "lockdown_state", "tickets", "ticket_channels", "applications"])
+for (const t of ["guild_settings", "antiping", "warnings", "muted_roles", "snapshots", "failsafe", "mod_rates", "lockdown_state", "tickets", "ticket_channels", "applications", "chain_of_command"])
   db.exec(`CREATE TABLE IF NOT EXISTS ${t} (guild_id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
 
 function dbLoadAll(table) {
@@ -369,6 +369,23 @@ function findOpenTicketByUser(guildId, userId, typeKey) {
   return null;
 }
 
+// ── Chain of command config (persisted to SQLite `chain_of_command`) ──
+// { [guildId]: { channelId, messageId, roleIds: [] } } - roleIds is the
+// hierarchy order, top rank first; the posted embed lists who currently
+// holds each one, and stays synced as roles change.
+let chainOfCommandConfigs = {};
+function loadChainOfCommandConfigs() { chainOfCommandConfigs = dbLoadAll("chain_of_command"); }
+function saveChainOfCommandConfig(gid) { dbPut("chain_of_command", gid, chainOfCommandConfigs[gid]); }
+loadChainOfCommandConfigs();
+function getChainOfCommand(guildId) {
+  const c = chainOfCommandConfigs[guildId] || {};
+  return { channelId: c.channelId || "", messageId: c.messageId || "", roleIds: Array.isArray(c.roleIds) ? c.roleIds : [] };
+}
+function setChainOfCommand(guildId, patch) {
+  chainOfCommandConfigs[guildId] = { ...getChainOfCommand(guildId), ...patch };
+  saveChainOfCommandConfig(guildId);
+}
+
 // One-time seed: pre-configure the exact ticket types + panel channel requested
 // for the HOME guild (GUILD_ID) only, if nothing's configured yet. Never
 // overwrites an existing configuration, and never applies to any other guild -
@@ -601,6 +618,29 @@ function migrateNypdQuestionsV3() {
   console.log(`📝 Applied expanded NYPD application questions for home guild (${GUILD_ID})`);
 }
 migrateNypdQuestionsV3();
+
+// One-time seed: the requested chain-of-command role hierarchy for the HOME
+// guild (GUILD_ID) only, top rank first. Never overwrites an existing
+// configuration - use /chainofcommand setroles for any other change.
+function migrateChainOfCommandToHomeGuild() {
+  if (!GUILD_ID) return;
+  if (getChainOfCommand(GUILD_ID).roleIds.length) return;
+  setChainOfCommand(GUILD_ID, {
+    roleIds: [
+      "1528754338472792085",
+      "1528754340964208702",
+      "1529251949671743671",
+      "1529251385424609350",
+      "1529252146925535345",
+      "1529184247800266834",
+      "1529184185137500192",
+      "1529252370586796213",
+      "1529184126358257684",
+    ],
+  });
+  console.log(`📋 Seeded chain-of-command role order for home guild (${GUILD_ID})`);
+}
+migrateChainOfCommandToHomeGuild();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
@@ -1184,6 +1224,15 @@ const commands = [
     .addSubcommandGroup(g => g.setName("manual").setDescription("Officer guide & procedures manual")
       .addSubcommand(s => s.setName("setup").setDescription("Post the officer guide & procedures manual in a channel")
         .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (defaults to this channel)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))),
+
+  new SlashCommandBuilder()
+    .setName("chainofcommand").setDescription("Auto-updating chain of command")
+    .addSubcommand(s => s.setName("setup").setDescription("Post (or move) the chain-of-command embed")
+      .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (defaults to this channel)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+    .addSubcommand(s => s.setName("setroles").setDescription("Replace the role hierarchy, top rank first")
+      .addStringOption(o => o.setName("roles").setDescription("Roles in order, mentioned or as IDs, separated by spaces or commas").setRequired(true)))
+    .addSubcommand(s => s.setName("refresh").setDescription("Manually re-render the chain-of-command embed now"))
+    .addSubcommand(s => s.setName("view").setDescription("Show the configured channel and role order")),
 
   new SlashCommandBuilder().setName("help").setDescription("Show all Guardian Bot commands"),
 ];
@@ -2750,6 +2799,54 @@ async function handleAppDenyReason(interaction) {
   return performAppDeny(interaction, key, userId, reason || null, messageId);
 }
 
+// ── Chain of Command ──────────────────────────────────────────
+// A single embed listing each configured role (in hierarchy order) next to
+// whoever currently holds it. Posted once via /chainofcommand setup, then
+// kept in sync automatically as members' roles change.
+function buildChainOfCommandEmbed(guild, roleIds) {
+  const e = new EmbedBuilder().setColor(COLORS.info).setTitle("📋 Chain of Command").setTimestamp();
+  for (const roleId of roleIds) {
+    const role = guild.roles.cache.get(roleId);
+    if (!role) continue;
+    const holders = [...role.members.values()].sort((a, b) => a.user.username.localeCompare(b.user.username));
+    e.addFields({
+      name: `<@&${roleId}>`,
+      value: holders.length ? holders.map(m => `<@${m.id}>`).join("\n") : "*(none)*",
+      inline: false,
+    });
+  }
+  if (!e.data.fields?.length) e.setDescription("None of the configured roles exist in this server anymore.");
+  return e;
+}
+
+// Post or refresh (edit-in-place) the chain-of-command message for a guild,
+// if one is configured. Safe to call often - a no-op when unconfigured.
+async function renderChainOfCommand(guild) {
+  const cfg = getChainOfCommand(guild.id);
+  if (!cfg.channelId || !cfg.roleIds.length) return;
+  const channel = guild.channels.cache.get(cfg.channelId);
+  if (!channel) return;
+  const payload = { embeds: [buildChainOfCommandEmbed(guild, cfg.roleIds)] };
+  if (cfg.messageId) {
+    const existing = await channel.messages.fetch(cfg.messageId).catch(() => null);
+    if (existing) { await existing.edit(payload).catch(() => {}); return; }
+  }
+  const posted = await channel.send(payload).catch(() => null);
+  if (posted) setChainOfCommand(guild.id, { messageId: posted.id });
+}
+
+// Debounced per-guild refresh so a burst of role changes (e.g. a bulk sync)
+// collapses into one re-render instead of one edit per member.
+const chainOfCommandRefreshTimers = new Map(); // guildId -> Timeout
+function scheduleChainOfCommandRefresh(guild) {
+  const cfg = getChainOfCommand(guild.id);
+  if (!cfg.channelId || !cfg.roleIds.length) return;
+  clearTimeout(chainOfCommandRefreshTimers.get(guild.id));
+  const t = setTimeout(() => renderChainOfCommand(guild).catch(() => {}), 3000);
+  if (t.unref) t.unref();
+  chainOfCommandRefreshTimers.set(guild.id, t);
+}
+
 // ── Police Department Manual ──────────────────────────────────
 // A single static embed: the officer guide & procedures reference posted via
 // /police manual setup. One long description rather than fields, so it reads
@@ -3564,6 +3661,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    // ── /chainofcommand ─────────────────────────────────────
+    case "chainofcommand": {
+      if (!isOwner(member) && member.id !== guild.ownerId)
+        return interaction.reply({ content: "Only the bot owner or the server owner can set up the chain of command.", ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === "setroles") {
+        const raw = interaction.options.getString("roles");
+        const roleIds = [...new Set(raw.match(/\d{15,25}/g) || [])];
+        if (!roleIds.length) return interaction.reply({ content: "Give at least one role, mentioned or by ID.", ephemeral: true });
+        setChainOfCommand(guild.id, { roleIds });
+        await renderChainOfCommand(guild);
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success,
+          `Chain of command now tracks **${roleIds.length}** role(s), top rank first:\n${roleIds.map((id, i) => `${i + 1}. <@&${id}>`).join("\n")}`, "Chain of Command")] });
+      }
+      if (sub === "setup") {
+        const cfg = getChainOfCommand(guild.id);
+        if (!cfg.roleIds.length) return interaction.reply({ content: "No roles configured yet - run `/chainofcommand setroles` first.", ephemeral: true });
+        const channel = interaction.options.getChannel("channel") || interaction.channel;
+        await interaction.deferReply({ ephemeral: true });
+        if (channel.id !== cfg.channelId) setChainOfCommand(guild.id, { channelId: channel.id, messageId: "" });
+        await renderChainOfCommand(guild);
+        return interaction.editReply(`Done - the chain of command is up in <#${channel.id}>, and will keep itself updated as roles change.`);
+      }
+      if (sub === "refresh") {
+        const cfg = getChainOfCommand(guild.id);
+        if (!cfg.channelId || !cfg.roleIds.length) return interaction.reply({ content: "Nothing configured yet - run `/chainofcommand setroles` and `/chainofcommand setup` first.", ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        await renderChainOfCommand(guild);
+        return interaction.editReply("Refreshed.");
+      }
+      if (sub === "view") {
+        const cfg = getChainOfCommand(guild.id);
+        if (!cfg.roleIds.length) return interaction.reply({ content: "No roles configured yet.", ephemeral: true });
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.info,
+          `Channel: ${cfg.channelId ? `<#${cfg.channelId}>` : "*(not set)*"}\n\n${cfg.roleIds.map((id, i) => `${i + 1}. <@&${id}>`).join("\n")}`,
+          "Chain of Command")] });
+      }
+      return;
+    }
+
     // ── /help ──────────────────────────────────────────────
     case "help": {
       const windowHours = config.modWindowMs / 3600000;
@@ -3588,6 +3726,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", inline: false },
           { name: "📝 /applications", value: "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole`/`setquestions` - configure the application system *(bot/server owner only)*", inline: false },
           { name: "👮 /police", value: "`manual setup [channel]` - post the officer guide & procedures manual *(bot/server owner only)*", inline: false },
+          { name: "📋 /chainofcommand", value: "`setroles`/`setup [channel]`/`refresh`/`view` - auto-updating role hierarchy embed *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },
@@ -3678,10 +3817,12 @@ client.once(Events.ClientReady, async () => {
   await recoverMutes();
   await recoverLockdowns();
 
-  // Post any configured ticket + application panels that aren't already up (idempotent).
+  // Post any configured ticket + application panels that aren't already up (idempotent),
+  // and refresh the chain-of-command embed in case roles changed while offline.
   for (const guild of client.guilds.cache.values()) {
     try { await ensureTicketPanel(guild); } catch (_) {}
     try { await ensureApplicationPanels(guild); } catch (_) {}
+    try { await renderChainOfCommand(guild); } catch (_) {}
   }
 
   // Permission self-audit
@@ -3716,6 +3857,7 @@ client.on(Events.GuildCreate, async (guild) => {
   try { await snapshotGuild(guild); } catch (_) {}
   try { await ensureTicketPanel(guild); } catch (_) {}
   try { await ensureApplicationPanels(guild); } catch (_) {}
+  try { await renderChainOfCommand(guild); } catch (_) {}
   // Clear any stray guild-scoped commands (e.g. from earlier per-guild testing on
   // this server before Guardian was invited) so nothing duplicates the global set.
   try {
@@ -3731,6 +3873,19 @@ client.on(Events.GuildCreate, async (guild) => {
       client.users.fetch(id)
         .then(u => u.send(`Just got added to **${guild.name}** (\`${guild.id}\`). To get set up fast, run \`/setup quick\` over there - it'll create a mute role and the log channels for you. Then point me at your staff role with \`/setup roles mod_role:@YourStaffRole\` and you're good.`))
         .catch(() => {});
+});
+
+// Chain of command: refresh whenever a tracked role is gained/lost, or a
+// holder leaves the server outright.
+client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+  const cfg = getChainOfCommand(newMember.guild.id);
+  if (!cfg.roleIds.length) return;
+  const touchesTracked = cfg.roleIds.some(id => oldMember.roles.cache.has(id) !== newMember.roles.cache.has(id));
+  if (touchesTracked) scheduleChainOfCommandRefresh(newMember.guild);
+});
+client.on(Events.GuildMemberRemove, (member) => {
+  const cfg = getChainOfCommand(member.guild.id);
+  if (cfg.roleIds.some(id => member.roles?.cache?.has(id))) scheduleChainOfCommandRefresh(member.guild);
 });
 
 // Periodic sweep: trim stale tracker entries + self-defense health check.

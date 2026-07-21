@@ -81,7 +81,7 @@ invocation of a hidden owner command is written to the local
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/config` `/status` `/antiping` `/nuketest` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/chainofcommand` `/config` `/status` `/antiping` `/nuketest` |
 
 ## Security systems
 
@@ -257,6 +257,28 @@ vehicle pursuits, felony stops, hostage situations, active shooter
 response, and arrest procedures, ending in a final-notes reminder. Nothing
 about it is per-guild configurable beyond where it's posted - re-run the
 command to post an updated copy or move it to a different channel.
+
+## Chain of command
+
+An auto-updating embed listing a role hierarchy, one field per role
+(top rank first), with whoever currently holds it mentioned underneath
+(or `(none)` if nobody does).
+
+- `/chainofcommand setroles roles:<@role1 @role2 ...>` (bot/server owner
+  only) - set the role order, mentioned or by ID, space- or
+  comma-separated
+- `/chainofcommand setup [channel]` - post it (defaults to the channel the
+  command was run in); re-run pointed at a different channel to move it
+- `/chainofcommand refresh` - force an immediate re-render
+- `/chainofcommand view` - show the configured channel and role order
+
+Once posted, it keeps itself in sync: any time a member gains or loses one
+of the tracked roles, or a holder leaves the server, the embed is
+re-rendered within a few seconds (multiple changes in quick succession
+collapse into a single re-render). It also refreshes once per guild on
+bot startup, in case roles changed while it was offline. Role mentions
+resolve live, so a role rename shows up automatically without needing a
+refresh.
 
 ## Data
 
