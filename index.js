@@ -2804,19 +2804,19 @@ async function handleAppDenyReason(interaction) {
 // whoever currently holds it. Posted once via /chainofcommand setup, then
 // kept in sync automatically as members' roles change.
 function buildChainOfCommandEmbed(guild, roleIds) {
-  const e = new EmbedBuilder().setColor(COLORS.info).setTitle("📋 Chain of Command").setTimestamp();
+  // Discord only resolves @mentions in an embed's description/field VALUE,
+  // never in a field NAME - so the role has to live in the description
+  // alongside its holders, not as a field header, or it renders as raw
+  // <@&id> text instead of an actual mention.
+  const blocks = [];
   for (const roleId of roleIds) {
     const role = guild.roles.cache.get(roleId);
     if (!role) continue;
     const holders = [...role.members.values()].sort((a, b) => a.user.username.localeCompare(b.user.username));
-    e.addFields({
-      name: `<@&${roleId}>`,
-      value: holders.length ? holders.map(m => `<@${m.id}>`).join("\n") : "*(none)*",
-      inline: false,
-    });
+    blocks.push(`<@&${roleId}>\n${holders.length ? holders.map(m => `<@${m.id}>`).join("\n") : "*(none)*"}`);
   }
-  if (!e.data.fields?.length) e.setDescription("None of the configured roles exist in this server anymore.");
-  return e;
+  return new EmbedBuilder().setColor(COLORS.info).setTitle("📋 Chain of Command").setTimestamp()
+    .setDescription(blocks.length ? blocks.join("\n\n").slice(0, 4096) : "None of the configured roles exist in this server anymore.");
 }
 
 // Post or refresh (edit-in-place) the chain-of-command message for a guild,
