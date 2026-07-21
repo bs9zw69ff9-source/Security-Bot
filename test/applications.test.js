@@ -48,3 +48,28 @@ test("multiple apps can coexist in one guild without clobbering each other", () 
   assert.equal(bot.getApplication("guildE", "gambino").reviewChannelId, "rev-gambino");
   assert.equal(bot.getApplication("guildE", "colombo").reviewChannelId, "rev-colombo");
 });
+
+test("open/close state: defaults to open, toggles independently, preserves other fields", () => {
+  bot.setApplication("guildF", "staff", { key: "staff", label: "Staff", reviewChannelId: "rev", questions: ["Q1"] });
+  // Undefined `closed` means open by default (backward-compatible with seeded apps).
+  assert.ok(!bot.getApplication("guildF", "staff").closed, "a newly configured app is open by default");
+
+  bot.setApplication("guildF", "staff", { closed: true });
+  assert.equal(bot.getApplication("guildF", "staff").closed, true);
+  assert.equal(bot.getApplication("guildF", "staff").reviewChannelId, "rev", "closing must not wipe other fields");
+  assert.deepEqual(bot.getApplication("guildF", "staff").questions, ["Q1"]);
+
+  bot.setApplication("guildF", "staff", { closed: false });
+  assert.equal(bot.getApplication("guildF", "staff").closed, false);
+});
+
+test("open/close is isolated per app and per guild", () => {
+  bot.setApplication("guildG", "gambino", { key: "gambino", label: "Gambino" });
+  bot.setApplication("guildG", "colombo", { key: "colombo", label: "Colombo" });
+  bot.setApplication("guildH", "gambino", { key: "gambino", label: "Gambino" });
+
+  bot.setApplication("guildG", "gambino", { closed: true });
+  assert.equal(bot.getApplication("guildG", "gambino").closed, true);
+  assert.ok(!bot.getApplication("guildG", "colombo").closed, "closing gambino must not close colombo in the same guild");
+  assert.ok(!bot.getApplication("guildH", "gambino").closed, "closing gambino in guildG must not affect guildH's gambino");
+});

@@ -1041,7 +1041,11 @@ const commands = [
       .addRoleOption(o => o.setName("role").setDescription("Role to grant on accept").setRequired(true)))
     .addSubcommand(s => s.setName("removerole").setDescription("Remove an accepted-role from an application")
       .addStringOption(o => o.setName("key").setDescription("The application's key").setRequired(true))
-      .addRoleOption(o => o.setName("role").setDescription("Role to remove").setRequired(true))),
+      .addRoleOption(o => o.setName("role").setDescription("Role to remove").setRequired(true)))
+    .addSubcommand(s => s.setName("open").setDescription("Open an application so users can apply (or 'all')")
+      .addStringOption(o => o.setName("key").setDescription("The application's key, or 'all' for every application").setRequired(true)))
+    .addSubcommand(s => s.setName("close").setDescription("Close an application so users can't apply (or 'all')")
+      .addStringOption(o => o.setName("key").setDescription("The application's key, or 'all' for every application").setRequired(true))),
 
   new SlashCommandBuilder().setName("help").setDescription("Show all Guardian Bot commands"),
 ];
@@ -2156,23 +2160,54 @@ const pendingApps = new Map();
 function pendingKey(gid, uid, key) { return `${gid}:${uid}:${key}`; }
 
 function buildAppPanelEmbed(guild, app) {
-  return new EmbedBuilder()
-    .setColor(COLORS.info)
-    .setTitle(`${app.emoji || "📝"} ${app.label} Application`)
-    .setDescription(
+  const closed = !!app.closed;
+  const e = new EmbedBuilder()
+    .setColor(closed ? COLORS.neutral : COLORS.info)
+    .setTitle(`${app.emoji || "📝"} ${app.label} Application${closed ? " (Closed)" : ""}`)
+    .setThumbnail(guild.iconURL?.() || null)
+    .setFooter({ text: guild.name })
+    .setTimestamp();
+  if (closed) {
+    e.setDescription(
+      `🔒 **${app.label} applications are currently closed.**\n\n` +
+      `Please check back later - the button below will reactivate when applications reopen.`
+    );
+  } else {
+    e.setDescription(
       `Interested in **${app.label}**? Click the button below to apply.\n\n` +
       `You'll be asked a few quick questions. Answer honestly and completely - our team reviews every submission.\n\n` +
       `**Questions (${app.questions.length}):**\n` +
       app.questions.map((q, i) => `**${i + 1}.** ${q}`).join("\n")
-    )
-    .setThumbnail(guild.iconURL?.() || null)
-    .setFooter({ text: guild.name })
-    .setTimestamp();
+    );
+  }
+  return e;
 }
 function buildAppPanelRow(app) {
+  const closed = !!app.closed;
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`app_apply_${app.key}`).setLabel(`Apply for ${app.label}`.slice(0, 80)).setEmoji(app.emoji || "📝").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`app_apply_${app.key}`)
+      .setLabel(closed ? `${app.label} applications closed`.slice(0, 80) : `Apply for ${app.label}`.slice(0, 80))
+      .setEmoji(closed ? "🔒" : (app.emoji || "📝"))
+      .setStyle(closed ? ButtonStyle.Secondary : ButtonStyle.Primary)
+      .setDisabled(closed),
   );
+}
+
+// Edit an application's existing panel message in place so its open/closed
+// state (button + embed) updates live. Falls back to a fresh post if the
+// stored message is gone. No-op if no panel channel is configured.
+async function refreshAppPanel(guild, app) {
+  if (!app.panelChannelId) return;
+  const channel = guild.channels.cache.get(app.panelChannelId);
+  if (!channel) return;
+  const payload = { embeds: [buildAppPanelEmbed(guild, app)], components: [buildAppPanelRow(app)] };
+  if (app.panelMessageId) {
+    const existing = await channel.messages.fetch(app.panelMessageId).catch(() => null);
+    if (existing) { await existing.edit(payload).catch(() => {}); return; }
+  }
+  const posted = await channel.send(payload).catch(() => null);
+  if (posted) setApplication(guild.id, app.key, { panelMessageId: posted.id });
 }
 
 // Post each app's panel (or leave it if already posted and still present).
@@ -2218,6 +2253,12 @@ async function handleAppApply(interaction) {
   const key = interaction.customId.replace("app_apply_", "");
   const app = getApplication(interaction.guild.id, key);
   if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
+  // Re-check even though the button is disabled when closed - the panel message
+  // could be stale, so never let a closed application accept a submission.
+  if (app.closed) {
+    await refreshAppPanel(interaction.guild, app).catch(() => {}); // resync the stale panel
+    return interaction.reply({ content: `🔒 **${app.label}** applications are currently closed. Please check back later.`, ephemeral: true });
+  }
   if (!app.reviewChannelId) return interaction.reply({ content: "❌ This application isn't fully set up yet (no review channel). Please contact an admin.", ephemeral: true });
   pendingApps.delete(pendingKey(interaction.guild.id, interaction.user.id, key)); // fresh start
   return interaction.showModal(buildAppModal(app, 0));
@@ -2992,7 +3033,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const e = new EmbedBuilder().setColor(COLORS.info).setTitle("📝 Applications").setTimestamp();
         for (const a of apps) {
           e.addFields({
-            name: `${a.emoji || "📝"} ${a.label} (\`${a.key}\`)`,
+            name: `${a.emoji || "📝"} ${a.label} (\`${a.key}\`) - ${a.closed ? "🔒 Closed" : "🟢 Open"}`,
             value: `Panel: ${a.panelChannelId ? `<#${a.panelChannelId}>` : "❌ not set"} · Review: ${a.reviewChannelId ? `<#${a.reviewChannelId}>` : "❌ not set"}\n` +
                    `Roles on accept: ${a.acceptedRoleIds?.length ? a.acceptedRoleIds.map(id => `<@&${id}>`).join(", ") : "none"}\n` +
                    `Questions: ${a.questions?.length || 0}`,
@@ -3000,6 +3041,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
           });
         }
         return interaction.reply({ ephemeral: true, embeds: [e] });
+      }
+
+      // open / close accept a key OR the literal "all" - handle before single-app resolution.
+      if (sub === "open" || sub === "close") {
+        const wantClosed = sub === "close";
+        const rawKey = interaction.options.getString("key")?.trim().toLowerCase();
+        await interaction.deferReply({ ephemeral: true });
+        const targets = rawKey === "all"
+          ? Object.values(getApplications(guild.id))
+          : (getApplication(guild.id, rawKey) ? [getApplication(guild.id, rawKey)] : []);
+        if (!targets.length)
+          return interaction.editReply(`❌ No application with key \`${rawKey}\`. Use \`/applications list\` to see valid keys (or \`all\`).`);
+        const changed = [];
+        for (const a of targets) {
+          setApplication(guild.id, a.key, { closed: wantClosed });
+          await refreshAppPanel(guild, getApplication(guild.id, a.key)).catch(() => {});
+          changed.push(a.label);
+        }
+        secLog(guild, wantClosed ? "Applications Closed" : "Applications Opened",
+          `<@${member.id}> ${wantClosed ? "closed" : "opened"} application(s): ${changed.join(", ")}`, wantClosed ? COLORS.neutral : COLORS.success);
+        return interaction.editReply({ embeds: [embed(wantClosed ? COLORS.neutral : COLORS.success,
+          `${wantClosed ? "🔒 Closed" : "🟢 Opened"} **${changed.length}** application(s): ${changed.join(", ")}.\nThe panel button${changed.length === 1 ? " has" : "s have"} been updated.`, "Applications")] });
       }
 
       const key = interaction.options.getString("key")?.trim().toLowerCase();
@@ -3069,7 +3132,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "⚙️ /config", value: "View configuration *(bot owner only)*", inline: false },
           { name: "🔧 /setup", value: "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", inline: false },
           { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", inline: false },
-          { name: "📝 /applications", value: "`list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole` - configure the application system *(bot/server owner only)*", inline: false },
+          { name: "📝 /applications", value: "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole` - configure the application system *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },

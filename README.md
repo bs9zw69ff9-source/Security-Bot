@@ -158,7 +158,8 @@ step with **Accept**/**Deny** that grants roles on acceptance.
 
 **Configuring it** (`/applications`, bot/server owner only):
 
-- `/applications list` - show every configured application, its panel/review channels, accepted roles, and question count
+- `/applications open key:<key|all>` / `close key:<key|all>` - open or close applications to control intake; the panel's Apply button and embed update live to reflect the state
+- `/applications list` - show every configured application, its open/closed state, panel/review channels, accepted roles, and question count
 - `/applications panel key:<key> [channel]` - post or refresh an application's Apply panel
 - `/applications setreview key:<key> channel:<#channel>` - where submitted applications go for staff review
 - `/applications setpanelchannel key:<key> channel:<#channel>` - where the Apply button panel is posted
@@ -178,6 +179,13 @@ step with **Accept**/**Deny** that grants roles on acceptance.
    buttons, and DMs the applicant.
 4. **Deny** (staff only) opens a short modal for an optional reason, marks
    the embed red, and DMs the applicant with the reason.
+
+**Opening and closing:** each application can be opened or closed with
+`/applications open`/`close` (pass `all` to do every application at once).
+While closed, the panel's Apply button is disabled and relabelled and the
+embed shows a "closed" notice; if someone still manages to click a stale
+button, the submission is refused. Reopening re-enables everything. New
+applications default to open.
 
 **Zero-touch setup for this specific deployment:** if `GUILD_ID` is set,
 four applications are seeded automatically on first boot and their panels
