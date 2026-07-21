@@ -881,6 +881,7 @@ const client = new Client({
     GatewayIntentBits.GuildWebhooks,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.DirectMessages, // needed to receive applicants' DM answers
   ],
   partials: [Partials.Message, Partials.Channel],
 });
@@ -2151,13 +2152,16 @@ async function handleTicketClose(interaction) {
   setTimeout(() => channel.delete("Ticket closed").catch(() => {}), 5000);
 }
 
-// ── Application System (Appy-style forms → staff review → role grant) ──
-const MODAL_MAX_QUESTIONS = 5;        // Discord hard limit: 5 text inputs per modal
-const APP_ANSWER_MAX = 700;           // per-answer cap (keeps the review embed under Discord's 6000-char total)
-// Partial answers for multi-modal (>5 question) applications, held only between
-// the first modal submit and the follow-up modal submit. Keyed "gid:uid:key".
-const pendingApps = new Map();
-function pendingKey(gid, uid, key) { return `${gid}:${uid}:${key}`; }
+// ── Application System (Appy-style DM interview → staff review → role grant) ──
+const APP_QUESTION_TIMEOUT_MS = 10 * 60 * 1000; // per-question DM reply window
+// Users with an in-progress DM interview, so we never start two at once.
+const activeDmApps = new Set(); // userId
+// Per-answer character cap: spread a safe budget across the questions so the
+// finished review embed stays under Discord's 6000-char total, capped at the
+// 1024 per-field limit.
+function appAnswerCap(questionCount) {
+  return Math.max(200, Math.min(1024, Math.floor(5200 / Math.max(questionCount, 1))));
+}
 
 function buildAppPanelEmbed(guild, app) {
   const closed = !!app.closed;
@@ -2175,9 +2179,9 @@ function buildAppPanelEmbed(guild, app) {
   } else {
     e.setDescription(
       `Interested in **${app.label}**? Click the button below to apply.\n\n` +
-      `You'll be asked a few quick questions. Answer honestly and completely - our team reviews every submission.\n\n` +
-      `**Questions (${app.questions.length}):**\n` +
-      app.questions.map((q, i) => `**${i + 1}.** ${q}`).join("\n")
+      `I'll send you the questions in your **DMs**, one at a time - just reply to each. ` +
+      `Make sure your DMs are open, and answer honestly and completely; our team reviews every submission.\n\n` +
+      `You can type **cancel** at any point to stop.`
     );
   }
   return e;
@@ -2228,89 +2232,89 @@ async function ensureApplicationPanels(guild) {
   }
 }
 
-// Build the modal for a given "part" (0-based) of an application. Each part
-// holds up to 5 questions; part index maps to slice [part*5, part*5+5).
-function buildAppModal(app, part) {
-  const start = part * MODAL_MAX_QUESTIONS;
-  const slice = app.questions.slice(start, start + MODAL_MAX_QUESTIONS);
-  const totalParts = Math.ceil(app.questions.length / MODAL_MAX_QUESTIONS);
-  const suffix = totalParts > 1 ? ` (${part + 1}/${totalParts})` : "";
-  const modal = new ModalBuilder().setCustomId(`app_modal_${app.key}_${part}`).setTitle(`${app.label} Application${suffix}`.slice(0, 45));
-  slice.forEach((q, i) => {
-    const input = new TextInputBuilder()
-      .setCustomId(`q${start + i}`)
-      .setLabel(q.length > 45 ? q.slice(0, 44) + "…" : q)
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true)
-      .setMaxLength(APP_ANSWER_MAX);
-    if (q.length > 45) input.setPlaceholder(q.slice(0, 100)); // full question when the label had to be truncated
-    modal.addComponents(new ActionRowBuilder().addComponents(input));
-  });
-  return modal;
-}
-
 async function handleAppApply(interaction) {
   const key = interaction.customId.replace("app_apply_", "");
   const app = getApplication(interaction.guild.id, key);
   if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
   // Re-check even though the button is disabled when closed - the panel message
-  // could be stale, so never let a closed application accept a submission.
+  // could be stale, so never let a closed application start an interview.
   if (app.closed) {
     await refreshAppPanel(interaction.guild, app).catch(() => {}); // resync the stale panel
     return interaction.reply({ content: `🔒 **${app.label}** applications are currently closed. Please check back later.`, ephemeral: true });
   }
   if (!app.reviewChannelId) return interaction.reply({ content: "❌ This application isn't fully set up yet (no review channel). Please contact an admin.", ephemeral: true });
-  pendingApps.delete(pendingKey(interaction.guild.id, interaction.user.id, key)); // fresh start
-  return interaction.showModal(buildAppModal(app, 0));
-}
+  if (!app.questions?.length) return interaction.reply({ content: "❌ This application has no questions configured. Please contact an admin.", ephemeral: true });
+  if (activeDmApps.has(interaction.user.id))
+    return interaction.reply({ content: "❌ You already have an application in progress in your DMs. Finish or type **cancel** there first.", ephemeral: true });
 
-async function handleAppModalSubmit(interaction) {
-  // customId: app_modal_<key>_<part>
-  const rest = interaction.customId.slice("app_modal_".length);
-  const lastUnderscore = rest.lastIndexOf("_");
-  const key = rest.slice(0, lastUnderscore);
-  const part = parseInt(rest.slice(lastUnderscore + 1), 10) || 0;
-  const app = getApplication(interaction.guild.id, key);
-  if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
-
-  const start = part * MODAL_MAX_QUESTIONS;
-  const slice = app.questions.slice(start, start + MODAL_MAX_QUESTIONS);
-  const pKey = pendingKey(interaction.guild.id, interaction.user.id, key);
-  const answers = pendingApps.get(pKey) || [];
-  slice.forEach((_, i) => { answers[start + i] = interaction.fields.getTextInputValue(`q${start + i}`); });
-
-  const totalParts = Math.ceil(app.questions.length / MODAL_MAX_QUESTIONS);
-  if (part + 1 < totalParts) {
-    // More questions remain - stash and offer a Continue button (can't chain modal→modal directly).
-    pendingApps.set(pKey, answers);
-    setTimeout(() => pendingApps.delete(pKey), 15 * 60 * 1000).unref?.();
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`app_continue_${key}_${part + 1}`).setLabel("Continue application").setEmoji("➡️").setStyle(ButtonStyle.Primary));
-    return interaction.reply({ ephemeral: true, content: `✅ Part ${part + 1}/${totalParts} saved. Click **Continue** to finish.`, components: [row] });
+  // Open a DM and send the intro BEFORE acknowledging, so a closed-DM user gets a
+  // clear error instead of silently starting an interview they can't see.
+  let dm;
+  try {
+    dm = await interaction.user.createDM();
+    await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.info)
+      .setTitle(`${app.emoji || "📝"} ${app.label} Application`)
+      .setDescription(
+        `Let's get started! I'll ask you **${app.questions.length}** question${app.questions.length === 1 ? "" : "s"}, one at a time - just reply to each here.\n\n` +
+        `You have **${APP_QUESTION_TIMEOUT_MS / 60000} minutes** per question, and you can type **cancel** anytime to stop.`)
+      .setFooter({ text: interaction.guild.name })
+      .setTimestamp()] });
+  } catch {
+    return interaction.reply({ content: "❌ I couldn't DM you. Enable **Direct Messages** for this server (Privacy Settings → Allow direct messages from server members) and click Apply again.", ephemeral: true });
   }
 
-  // Final part - finalize and submit for review.
-  pendingApps.delete(pKey);
-  return finalizeApplication(interaction, app, answers);
+  await interaction.reply({ content: `📬 Check your DMs - I've sent you the **${app.label}** application. Answer the questions there.`, ephemeral: true });
+  runDmApplication(interaction.guild, interaction.user, app, dm).catch(err => console.error("⚠️ DM application flow failed:", err));
 }
 
-async function handleAppContinue(interaction) {
-  // customId: app_continue_<key>_<part>
-  const rest = interaction.customId.slice("app_continue_".length);
-  const lastUnderscore = rest.lastIndexOf("_");
-  const key = rest.slice(0, lastUnderscore);
-  const part = parseInt(rest.slice(lastUnderscore + 1), 10) || 0;
-  const app = getApplication(interaction.guild.id, key);
-  if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
-  if (!pendingApps.has(pendingKey(interaction.guild.id, interaction.user.id, key)))
-    return interaction.reply({ content: "❌ Your application session expired. Please start over from the panel.", ephemeral: true });
-  return interaction.showModal(buildAppModal(app, part));
+// Walk the applicant through the questions in DMs, one at a time.
+async function runDmApplication(guild, user, app, dm) {
+  activeDmApps.add(user.id);
+  try {
+    const cap = appAnswerCap(app.questions.length);
+    const answers = [];
+    for (let i = 0; i < app.questions.length; i++) {
+      await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.info)
+        .setAuthor({ name: `${app.label} Application`, iconURL: guild.iconURL?.() || undefined })
+        .setTitle(`Question ${i + 1} of ${app.questions.length}`)
+        .setDescription(app.questions[i])
+        .setFooter({ text: "Reply with your answer • type 'cancel' to stop" })] }).catch(() => {});
+
+      const collected = await dm.awaitMessages({ filter: m => m.author.id === user.id, max: 1, time: APP_QUESTION_TIMEOUT_MS }).catch(() => null);
+      if (!collected || !collected.size) {
+        await dm.send({ embeds: [embed(COLORS.neutral, `⏱️ You didn't answer in time, so your **${app.label}** application was cancelled. You can start again from the panel whenever you're ready.`)] }).catch(() => {});
+        return;
+      }
+      const msg = collected.first();
+      let content = (msg.content || "").trim();
+      if (content.toLowerCase() === "cancel") {
+        await dm.send({ embeds: [embed(COLORS.neutral, `❌ Your **${app.label}** application was cancelled. Nothing was submitted.`)] }).catch(() => {});
+        return;
+      }
+      if (!content && msg.attachments?.size) content = [...msg.attachments.values()].map(a => a.url).join("\n"); // image/file-only answer
+      answers.push(content ? content.slice(0, cap) : "*(no answer)*");
+    }
+
+    // The application could have been closed or deleted mid-interview - re-check before submitting.
+    const fresh = getApplication(guild.id, app.key);
+    if (!fresh || fresh.closed || !fresh.reviewChannelId) {
+      await dm.send({ embeds: [embed(COLORS.neutral, `🔒 **${app.label}** applications closed before you finished, so your submission wasn't sent.`)] }).catch(() => {});
+      return;
+    }
+
+    const ok = await finalizeApplication(guild, user, fresh, answers);
+    await dm.send({ embeds: [embed(ok ? COLORS.success : COLORS.danger,
+      ok ? `✅ Your **${app.label}** application has been submitted. You'll be notified here once it's reviewed. Good luck!`
+         : `❌ Something went wrong submitting your application - please contact an admin.`)] }).catch(() => {});
+  } finally {
+    activeDmApps.delete(user.id);
+  }
 }
 
-async function finalizeApplication(interaction, app, answers) {
-  const { guild, user } = interaction;
+// Post a completed application to its review channel. Returns true on success.
+async function finalizeApplication(guild, user, app, answers) {
   const reviewChannel = guild.channels.cache.get(app.reviewChannelId);
-  if (!reviewChannel) return interaction.reply({ content: "❌ The review channel for this application no longer exists. Please contact an admin.", ephemeral: true });
+  if (!reviewChannel) return false;
 
   const reviewEmbed = new EmbedBuilder()
     .setColor(COLORS.warn)
@@ -2330,10 +2334,9 @@ async function finalizeApplication(interaction, app, answers) {
   );
 
   const posted = await reviewChannel.send({ embeds: [reviewEmbed], components: [controls] }).catch(() => null);
-  if (!posted) return interaction.reply({ content: "❌ Could not submit your application - I may be missing permission to post in the review channel. Please contact an admin.", ephemeral: true });
-
+  if (!posted) return false;
   secLog(guild, "Application Submitted", `<@${user.id}> submitted a **${app.label}** application → <#${reviewChannel.id}>`, COLORS.info);
-  return interaction.reply({ ephemeral: true, content: `✅ Your **${app.label}** application has been submitted. You'll be notified once it's reviewed. Good luck!` });
+  return true;
 }
 
 // Parse "app_accept_<key>_<userId>" / "app_deny_<key>_<userId>" → { key, userId }.
@@ -3179,14 +3182,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// ── Application buttons (apply / continue / accept / deny) ──────
+// ── Application buttons (apply / accept / deny) ────────────────
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton() || !interaction.inGuild()) return;
   try {
-    if (interaction.customId.startsWith("app_apply_"))    return await handleAppApply(interaction);
-    if (interaction.customId.startsWith("app_continue_")) return await handleAppContinue(interaction);
-    if (interaction.customId.startsWith("app_accept_"))   return await handleAppAccept(interaction);
-    if (interaction.customId.startsWith("app_deny_"))     return await handleAppDeny(interaction);
+    if (interaction.customId.startsWith("app_apply_"))  return await handleAppApply(interaction);
+    if (interaction.customId.startsWith("app_accept_")) return await handleAppAccept(interaction);
+    if (interaction.customId.startsWith("app_deny_"))   return await handleAppDeny(interaction);
   } catch (err) {
     console.error("⚠️ application button handler failed:", err);
     const msg = { content: "⚠️ Something went wrong.", ephemeral: true };
@@ -3195,15 +3197,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// ── Application modal submits (form parts + deny reason) ───────
+// ── Application deny-reason modal submit (staff review only) ───
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isModalSubmit() || !interaction.inGuild()) return;
+  if (!interaction.customId.startsWith("app_denyreason_")) return;
   try {
-    if (interaction.customId.startsWith("app_modal_"))     return await handleAppModalSubmit(interaction);
-    if (interaction.customId.startsWith("app_denyreason_")) return await handleAppDenyReason(interaction);
+    await handleAppDenyReason(interaction);
   } catch (err) {
     console.error("⚠️ application modal handler failed:", err);
-    const msg = { content: "⚠️ Something went wrong with your application.", ephemeral: true };
+    const msg = { content: "⚠️ Something went wrong.", ephemeral: true };
     if (interaction.deferred || interaction.replied) interaction.followUp(msg).catch(() => {});
     else interaction.reply(msg).catch(() => {});
   }

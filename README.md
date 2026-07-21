@@ -167,18 +167,26 @@ step with **Accept**/**Deny** that grants roles on acceptance.
 
 **The flow, end to end:**
 
-1. An applicant clicks **Apply** on a panel and fills in the questions in
-   a modal. Applications with more than 5 questions are split across two
-   modals automatically (Discord caps a modal at 5 inputs) - the applicant
-   answers the first 5, clicks **Continue**, then answers the rest.
-2. On submit, the completed application is posted to that type's review
-   channel as an embed (every question + answer), with **Accept** and
-   **Deny** buttons.
+1. An applicant clicks **Apply** on a panel. The bot DMs them the
+   questions one at a time (Appy-style) and waits for a reply to each -
+   no limit on the number of questions, and image/file-only answers are
+   captured too. There's a per-question timeout (10 min) and the applicant
+   can type **cancel** anytime to stop. If their DMs are closed, they get
+   a clear ephemeral error telling them to open DMs and retry; only one
+   in-progress interview per user at a time.
+2. When the last question is answered, the completed application is posted
+   to that type's review channel as an embed (every question + answer),
+   with **Accept** and **Deny** buttons, and the applicant gets a
+   confirmation in their DMs.
 3. **Accept** (staff only) grants the application's configured roles to
    the applicant, marks the embed green with who accepted, disables the
    buttons, and DMs the applicant.
 4. **Deny** (staff only) opens a short modal for an optional reason, marks
    the embed red, and DMs the applicant with the reason.
+
+Reading applicants' DM replies requires the **Direct Messages** gateway
+intent (added alongside the existing Message Content intent), so no extra
+Developer Portal toggle beyond what the bot already needs.
 
 **Opening and closing:** each application can be opened or closed with
 `/applications open`/`close` (pass `all` to do every application at once).
@@ -237,7 +245,7 @@ logic, are covered by real regression tests. Anything that requires a live
 gateway connection - the actual anti-nuke/anti-raid/anti-spam detection
 firing against real Discord events, role/channel snapshot-and-restore,
 mute-role stashing, the whole ticket flow, and the whole application flow
-(Apply buttons, form modals, multi-modal splitting, staff accept/deny,
-role granting) - is not, and has only been exercised by hand. Treat this
+(Apply button, DM interview, staff accept/deny, role granting) - is not,
+and has only been exercised by hand. Treat this
 bot as reviewed-and-tested-where-practical, not as verified against live
 abuse scenarios at scale.
