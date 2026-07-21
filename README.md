@@ -152,15 +152,22 @@ this one, to reconfigure) uses the `/tickets` commands above.
 
 ## Application system
 
-An Appy-style application system: an embed panel with an **Apply** button
-per application type, a form the applicant fills in, and a staff review
+An Appy-style application system: a panel with an **Apply** button per
+application type, a DM interview the applicant fills in, and a staff review
 step with **Accept**/**Deny** that grants roles on acceptance.
+
+**Panels group by channel:** applications that share a panel channel are
+rendered as **one embed with a button per application** rather than one
+embed each. So the two family applications (Gambino + Colombo, which share
+a channel) appear as a single panel with two buttons, while Staff and NYPD
+each get their own single-button panel. `/applications panel key:<key>`
+posts/refreshes the whole panel for that application's channel.
 
 **Configuring it** (`/applications`, bot/server owner only):
 
-- `/applications open key:<key|all>` / `close key:<key|all>` - open or close applications to control intake; the panel's Apply button and embed update live to reflect the state
+- `/applications open key:<key|all>` / `close key:<key|all>` - open or close applications to control intake; the shared panel's buttons and embed update live to reflect each application's state
 - `/applications list` - show every configured application, its open/closed state, panel/review channels, accepted roles, and question count
-- `/applications panel key:<key> [channel]` - post or refresh an application's Apply panel
+- `/applications panel key:<key> [channel]` - post or refresh the panel for this application's channel (combined if the channel hosts more than one application)
 - `/applications setreview key:<key> channel:<#channel>` - where submitted applications go for staff review
 - `/applications setpanelchannel key:<key> channel:<#channel>` - where the Apply button panel is posted
 - `/applications addrole key:<key> role:<@role>` / `removerole` - roles granted on acceptance
@@ -190,10 +197,11 @@ Developer Portal toggle beyond what the bot already needs.
 
 **Opening and closing:** each application can be opened or closed with
 `/applications open`/`close` (pass `all` to do every application at once).
-While closed, the panel's Apply button is disabled and relabelled and the
-embed shows a "closed" notice; if someone still manages to click a stale
-button, the submission is refused. Reopening re-enables everything. New
-applications default to open.
+While closed, that application's button on the panel is disabled and
+relabelled (on a combined panel only that one button changes; the others
+stay active); if someone still manages to click a stale button, the
+submission is refused. Reopening re-enables it. New applications default
+to open.
 
 **Zero-touch setup for this specific deployment:** if `GUILD_ID` is set,
 four applications are seeded automatically on first boot and their panels
@@ -205,6 +213,12 @@ are posted once the bot is up, with zero commands required:
 | `colombo` | family panel (same as Gambino) | Colombo reviews | 3 roles | 4 |
 | `staff` | staff panel | staff reviews | 1 role | 6 |
 | `nypd` | police panel | NYPD reviews | 3 roles | 6 |
+
+Because Gambino and Colombo share the family panel channel, they post as a
+single combined panel with two buttons. On boot the bot reconciles any
+leftover separate/duplicate panels in a shared channel down to one combined
+message, so upgrading from the earlier one-embed-per-app layout cleans
+itself up.
 
 As with tickets, this seed runs once, only for that one guild, and never
 overwrites an existing configuration; anything else uses `/applications`.

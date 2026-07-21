@@ -2186,48 +2186,106 @@ function buildAppPanelEmbed(guild, app) {
   }
   return e;
 }
-function buildAppPanelRow(app) {
+// A single Apply button reflecting one app's open/closed state.
+function buildApplyButton(app) {
   const closed = !!app.closed;
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`app_apply_${app.key}`)
-      .setLabel(closed ? `${app.label} applications closed`.slice(0, 80) : `Apply for ${app.label}`.slice(0, 80))
-      .setEmoji(closed ? "🔒" : (app.emoji || "📝"))
-      .setStyle(closed ? ButtonStyle.Secondary : ButtonStyle.Primary)
-      .setDisabled(closed),
-  );
+  return new ButtonBuilder()
+    .setCustomId(`app_apply_${app.key}`)
+    .setLabel(closed ? `${app.label} closed`.slice(0, 80) : `Apply for ${app.label}`.slice(0, 80))
+    .setEmoji(closed ? "🔒" : (app.emoji || "📝"))
+    .setStyle(closed ? ButtonStyle.Secondary : ButtonStyle.Primary)
+    .setDisabled(closed);
 }
 
-// Edit an application's existing panel message in place so its open/closed
-// state (button + embed) updates live. Falls back to a fresh post if the
-// stored message is gone. No-op if no panel channel is configured.
-async function refreshAppPanel(guild, app) {
-  if (!app.panelChannelId) return;
-  const channel = guild.channels.cache.get(app.panelChannelId);
+// Combined panel embed for a channel that hosts 2+ applications (e.g. the
+// family channel with Gambino + Colombo) - one embed, a button per app.
+function buildCombinedPanelEmbed(guild, apps) {
+  return new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setTitle("📋 Applications")
+    .setDescription(
+      "Pick which application you'd like to submit using the buttons below. " +
+      "I'll DM you the questions one at a time - just make sure your DMs are open.\n\n" +
+      apps.map(a => `${a.emoji || "📝"} **${a.label}**${a.closed ? " - 🔒 closed" : ""}`).join("\n")
+    )
+    .setThumbnail(guild.iconURL?.() || null)
+    .setFooter({ text: guild.name })
+    .setTimestamp();
+}
+
+// Group a guild's panel-eligible apps by their panel channel.
+function appsByPanelChannel(guildId) {
+  const groups = new Map(); // channelId -> [apps]
+  for (const app of Object.values(getApplications(guildId))) {
+    if (!app.panelChannelId || !app.questions?.length) continue;
+    if (!groups.has(app.panelChannelId)) groups.set(app.panelChannelId, []);
+    groups.get(app.panelChannelId).push(app);
+  }
+  return groups;
+}
+
+// Message payload for a channel's panel: single-app style for one app, a
+// combined embed with one button per app for a shared channel.
+function panelPayloadForGroup(guild, apps) {
+  if (apps.length === 1) return { embeds: [buildAppPanelEmbed(guild, apps[0])], components: [new ActionRowBuilder().addComponents(buildApplyButton(apps[0]))] };
+  const buttons = apps.slice(0, 25).map(buildApplyButton);
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+  return { embeds: [buildCombinedPanelEmbed(guild, apps)], components: rows };
+}
+
+// Point every app in a channel group at the same panel message id.
+function setGroupPanelMessage(guildId, apps, messageId) {
+  for (const a of apps) if (a.panelMessageId !== messageId) setApplication(guildId, a.key, { panelMessageId: messageId });
+}
+
+// Render (edit-in-place or post) the one panel message for a channel group, so
+// open/close changes on any member app update the shared panel live.
+async function renderChannelPanel(guild, channelId, apps) {
+  const channel = guild.channels.cache.get(channelId);
   if (!channel) return;
-  const payload = { embeds: [buildAppPanelEmbed(guild, app)], components: [buildAppPanelRow(app)] };
-  if (app.panelMessageId) {
-    const existing = await channel.messages.fetch(app.panelMessageId).catch(() => null);
-    if (existing) { await existing.edit(payload).catch(() => {}); return; }
+  const payload = panelPayloadForGroup(guild, apps);
+  const existingId = apps.map(a => a.panelMessageId).find(Boolean);
+  if (existingId) {
+    const existing = await channel.messages.fetch(existingId).catch(() => null);
+    if (existing) { await existing.edit(payload).catch(() => {}); setGroupPanelMessage(guild.id, apps, existing.id); return; }
   }
   const posted = await channel.send(payload).catch(() => null);
-  if (posted) setApplication(guild.id, app.key, { panelMessageId: posted.id });
+  if (posted) setGroupPanelMessage(guild.id, apps, posted.id);
 }
 
-// Post each app's panel (or leave it if already posted and still present).
+// Refresh the whole panel of the channel `app` lives in (so a combined panel's
+// other buttons are rebuilt too when this one's open/closed state changes).
+async function refreshAppPanel(guild, app) {
+  if (!app.panelChannelId) return;
+  const apps = appsByPanelChannel(guild.id).get(app.panelChannelId) || [app];
+  await renderChannelPanel(guild, app.panelChannelId, apps);
+}
+
+// Post each channel's panel if it isn't already up. For a shared channel this
+// also reconciles any leftover separate/duplicate panels (e.g. from before
+// Gambino + Colombo were combined) down to a single combined message.
 async function ensureApplicationPanels(guild) {
-  for (const app of Object.values(getApplications(guild.id))) {
-    if (!app.panelChannelId || !app.questions?.length) continue;
-    const channel = guild.channels.cache.get(app.panelChannelId);
+  for (const [channelId, apps] of appsByPanelChannel(guild.id)) {
+    const channel = guild.channels.cache.get(channelId);
     if (!channel) continue;
-    if (app.panelMessageId) {
-      const existing = await channel.messages.fetch(app.panelMessageId).catch(() => null);
-      if (existing) continue;
+    const ids = [...new Set(apps.map(a => a.panelMessageId).filter(Boolean))];
+    const live = [];
+    for (const id of ids) { const m = await channel.messages.fetch(id).catch(() => null); if (m) live.push(m); }
+
+    // Already a single shared panel message - just refresh it to the current state.
+    if (live.length === 1 && ids.length === 1) {
+      await live[0].edit(panelPayloadForGroup(guild, apps)).catch(() => {});
+      setGroupPanelMessage(guild.id, apps, live[0].id);
+      continue;
     }
-    const posted = await channel.send({ embeds: [buildAppPanelEmbed(guild, app)], components: [buildAppPanelRow(app)] }).catch(() => null);
+    // Otherwise (nothing up yet, or multiple stale/separate panels): clear any
+    // leftovers and post one fresh panel for the channel.
+    for (const m of live) await m.delete().catch(() => {});
+    const posted = await channel.send(panelPayloadForGroup(guild, apps)).catch(() => null);
     if (posted) {
-      setApplication(guild.id, app.key, { panelMessageId: posted.id });
-      console.log(`📝 Posted ${app.label} application panel in #${channel.name} (${guild.name})`);
+      setGroupPanelMessage(guild.id, apps, posted.id);
+      console.log(`📝 Posted application panel (${apps.map(a => a.label).join(", ")}) in #${channel.name} (${guild.name})`);
     }
   }
 }
@@ -3073,20 +3131,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!app) return interaction.reply({ content: `❌ No application with key \`${key}\`. Use \`/applications list\` to see valid keys.`, ephemeral: true });
 
       if (sub === "panel") {
-        const channel = interaction.options.getChannel("channel") || (app.panelChannelId ? guild.channels.cache.get(app.panelChannelId) : null);
-        if (!channel) return interaction.reply({ content: "❌ Provide a channel - none configured for this application yet.", ephemeral: true });
+        const channelOpt = interaction.options.getChannel("channel");
         await interaction.deferReply({ ephemeral: true });
-        const panelEmbed = buildAppPanelEmbed(guild, app);
-        const row = buildAppPanelRow(app);
-        let posted = null;
-        if (app.panelChannelId === channel.id && app.panelMessageId) {
-          const existing = await channel.messages.fetch(app.panelMessageId).catch(() => null);
-          if (existing) posted = await existing.edit({ embeds: [panelEmbed], components: [row] }).catch(() => null);
-        }
-        if (!posted) posted = await channel.send({ embeds: [panelEmbed], components: [row] }).catch(() => null);
-        if (!posted) return interaction.editReply("❌ Could not send the panel - check my permissions in that channel.");
-        setApplication(guild.id, key, { panelChannelId: channel.id, panelMessageId: posted.id });
-        return interaction.editReply(`✅ **${app.label}** application panel posted in <#${channel.id}>.`);
+        // Moving to a new channel? Re-home this app and drop its old panel message id.
+        if (channelOpt && channelOpt.id !== app.panelChannelId) setApplication(guild.id, key, { panelChannelId: channelOpt.id, panelMessageId: "" });
+        const channelId = channelOpt?.id || app.panelChannelId;
+        if (!channelId) return interaction.editReply("❌ Provide a channel - none configured for this application yet.");
+        const channel = guild.channels.cache.get(channelId);
+        if (!channel) return interaction.editReply("❌ That channel doesn't exist.");
+        // Render the whole channel group, so a shared channel (e.g. Gambino +
+        // Colombo) posts one combined panel rather than one per app.
+        const apps = appsByPanelChannel(guild.id).get(channelId) || [getApplication(guild.id, key)];
+        await renderChannelPanel(guild, channelId, apps);
+        return interaction.editReply(`✅ Application panel (${apps.map(a => a.label).join(", ")}) posted in <#${channelId}>.`);
       }
       if (sub === "setreview") {
         const channel = interaction.options.getChannel("channel");
