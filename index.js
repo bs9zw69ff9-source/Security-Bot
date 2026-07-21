@@ -525,7 +525,7 @@ async function runFailsafe(message) {
   const guild = message.guild;
   const failsafeRoleIds = gc(guild).failsafeRoleIds;
   if (!failsafeRoleIds.length)
-    return message.reply("❌ No failsafe roles configured for this server. Run `/setup failsafe action:add role:@Role` first.").catch(() => {});
+    return message.reply("There are no failsafe roles set up for this server yet. Add some with `/setup failsafe action:add role:@Role` first.").catch(() => {});
 
   await message.reply("🛡️ **FAILSAFE engaged** - backing up, then purging roles & bots…").catch(() => {});
   await guild.members.fetch().catch(() => {}); // full cache for accurate membership + bot list
@@ -593,7 +593,7 @@ async function runRestore(message) {
   const guild = message.guild;
   const backup = failsafeBackup[guild.id];
   if (!backup || !backup.roles?.length)
-    return message.reply("❌ No failsafe backup found for this server.").catch(() => {});
+    return message.reply("I do not have a failsafe backup saved for this server.").catch(() => {});
 
   await message.reply(`♻️ **Restoring ${backup.roles.length} role(s)…**`).catch(() => {});
 
@@ -700,7 +700,7 @@ async function snapshotGuild(guild) {
 // Destructive by design - requires a ✅ confirmation before touching anything.
 async function rollbackGuild(guild, message) {
   const snap = (snapshots[guild.id] || []).slice(-1)[0];
-  if (!snap) { message?.reply("❌ No snapshot available yet. Run `!snapshot` first."); return; }
+  if (!snap) { message?.reply("There is no snapshot saved yet. Take one with `!snapshot` first."); return; }
 
   await guild.roles.fetch().catch(() => {});
   await guild.channels.fetch().catch(() => {});
@@ -730,7 +730,7 @@ async function rollbackGuild(guild, message) {
       max: 1, time: 30000,
     }).catch(() => null);
     if (!collected || !collected.size) {
-      await message.reply("❌ Rollback cancelled - no confirmation received within 30s.").catch(() => {});
+      await message.reply("Rollback cancelled - I did not get a confirmation in time.").catch(() => {});
       return;
     }
   }
@@ -880,8 +880,8 @@ function bumpStorm(guildId) {
 }
 async function serverEmergencyLock(guild, reason) {
   alertOwner(guild,
-    `🧨 **NUKE STORM DETECTED** - ${reason}.\nEngaging server-wide emergency lockdown: stripping dangerous roles from every non-whitelisted member and locking all channels.`,
-    COLORS.nuke, "NUKE STORM LOCKDOWN");
+    `This is getting serious - ${reason}. I'm putting the whole server into emergency lockdown: pulling dangerous roles from everyone who isn't whitelisted and locking every channel.`,
+    COLORS.nuke, "Emergency Lockdown");
   await guild.members.fetch().catch(() => {});
   for (const m of guild.members.cache.values()) {
     if (m.user.bot || isWhitelisted(m)) continue;
@@ -1107,6 +1107,9 @@ const COLORS = {
   success: 0x00e5a0, warn: 0xf5a623, danger: 0xff3b5c, info: 0x5865f2,
   muted: 0xff7518, nuke: 0xff0033, neutral: 0x2f3136,
 };
+// Appy-style accent colours for the application DM flow.
+const APPY_GREEN   = 0x57f287; // "Application Started" intro
+const APPY_BLURPLE = 0x5865f2; // per-question prompts
 
 function embed(color, description, title = null) {
   const e = new EmbedBuilder().setColor(color).setDescription(description).setTimestamp();
@@ -1172,17 +1175,17 @@ async function tryDM(user, text) {
 
 // Guard: can `actor` moderate `target`? Protects owner/whitelist and respects hierarchy.
 function canActOn(actor, target) {
-  if (!target) return { ok: false, why: "❌ User not found in this server." };
-  if (isOwner(target)) return { ok: false, why: "❌ That user is the bot owner - protected." };
-  if (target.id === target.guild.ownerId) return { ok: false, why: "❌ That user is the server owner - protected." };
-  if (isWhitelisted(target)) return { ok: false, why: "❌ That user is whitelisted - protected." };
-  if (target.id === actor.id) return { ok: false, why: "❌ You can't action yourself." };
+  if (!target) return { ok: false, why: "I can't find that user in this server." };
+  if (isOwner(target)) return { ok: false, why: "That's the bot owner, so they're off-limits." };
+  if (target.id === target.guild.ownerId) return { ok: false, why: "That's the server owner - can't touch them." };
+  if (isWhitelisted(target)) return { ok: false, why: "That user's whitelisted, so they're protected." };
+  if (target.id === actor.id) return { ok: false, why: "You can't do that to yourself." };
   const me = target.guild.members.me;
   if (me && target.roles.highest.position >= me.roles.highest.position)
-    return { ok: false, why: "❌ That user's highest role is above mine - fix my role position." };
+    return { ok: false, why: "Their top role sits above mine, so I can't. Bump my role higher and try again." };
   const actorPrivileged = isOwner(actor) || actor.id === actor.guild.ownerId;
   if (!actorPrivileged && target.roles.highest.position >= actor.roles.highest.position)
-    return { ok: false, why: "❌ That user's role is equal to or higher than yours." };
+    return { ok: false, why: "Their role is the same as or higher than yours, so this one's out of your reach." };
   return { ok: true };
 }
 
@@ -1222,15 +1225,15 @@ function recordModAction(guildId, memberId, action) {
 }
 function limitDeniedEmbed(action, used, limit, resetsInMin) {
   return embed(COLORS.danger,
-    `⛔ **Rate limit reached for \`/${action}\`**\n\n` +
-    `You've used **${used}/${limit}** ${action}s in the past ${config.modWindowMs / 3600000}h.\n` +
-    `⏱️ Resets in **~${resetsInMin} minute${resetsInMin === 1 ? "" : "s"}**.`);
+    `You've hit your \`/${action}\` limit for now.\n\n` +
+    `That's **${used}/${limit}** ${action}s in the last ${config.modWindowMs / 3600000}h. ` +
+    `You'll be able to use it again in about **${resetsInMin} minute${resetsInMin === 1 ? "" : "s"}**.`);
 }
 function usageFooter(action, used, limit) {
   const remaining = limit - used;
   const bar = buildBar(used, limit, 10);
   const warning = remaining <= Math.ceil(limit * 0.2) && remaining > 0
-    ? `\n⚠️ Only **${remaining}** ${action}${remaining === 1 ? "" : "s"} remaining today.` : "";
+    ? `\nJust **${remaining}** ${action}${remaining === 1 ? "" : "s"} remaining today.` : "";
   return `\`${bar}\` **${used}/${limit}** ${action}s used today${warning}`;
 }
 function buildBar(used, limit, width = 10) {
@@ -1284,9 +1287,9 @@ async function muteUser(member, durationMin, reason) {
 
   const stash = mutedRoles[member.guild.id][member.id].roles;
   secLog(member.guild, "Member Muted",
-    `<@${member.id}> muted for **${durationMin > 0 ? durationMin + " min" : "permanent"}** - ${reason}\n` +
-    `📦 Stashed **${stash.length}** role${stash.length === 1 ? "" : "s"}: ${stash.length ? stash.map(id => `<@&${id}>`).join(", ") : "none"}` +
-    (unstrippable.size ? `\n⚠️ Couldn't strip (managed / above bot): ${unstrippable.map(r => `<@&${r.id}>`).join(", ")}` : ""),
+    `<@${member.id}> was muted for **${durationMin > 0 ? durationMin + " min" : "as long as it takes"}** - ${reason}\n` +
+    `I set aside **${stash.length}** role${stash.length === 1 ? "" : "s"} to give back on unmute: ${stash.length ? stash.map(id => `<@&${id}>`).join(", ") : "none"}` +
+    (unstrippable.size ? `\nCouldn't take these (managed or above me): ${unstrippable.map(r => `<@&${r.id}>`).join(", ")}` : ""),
     COLORS.muted);
 
   if (durationMin > 0) {
@@ -1314,11 +1317,11 @@ async function unmuteUser(guild, userId, reason = "Unmute") {
       const lost = stash.roles.filter(id => !restorable.includes(id));
       if (restorable.length) await member.roles.add(restorable, `Restore stashed roles - ${reason}`).catch(() => {});
       secLog(guild, "Roles Restored",
-        `<@${userId}> unmuted - restored **${restorable.length}** role${restorable.length === 1 ? "" : "s"}: ${restorable.length ? restorable.map(id => `<@&${id}>`).join(", ") : "none"}` +
-        (lost.length ? `\n⚠️ Could not restore (deleted / above bot): ${lost.map(id => `<@&${id}>`).join(", ")}` : "") +
+        `<@${userId}> is unmuted, and I gave back **${restorable.length}** role${restorable.length === 1 ? "" : "s"}: ${restorable.length ? restorable.map(id => `<@&${id}>`).join(", ") : "none"}` +
+        (lost.length ? `\nCouldn't restore these (deleted or above me): ${lost.map(id => `<@&${id}>`).join(", ")}` : "") +
         `\n_(${reason})_`, COLORS.success);
     } else {
-      secLog(guild, "Member Unmuted", `<@${userId}> unmuted - no stashed roles to restore. _(${reason})_`);
+      secLog(guild, "Member Unmuted", `<@${userId}> is unmuted. There were no stashed roles to give back. _(${reason})_`);
     }
   }
 
@@ -1380,7 +1383,7 @@ function checkSpam(message) {
   if (mentionCount >= config.spamMentionLimit) {
     message.delete().catch(() => {});
     muteUser(message.member, config.spamMuteMin, `Anti-spam: mass mention (${mentionCount})`);
-    secLog(message.guild, "Anti-Spam", `<@${uid}> mass-mentioned (${mentionCount}) in <#${message.channel.id}> → muted`, COLORS.warn);
+    secLog(message.guild, "Anti-Spam", `Muted <@${uid}> for mass-mentioning (${mentionCount}) in <#${message.channel.id}>.`, COLORS.warn);
     return true;
   }
 
@@ -1388,7 +1391,7 @@ function checkSpam(message) {
   if (config.scamBlock && SCAM_RE.test(message.content)) {
     message.delete().catch(() => {});
     muteUser(message.member, config.spamMuteMin, "Anti-spam: scam/grabber link");
-    alertOwner(message.guild, `🎣 <@${uid}> posted a suspected **scam/grabber link** in <#${message.channel.id}> → deleted + muted.`, COLORS.danger, "Scam Link Blocked");
+    alertOwner(message.guild, `Heads up - <@${uid}> dropped what looks like a **scam or grabber link** in <#${message.channel.id}>. I've deleted it and muted them.`, COLORS.danger, "Scam Link Blocked");
     return true;
   }
 
@@ -1396,7 +1399,7 @@ function checkSpam(message) {
   if (config.spamBlockInvites && INVITE_RE.test(message.content) && !isMod(message.member)) {
     message.delete().catch(() => {});
     muteUser(message.member, config.spamMuteMin, "Anti-spam: posted invite link");
-    secLog(message.guild, "Anti-Spam", `<@${uid}> posted an invite link in <#${message.channel.id}> → muted`, COLORS.warn);
+    secLog(message.guild, "Anti-Spam", `Muted <@${uid}> for posting an invite link in <#${message.channel.id}>.`, COLORS.warn);
     return true;
   }
 
@@ -1408,7 +1411,7 @@ function checkSpam(message) {
       message.delete().catch(() => {});
       muteUser(message.member, config.spamMuteMin, "Anti-spam: duplicate flood");
       dupeTracker.set(key, { content: "", count: 0, ts: now });
-      secLog(message.guild, "Anti-Spam", `<@${uid}> duplicate-flooded in <#${message.channel.id}> → muted`, COLORS.warn);
+      secLog(message.guild, "Anti-Spam", `Muted <@${uid}> for flooding the same message over and over in <#${message.channel.id}>.`, COLORS.warn);
       return true;
     }
   } else {
@@ -1423,7 +1426,7 @@ function checkSpam(message) {
     message.delete().catch(() => {});
     muteUser(message.member, config.spamMuteMin, "Anti-spam: message flood");
     spamTracker.set(key, []);
-    secLog(message.guild, "Anti-Spam", `<@${uid}> message-flooded in <#${message.channel.id}> → muted`, COLORS.warn);
+    secLog(message.guild, "Anti-Spam", `Muted <@${uid}> for flooding <#${message.channel.id}> with messages.`, COLORS.warn);
     return true;
   }
   return false;
@@ -1472,7 +1475,7 @@ async function checkAntiPing(message) {
       .then(m => setTimeout(() => m.delete().catch(() => {}), 8000)).catch(() => {});
   }
   secLog(message.guild, "📡 Anti-Ping Triggered",
-    `<@${member.id}> pinged ${targets} in <#${message.channel.id}> → **${actionText}**`, COLORS.warn);
+    `<@${member.id}> pinged ${targets} in <#${message.channel.id}>, so they were **${actionText}**.`, COLORS.warn);
 }
 
 // ── Anti-Raid (join velocity + new-account quarantine) ────────
@@ -1484,9 +1487,9 @@ client.on(Events.GuildMemberAdd, async (member) => {
   if (isLockdown(gid) && config.raidKickNewOnLock && !member.user.bot) {
     const ageMin = (now - member.user.createdTimestamp) / 60000;
     if (ageMin < config.raidMinAccountAgeMin) {
-      await tryDM(member.user, "The server is in raid lockdown. Please rejoin later.");
+      await tryDM(member.user, "The server's in a temporary raid lockdown right now, so I couldn't let you in. Please try joining again a little later.");
       await member.kick(`Raid lockdown: new account (${Math.round(ageMin)}m old)`).catch(() => {});
-      secLog(member.guild, "Raid Quarantine", `Kicked new account <@${member.id}> (${Math.round(ageMin)}m old) during lockdown.`, COLORS.danger);
+      secLog(member.guild, "Raid Quarantine", `Turned away <@${member.id}> during the lockdown - it's a brand-new account (${Math.round(ageMin)}m old).`, COLORS.danger);
       return;
     }
   }
@@ -1498,11 +1501,11 @@ client.on(Events.GuildMemberAdd, async (member) => {
   if (recent >= config.raidJoinThreshold && !isLockdown(gid)) {
     const expiresAt = Date.now() + config.raidLockdownMin * 60000;
     setLockdown(gid, "raid", expiresAt);
-    alertOwner(member.guild, `🚨 **RAID DETECTED** - **${recent}** joins in ${config.raidWindowMs / 1000}s. Server locked down for **${config.raidLockdownMin} min**.`, COLORS.nuke, "RAID DETECTED");
+    alertOwner(member.guild, `Looks like a raid - **${recent}** people joined in just ${config.raidWindowMs / 1000}s. I've locked the server down for **${config.raidLockdownMin} min** to be safe.`, COLORS.nuke, "Raid Detected");
     member.guild.channels.cache.forEach(ch => {
       if (ch.isTextBased() && !ch.isThread()) ch.permissionOverwrites.edit(member.guild.roles.everyone, { SendMessages: false }).catch(() => {});
     });
-    scheduleTask(() => liftLockdownChannels(member.guild, `Auto-lifted after **${config.raidLockdownMin} minutes**.`), expiresAt - Date.now());
+    scheduleTask(() => liftLockdownChannels(member.guild, `Lifted the raid lockdown automatically after **${config.raidLockdownMin} minutes**. Things should be back to normal.`), expiresAt - Date.now());
   }
 });
 
@@ -1533,26 +1536,26 @@ async function nukeResponse(guild, member, reason) {
   if (!member || isWhitelisted(member)) return;
 
   alertOwner(guild,
-    `**Executor:** <@${member.id}> (\`${member.id}\`)\n**Reason:** ${reason}\n**Action:** dangerous roles stripped → ban attempted.`,
-    COLORS.nuke, "🔴 ANTI-NUKE TRIGGERED");
+    `Anti-nuke just kicked in on <@${member.id}> (\`${member.id}\`).\n**What set it off:** ${reason}\n**What I did:** pulled their dangerous roles and moved to ban them.`,
+    COLORS.nuke, "Anti-Nuke Triggered");
 
   try {
     const toRemove = member.roles.cache.filter(r => r.permissions.any(DANGER_PERMS) && r.editable);
     if (toRemove.size > 0) await member.roles.remove([...toRemove.keys()], "Anti-nuke: role strip");
   } catch (e) {
-    secLog(guild, "Anti-Nuke", `⚠️ Could not strip roles from <@${member.id}>: ${e.message}`, COLORS.warn);
+    secLog(guild, "Anti-Nuke", `I couldn't pull the roles off <@${member.id}>: ${e.message}`, COLORS.warn);
   }
 
   try {
     await member.ban({ reason: `Anti-Nuke: ${reason}` });
-    secLog(guild, "Anti-Nuke", `✅ Banned <@${member.id}> - ${reason}`, COLORS.nuke);
+    secLog(guild, "Anti-Nuke", `Banned <@${member.id}> - ${reason}`, COLORS.nuke);
   } catch (e) {
     // Ban failed (likely above the bot). Try kick; otherwise leave de-permed + escalate.
     const kicked = await member.kick(`Anti-Nuke: ${reason}`).catch(() => null);
     alertOwner(guild,
-      `⚠️ Could not ban <@${member.id}> (${e.message}). ` +
-      (kicked === null ? `Kick also failed - roles stripped only. **Check my role position immediately.**` : `Kicked instead.`),
-      COLORS.danger, "Anti-Nuke - manual review");
+      `I couldn't ban <@${member.id}> (${e.message}). ` +
+      (kicked === null ? `The kick didn't go through either, so I've only managed to strip their roles. **Please check my role position right away.**` : `I kicked them instead.`),
+      COLORS.danger, "Anti-Nuke Needs a Look");
   }
 
   // Nuke-storm escalation: several responses in THIS guild in a short window ⇒ lock it down.
@@ -1636,7 +1639,7 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
         if (!escalated) break;
         const role = guild.roles.cache.get(targetId);
         if (role && role.editable) await role.setPermissions(oldP, "Anti-nuke: revert perm escalation").catch(() => {});
-        alertOwner(guild, `⚠️ <@${executorId}> granted dangerous permissions to <@&${targetId}>. **Reverted.**`, COLORS.warn, "Permission Escalation Blocked");
+        alertOwner(guild, `<@${executorId}> just handed <@&${targetId}> some dangerous permissions. I've rolled that back.`, COLORS.warn, "Permission Change Reverted");
         if (bump(guild.id, executorId, "permEsc", 3)) { resetBump(guild.id, executorId, "permEsc"); return nukeResponse(guild, executor, "Repeated permission escalation"); }
         break;
       }
@@ -1650,7 +1653,7 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
         if (!dangerous.length) break;
         const target = await guild.members.fetch(targetId).catch(() => null);
         if (target) await target.roles.remove(dangerous.map(r => r.id), "Anti-nuke: revert dangerous role grant").catch(() => {});
-        alertOwner(guild, `⚠️ <@${executorId}> granted dangerous role(s) ${dangerous.map(r => `<@&${r.id}>`).join(", ")} to <@${targetId}>. **Reverted.**`, COLORS.warn, "Privilege Grant Blocked");
+        alertOwner(guild, `<@${executorId}> just gave <@${targetId}> some dangerous role(s): ${dangerous.map(r => `<@&${r.id}>`).join(", ")}. I've taken them back off.`, COLORS.warn, "Role Grant Reverted");
         if (bump(guild.id, executorId, "dangerGrant", config.nukeMemberRoleThreshold)) {
           resetBump(guild.id, executorId, "dangerGrant");
           return nukeResponse(guild, executor, `Granted dangerous roles ${config.nukeMemberRoleThreshold}+ times in ${config.nukeWindowMs / 1000}s`);
@@ -1675,9 +1678,9 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
           r.id !== guild.id && (r.managed || !r.editable));
 
         alertOwner(guild,
-          `⚠️ <@${executorId}> added bot <@${targetId}> - ${config.nukeBotAddAction === "kick" ? "**bot removed.**" : "review required."}\n` +
-          `🧹 Stripped **${strippedIds.length}** role${strippedIds.length === 1 ? "" : "s"} from <@${executorId}>: ${strippedIds.length ? strippedIds.map(id => `<@&${id}>`).join(", ") : "none"}` +
-          (unstrippable.size ? `\n⚠️ Couldn't strip (managed / above me): ${unstrippable.map(r => `<@&${r.id}>`).join(", ")}` : ""),
+          `<@${executorId}> added the bot <@${targetId}> - ${config.nukeBotAddAction === "kick" ? "I've kicked it back out." : "you'll want to review this."}\n` +
+          `I also pulled **${strippedIds.length}** role${strippedIds.length === 1 ? "" : "s"} off <@${executorId}>: ${strippedIds.length ? strippedIds.map(id => `<@&${id}>`).join(", ") : "none"}` +
+          (unstrippable.size ? `\nCouldn't take these (managed or above me): ${unstrippable.map(r => `<@&${r.id}>`).join(", ")}` : ""),
           COLORS.danger, "Bot Added");
         break;
       }
@@ -1691,7 +1694,7 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
         break;
 
       case AuditLogEvent.GuildUpdate:
-        alertOwner(guild, `⚙️ Server settings were changed by <@${executorId}>. Review the audit log.`, COLORS.warn, "Guild Settings Changed");
+        alertOwner(guild, `<@${executorId}> changed the server settings. Might be worth a glance at the audit log.`, COLORS.warn, "Server Settings Changed");
         break;
     }
   } catch (e) {
@@ -1925,10 +1928,10 @@ function buildTicketPanelEmbed(guild, cfg) {
     .setColor(COLORS.info)
     .setTitle("🎫 Support Tickets")
     .setDescription(
-      "Need help? Select the category below that best matches your issue and a private ticket " +
-      "will be opened just for you.\n\n" +
+      "Need a hand? Pick the option below that fits what you need, and I'll open a private " +
+      "ticket just for you and the team.\n\n" +
       cfg.types.map(t => `${t.emoji || "🎫"}  **${t.label}**`).join("\n") +
-      "\n\nOur team will respond as soon as possible. Please avoid opening duplicate tickets."
+      "\n\nSomeone will be with you as soon as they can. Please stick to one ticket at a time."
     )
     .setThumbnail(guild.iconURL?.() || null)
     .setFooter({ text: guild.name })
@@ -2020,11 +2023,11 @@ async function createTicketChannel(interaction, key, reason) {
   const { guild, member } = interaction;
   const cfg = getTicketConfig(guild.id);
   const type = cfg.types.find(t => t.key === key);
-  if (!type) return interaction.reply({ content: "❌ This ticket type is no longer available.", ephemeral: true });
+  if (!type) return interaction.reply({ content: "Sorry, that ticket option isn't available anymore.", ephemeral: true });
 
   const existing = findOpenTicketByUser(guild.id, member.id, key);
   if (existing && guild.channels.cache.has(existing))
-    return interaction.reply({ content: `❌ You already have an open ticket: <#${existing}>`, ephemeral: true });
+    return interaction.reply({ content: `You've already got one open over here: <#${existing}>`, ephemeral: true });
 
   await interaction.deferReply({ ephemeral: true });
 
@@ -2067,18 +2070,18 @@ async function createTicketChannel(interaction, key, reason) {
   }
 
   if (!ticketChannel)
-    return interaction.editReply(`❌ Could not create a ticket channel: \`${createErr?.message || "unknown error"}\`. Check my Manage Channels permission.`);
+    return interaction.editReply(`Hmm, I couldn't open a ticket channel: \`${createErr?.message || "unknown error"}\`. Please double-check I have the Manage Channels permission.`);
 
   setOpenTicket(guild.id, ticketChannel.id, { typeKey: key, openerId: member.id, openedAt: Date.now(), claimedBy: null, reason });
 
   const welcomeEmbed = new EmbedBuilder()
     .setColor(COLORS.info)
     .setTitle(`${type.emoji || "🎫"} ${type.label}`)
-    .setDescription(`Thanks for reaching out, <@${member.id}>. A member of staff will be with you shortly.\n\n**Reason:**\n${reason}`)
+    .setDescription(`Thanks for reaching out, <@${member.id}> - someone from the team will be with you shortly. Here's what you told us:\n\n${reason}`)
     .addFields(
       { name: "Opened by", value: `<@${member.id}>`, inline: true },
       { name: "Category", value: type.label, inline: true },
-      { name: "Status", value: "🟢 Open - unclaimed", inline: true },
+      { name: "Status", value: "🟢 Open, waiting for staff", inline: true },
     )
     .setFooter({ text: `Ticket ID: ${ticketChannel.id}` })
     .setTimestamp();
@@ -2089,8 +2092,8 @@ async function createTicketChannel(interaction, key, reason) {
   const pingRole = g.modRoleId ? `<@&${g.modRoleId}> ` : "";
   await ticketChannel.send({ content: `${pingRole}<@${member.id}>`, embeds: [welcomeEmbed], components: [controlRow] }).catch(() => {});
 
-  secLog(guild, "Ticket Opened", `<@${member.id}> opened a **${type.label}** ticket: <#${ticketChannel.id}>`, COLORS.info);
-  return interaction.editReply(`✅ Your ticket has been created: <#${ticketChannel.id}>`);
+  secLog(guild, "Ticket Opened", `<@${member.id}> opened a **${type.label}** ticket over in <#${ticketChannel.id}>.`, COLORS.info);
+  return interaction.editReply(`You're all set - your ticket's open here: <#${ticketChannel.id}>`);
 }
 
 async function handleTicketOpen(interaction) {
@@ -2098,16 +2101,16 @@ async function handleTicketOpen(interaction) {
   const key = customId.replace("ticket_open_", "");
   const cfg = getTicketConfig(guild.id);
   const type = cfg.types.find(t => t.key === key);
-  if (!type) return interaction.reply({ content: "❌ This ticket type is no longer available.", ephemeral: true });
+  if (!type) return interaction.reply({ content: "Sorry, that ticket option isn't available anymore.", ephemeral: true });
 
   const existing = findOpenTicketByUser(guild.id, interaction.member.id, key);
   if (existing && guild.channels.cache.has(existing))
-    return interaction.reply({ content: `❌ You already have an open ticket: <#${existing}>`, ephemeral: true });
+    return interaction.reply({ content: `You've already got one open over here: <#${existing}>`, ephemeral: true });
 
   const modal = new ModalBuilder().setCustomId(`ticket_reason_${key}`).setTitle(`${type.label} - Ticket`.slice(0, 45));
   const reasonInput = new TextInputBuilder()
-    .setCustomId("reason").setLabel("Briefly describe your issue").setStyle(TextInputStyle.Paragraph)
-    .setRequired(true).setMaxLength(1000).setPlaceholder("Include any relevant details (who, what, when)...");
+    .setCustomId("reason").setLabel("What can we help you with?").setStyle(TextInputStyle.Paragraph)
+    .setRequired(true).setMaxLength(1000).setPlaceholder("A few details go a long way (who, what, when)...");
   modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
   return interaction.showModal(modal);
 }
@@ -2115,9 +2118,9 @@ async function handleTicketOpen(interaction) {
 async function handleTicketClaim(interaction) {
   const { guild, member, channel } = interaction;
   const ticket = getOpenTicket(guild.id, channel.id);
-  if (!ticket) return interaction.reply({ content: "❌ This isn't an active ticket channel.", ephemeral: true });
-  if (!isMod(member)) return interaction.reply({ content: "❌ Only staff can claim tickets.", ephemeral: true });
-  if (ticket.claimedBy) return interaction.reply({ content: `❌ Already claimed by <@${ticket.claimedBy}>.`, ephemeral: true });
+  if (!ticket) return interaction.reply({ content: "This isn't an active ticket channel.", ephemeral: true });
+  if (!isMod(member)) return interaction.reply({ content: "Only staff can claim tickets.", ephemeral: true });
+  if (ticket.claimedBy) return interaction.reply({ content: `This one's already claimed by <@${ticket.claimedBy}>.`, ephemeral: true });
 
   ticket.claimedBy = member.id;
   setOpenTicket(guild.id, channel.id, ticket);
@@ -2129,17 +2132,17 @@ async function handleTicketClaim(interaction) {
   } else {
     await interaction.deferUpdate().catch(() => {});
   }
-  await channel.send({ embeds: [embed(COLORS.warn, `🙋 <@${member.id}> claimed this ticket.`)] }).catch(() => {});
+  await channel.send({ embeds: [embed(COLORS.warn, `<@${member.id}> has got this one and will help you out from here.`)] }).catch(() => {});
 }
 
 async function handleTicketClose(interaction) {
   const { guild, member, channel } = interaction;
   const ticket = getOpenTicket(guild.id, channel.id);
-  if (!ticket) return interaction.reply({ content: "❌ This isn't an active ticket channel.", ephemeral: true });
+  if (!ticket) return interaction.reply({ content: "This isn't an active ticket channel.", ephemeral: true });
   if (!isMod(member) && member.id !== ticket.openerId)
-    return interaction.reply({ content: "❌ Only staff or the ticket opener can close this.", ephemeral: true });
+    return interaction.reply({ content: "Only staff or the person who opened this can close it.", ephemeral: true });
 
-  await interaction.reply({ embeds: [embed(COLORS.warn, "🔒 Closing this ticket and generating a transcript…")] }).catch(() => {});
+  await interaction.reply({ embeds: [embed(COLORS.warn, "Closing this ticket and saving a transcript, one sec...")] }).catch(() => {});
 
   const cfg = getTicketConfig(guild.id);
   const type = cfg.types.find(t => t.key === ticket.typeKey);
@@ -2167,10 +2170,10 @@ async function handleTicketClose(interaction) {
     }).catch(() => {});
   }
 
-  secLog(guild, "Ticket Closed", `<@${member.id}> closed **${type?.label || ticket.typeKey}** ticket opened by <@${ticket.openerId}> (<#${channel.id}>)`, COLORS.neutral);
+  secLog(guild, "Ticket Closed", `<@${member.id}> closed the **${type?.label || ticket.typeKey}** ticket that <@${ticket.openerId}> opened (<#${channel.id}>).`, COLORS.neutral);
   deleteOpenTicket(guild.id, channel.id);
 
-  await channel.send("🗑️ This channel will be deleted in 5 seconds…").catch(() => {});
+  await channel.send("All done here - this channel will disappear in a few seconds.").catch(() => {});
   setTimeout(() => channel.delete("Ticket closed").catch(() => {}), 5000);
 }
 
@@ -2207,7 +2210,7 @@ function buildAppPanelEmbed(guild, app) {
     .setFooter({ text: guild.name })
     .setTimestamp();
   if (closed) {
-    e.setDescription(`🔒 **${app.label} applications are currently closed.**\n\n${buildRequirements(app)}`);
+    e.setDescription(`**${app.label} applications are closed right now.** Check back soon.\n\n${buildRequirements(app)}`);
   } else {
     e.setDescription(buildRequirements(app));
   }
@@ -2323,77 +2326,98 @@ async function ensureApplicationPanels(guild) {
 async function handleAppApply(interaction) {
   const key = interaction.customId.replace("app_apply_", "");
   const app = getApplication(interaction.guild.id, key);
-  if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
+  if (!app) return interaction.reply({ content: "Sorry, that application isn't around anymore.", ephemeral: true });
   // Re-check even though the button is disabled when closed - the panel message
   // could be stale, so never let a closed application start an interview.
   if (app.closed) {
     await refreshAppPanel(interaction.guild, app).catch(() => {}); // resync the stale panel
-    return interaction.reply({ content: `🔒 **${app.label}** applications are currently closed. Please check back later.`, ephemeral: true });
+    return interaction.reply({ content: `**${app.label}** applications are closed right now. Do check back soon!`, ephemeral: true });
   }
-  if (!app.reviewChannelId) return interaction.reply({ content: "❌ This application isn't fully set up yet (no review channel). Please contact an admin.", ephemeral: true });
-  if (!app.questions?.length) return interaction.reply({ content: "❌ This application has no questions configured. Please contact an admin.", ephemeral: true });
+  if (!app.reviewChannelId) return interaction.reply({ content: "This application isn't quite ready yet. Please give an admin a heads up.", ephemeral: true });
+  if (!app.questions?.length) return interaction.reply({ content: "This application doesn't have any questions set up yet. Please let an admin know.", ephemeral: true });
   if (activeDmApps.has(interaction.user.id))
-    return interaction.reply({ content: "❌ You already have an application in progress in your DMs. Finish or type **cancel** there first.", ephemeral: true });
+    return interaction.reply({ content: "You've already got an application open in your DMs. Finish that one first, or hit **Cancel Application** there, then come back.", ephemeral: true });
 
   // Open a DM and send the intro BEFORE acknowledging, so a closed-DM user gets a
-  // clear error instead of silently starting an interview they can't see.
+  // clear message instead of silently starting an interview they can't see.
   let dm;
   try {
     dm = await interaction.user.createDM();
-    await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.info)
-      .setTitle(`${app.emoji || "📝"} ${app.label} Application`)
-      .setDescription(
-        `Let's get started! I'll ask you **${app.questions.length}** question${app.questions.length === 1 ? "" : "s"}, one at a time - just reply to each here.\n\n` +
-        `You have **${APP_QUESTION_TIMEOUT_MS / 60000} minutes** per question, and you can type **cancel** anytime to stop.`)
-      .setFooter({ text: interaction.guild.name })
-      .setTimestamp()] });
+    await dm.send({ embeds: [new EmbedBuilder().setColor(APPY_GREEN)
+      .setTitle("Application Started")
+      .setDescription("Please answer the questions below by sending a message to the bot. Take your time, and answer honestly.")] });
   } catch {
-    return interaction.reply({ content: "❌ I couldn't DM you. Enable **Direct Messages** for this server (Privacy Settings → Allow direct messages from server members) and click Apply again.", ephemeral: true });
+    return interaction.reply({ content: "I couldn't send you a DM. Turn on direct messages for this server (Privacy Settings → Allow direct messages from server members), then hit Apply again.", ephemeral: true });
   }
 
-  await interaction.reply({ content: `📬 Check your DMs - I've sent you the **${app.label}** application. Answer the questions there.`, ephemeral: true });
+  await interaction.reply({ content: `All set - I've sent the **${app.label}** application to your DMs. Just answer there and you're good to go.`, ephemeral: true });
   runDmApplication(interaction.guild, interaction.user, app, dm).catch(err => console.error("⚠️ DM application flow failed:", err));
 }
 
-// Walk the applicant through the questions in DMs, one at a time.
+// Walk the applicant through the questions in DMs, one at a time (Appy-style).
 async function runDmApplication(guild, user, app, dm) {
   activeDmApps.add(user.id);
   try {
     const cap = appAnswerCap(app.questions.length);
+    const total = app.questions.length;
+    const cancelRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("app_cancel").setLabel("Cancel Application").setStyle(ButtonStyle.Danger));
     const answers = [];
-    for (let i = 0; i < app.questions.length; i++) {
-      await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.info)
-        .setAuthor({ name: `${app.label} Application`, iconURL: guild.iconURL?.() || undefined })
-        .setTitle(`Question ${i + 1} of ${app.questions.length}`)
-        .setDescription(app.questions[i])
-        .setFooter({ text: "Reply with your answer • type 'cancel' to stop" })] }).catch(() => {});
 
-      const collected = await dm.awaitMessages({ filter: m => m.author.id === user.id, max: 1, time: APP_QUESTION_TIMEOUT_MS }).catch(() => null);
-      if (!collected || !collected.size) {
-        await dm.send({ embeds: [embed(COLORS.neutral, `⏱️ You didn't answer in time, so your **${app.label}** application was cancelled. You can start again from the panel whenever you're ready.`)] }).catch(() => {});
+    for (let i = 0; i < total; i++) {
+      const qMsg = await dm.send({
+        embeds: [new EmbedBuilder().setColor(APPY_BLURPLE)
+          .setTitle(`${app.label} Application`)
+          .setDescription(`${i + 1}/${total}. ${app.questions[i]}\n\n*To answer this question, just send your response as a message here.*`)],
+        components: [cancelRow],
+      }).catch(() => null);
+
+      // Whichever comes first: the applicant's reply, or a click on Cancel Application.
+      const replyP = dm.awaitMessages({ filter: m => m.author.id === user.id, max: 1, time: APP_QUESTION_TIMEOUT_MS })
+        .then(c => (c.size ? c.first() : "TIMEOUT")).catch(() => "TIMEOUT");
+      const cancelP = qMsg
+        ? qMsg.awaitMessageComponent({ filter: b => b.user.id === user.id && b.customId === "app_cancel", time: APP_QUESTION_TIMEOUT_MS })
+            .then(b => { b.deferUpdate().catch(() => {}); return "CANCEL"; }).catch(() => "TIMEOUT")
+        : Promise.resolve("TIMEOUT");
+      const result = await Promise.race([replyP, cancelP]);
+      if (qMsg) await qMsg.edit({ components: [] }).catch(() => {}); // retire the Cancel button for this question
+
+      if (result === "CANCEL") {
+        await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Cancelled")
+          .setDescription(`No worries - I've cancelled your **${app.label}** application. Nothing was sent. You can start again anytime from the panel.`)] }).catch(() => {});
         return;
       }
-      const msg = collected.first();
+      if (result === "TIMEOUT") {
+        await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Timed Out")
+          .setDescription(`Looks like you stepped away, so I've cancelled your **${app.label}** application for now. Feel free to start again whenever you're ready.`)] }).catch(() => {});
+        return;
+      }
+
+      const msg = result;
       let content = (msg.content || "").trim();
       if (content.toLowerCase() === "cancel") {
-        await dm.send({ embeds: [embed(COLORS.neutral, `❌ Your **${app.label}** application was cancelled. Nothing was submitted.`)] }).catch(() => {});
+        await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Cancelled")
+          .setDescription(`No worries - I've cancelled your **${app.label}** application. Nothing was sent.`)] }).catch(() => {});
         return;
       }
       if (!content && msg.attachments?.size) content = [...msg.attachments.values()].map(a => a.url).join("\n"); // image/file-only answer
-      answers.push(content ? content.slice(0, cap) : "*(no answer)*");
+      answers.push(content ? content.slice(0, cap) : "*(left blank)*");
     }
 
     // The application could have been closed or deleted mid-interview - re-check before submitting.
     const fresh = getApplication(guild.id, app.key);
     if (!fresh || fresh.closed || !fresh.reviewChannelId) {
-      await dm.send({ embeds: [embed(COLORS.neutral, `🔒 **${app.label}** applications closed before you finished, so your submission wasn't sent.`)] }).catch(() => {});
+      await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Closed")
+        .setDescription(`**${app.label}** applications closed while you were filling this out, so I wasn't able to send it in. Sorry about that - do try again once they reopen.`)] }).catch(() => {});
       return;
     }
 
     const ok = await finalizeApplication(guild, user, fresh, answers);
-    await dm.send({ embeds: [embed(ok ? COLORS.success : COLORS.danger,
-      ok ? `✅ Your **${app.label}** application has been submitted. You'll be notified here once it's reviewed. Good luck!`
-         : `❌ Something went wrong submitting your application - please contact an admin.`)] }).catch(() => {});
+    await dm.send({ embeds: [ok
+      ? new EmbedBuilder().setColor(APPY_GREEN).setTitle("Application Submitted")
+          .setDescription(`That's everything - thanks for applying! Your **${app.label}** application is with the team now, and you'll hear back here once they've had a look. Good luck!`)
+      : new EmbedBuilder().setColor(COLORS.danger).setTitle("Something Went Wrong")
+          .setDescription("Something went wrong on my end and I couldn't send your application through. Please let a staff member know so they can sort it out.")] }).catch(() => {});
   } finally {
     activeDmApps.delete(user.id);
   }
@@ -2410,10 +2434,10 @@ async function finalizeApplication(guild, user, app, answers) {
     .setTitle(`${app.emoji || "📝"} New ${app.label} Application`)
     .addFields(app.questions.map((q, i) => ({
       name: `${i + 1}. ${q}`.slice(0, 256),
-      value: (answers[i] || "*(no answer)*").slice(0, 1024),
+      value: (answers[i] || "*(left blank)*").slice(0, 1024),
       inline: false,
     })))
-    .setFooter({ text: `Applicant ID: ${user.id} • Status: 🟡 Pending` })
+    .setFooter({ text: `Applicant ID: ${user.id} • Waiting on review` })
     .setTimestamp();
 
   const controls = new ActionRowBuilder().addComponents(
@@ -2423,7 +2447,7 @@ async function finalizeApplication(guild, user, app, answers) {
 
   const posted = await reviewChannel.send({ embeds: [reviewEmbed], components: [controls] }).catch(() => null);
   if (!posted) return false;
-  secLog(guild, "Application Submitted", `<@${user.id}> submitted a **${app.label}** application → <#${reviewChannel.id}>`, COLORS.info);
+  secLog(guild, "New Application", `<@${user.id}> just applied for **${app.label}**. It's waiting for a look in <#${reviewChannel.id}>.`, COLORS.info);
   return true;
 }
 
@@ -2436,10 +2460,10 @@ function parseReviewCustomId(customId, prefix) {
 
 async function handleAppAccept(interaction) {
   const { guild, member } = interaction;
-  if (!isMod(member)) return interaction.reply({ content: "❌ Only staff can review applications.", ephemeral: true });
+  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
   const { key, userId } = parseReviewCustomId(interaction.customId, "app_accept_");
   const app = getApplication(guild.id, key);
-  if (!app) return interaction.reply({ content: "❌ This application type no longer exists.", ephemeral: true });
+  if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
 
   await interaction.deferUpdate().catch(() => {});
   const applicant = await guild.members.fetch(userId).catch(() => null);
@@ -2458,31 +2482,31 @@ async function handleAppAccept(interaction) {
   const base = interaction.message.embeds[0];
   const updated = EmbedBuilder.from(base)
     .setColor(COLORS.success)
-    .setFooter({ text: `Applicant ID: ${userId} • ✅ Accepted by ${member.user.tag}` });
+    .setFooter({ text: `Applicant ID: ${userId} • Accepted by ${member.user.tag}` });
   await interaction.message.edit({
     embeds: [updated],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("app_done_accept").setLabel(`Accepted by ${member.user.username}`.slice(0, 80)).setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true))],
   }).catch(() => {});
 
-  if (applicant) await tryDM(applicant.user, `🎉 Your **${app.label}** application in **${guild.name}** was **accepted**! ${grantedCount ? `You've been granted ${grantedCount} role(s).` : ""}`);
+  if (applicant) await tryDM(applicant.user, `Great news - your **${app.label}** application over in **${guild.name}** got accepted!${grantedCount ? ` You've picked up ${grantedCount} new role${grantedCount === 1 ? "" : "s"}.` : ""} Welcome aboard.`);
   secLog(guild, "Application Accepted",
-    `<@${member.id}> accepted <@${userId}>'s **${app.label}** application. Granted **${grantedCount}** role(s).` +
-    (failedRoles.length ? `\n⚠️ Could not grant: ${failedRoles.join(", ")}` : "") +
-    (!applicant ? `\n⚠️ Applicant is no longer in the server - roles not granted.` : ""),
+    `<@${member.id}> accepted <@${userId}>'s **${app.label}** application and handed them **${grantedCount}** role${grantedCount === 1 ? "" : "s"}.` +
+    (failedRoles.length ? `\nHeads up, I couldn't grant: ${failedRoles.join(", ")}` : "") +
+    (!applicant ? `\nThey've since left the server, so no roles were applied.` : ""),
     COLORS.success);
 }
 
 async function handleAppDeny(interaction) {
   const { guild, member } = interaction;
-  if (!isMod(member)) return interaction.reply({ content: "❌ Only staff can review applications.", ephemeral: true });
+  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
   const { key, userId } = parseReviewCustomId(interaction.customId, "app_deny_");
   const app = getApplication(guild.id, key);
-  if (!app) return interaction.reply({ content: "❌ This application type no longer exists.", ephemeral: true });
+  if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
 
   const modal = new ModalBuilder().setCustomId(`app_denyreason_${key}_${userId}_${interaction.message.id}`).setTitle(`Deny ${app.label} Application`.slice(0, 45));
   modal.addComponents(new ActionRowBuilder().addComponents(
-    new TextInputBuilder().setCustomId("reason").setLabel("Reason (optional - shown to applicant)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)));
+    new TextInputBuilder().setCustomId("reason").setLabel("Reason (optional, shared with them)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)));
   return interaction.showModal(modal);
 }
 
@@ -2502,8 +2526,8 @@ async function handleAppDenyReason(interaction) {
   if (msg && msg.embeds[0]) {
     const updated = EmbedBuilder.from(msg.embeds[0])
       .setColor(COLORS.danger)
-      .setFooter({ text: `Applicant ID: ${userId} • ⛔ Denied by ${member.user.tag}` });
-    if (reason) updated.addFields({ name: "Denial reason", value: reason.slice(0, 1024), inline: false });
+      .setFooter({ text: `Applicant ID: ${userId} • Denied by ${member.user.tag}` });
+    if (reason) updated.addFields({ name: "Reason", value: reason.slice(0, 1024), inline: false });
     await msg.edit({
       embeds: [updated],
       components: [new ActionRowBuilder().addComponents(
@@ -2512,15 +2536,15 @@ async function handleAppDenyReason(interaction) {
   }
 
   const applicant = await guild.members.fetch(userId).catch(() => null);
-  if (applicant) await tryDM(applicant.user, `Your **${app?.label || "application"}** application in **${guild.name}** was **denied**.${reason ? `\n**Reason:** ${reason}` : ""}`);
-  secLog(guild, "Application Denied", `<@${member.id}> denied <@${userId}>'s **${app?.label || key}** application.${reason ? ` Reason: ${reason}` : ""}`, COLORS.danger);
+  if (applicant) await tryDM(applicant.user, `Thanks for applying for **${app?.label || "that role"}** in **${guild.name}**. It wasn't accepted this time.${reason ? ` Here's the reason they gave: ${reason}` : ""} You're welcome to try again down the line.`);
+  secLog(guild, "Application Denied", `<@${member.id}> turned down <@${userId}>'s **${app?.label || key}** application.${reason ? ` Reason given: ${reason}` : ""}`, COLORS.danger);
 }
 
 // ── Slash Command Handler ─────────────────────────────────────
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (!interaction.inGuild())
-    return interaction.reply({ content: "❌ This command can only be used in a server.", ephemeral: true });
+    return interaction.reply({ content: "You can only use this in a server.", ephemeral: true });
   const { commandName, guild, member } = interaction;
 
   try {
@@ -2528,7 +2552,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // ── /mute ──────────────────────────────────────────────
     case "mute": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const target  = interaction.options.getMember("user");
       const minutes = interaction.options.getInteger("minutes") ?? 10;
       const reason  = interaction.options.getString("reason") ?? "No reason provided";
@@ -2536,7 +2560,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!guard.ok) return interaction.reply({ content: guard.why, ephemeral: true });
       const muteRoleId = gc(guild).muteRoleId;
       if (!muteRoleId || !guild.roles.cache.get(muteRoleId))
-        return interaction.reply({ content: "❌ Mute role not configured. Run `/setup quick` or `/setup roles mute_role:@Role`.", ephemeral: true });
+        return interaction.reply({ content: "There is no mute role set up yet. Run `/setup quick`, or set one with `/setup roles mute_role:@Role`.", ephemeral: true });
 
       if (!isWhitelisted(member)) {
         const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "mute");
@@ -2544,11 +2568,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         recordModAction(guild.id, member.id, "mute");
       }
       const ok = await muteUser(target, minutes, reason);
-      if (!ok) return interaction.reply({ content: "❌ Mute role not configured. Run `/setup quick` or `/setup roles mute_role:@Role`.", ephemeral: true });
+      if (!ok) return interaction.reply({ content: "There is no mute role set up yet. Run `/setup quick`, or set one with `/setup roles mute_role:@Role`.", ephemeral: true });
       const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "mute");
       const stashed = mutedRoles[guild.id]?.[target.id]?.roles?.length ?? 0;
       const e = new EmbedBuilder().setColor(COLORS.muted).setTitle("🔇 Member Muted")
-        .setDescription(`<@${target.id}> has been muted for **${minutes > 0 ? minutes + " minutes" : "permanently"}**.\n**Reason:** ${reason}\n📦 **${stashed}** role${stashed === 1 ? "" : "s"} stashed - restored on unmute.`)
+        .setDescription(`Muted <@${target.id}> for **${minutes > 0 ? minutes + " minutes" : "as long as it takes"}**.\n**Reason:** ${reason}\nI've set aside **${stashed}** role${stashed === 1 ? "" : "s"} and will hand them back on unmute.`)
         .setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("mute", newUsed, limit) });
       return interaction.reply({ embeds: [e] });
@@ -2556,19 +2580,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // ── /unmute ────────────────────────────────────────────
     case "unmute": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const target = interaction.options.getMember("user");
-      if (!target) return interaction.reply({ content: "❌ User not found.", ephemeral: true });
-      if (!gc(guild).muteRoleId) return interaction.reply({ content: "❌ Mute role not configured. Run `/setup quick` or `/setup roles mute_role:@Role`.", ephemeral: true });
+      if (!target) return interaction.reply({ content: "I couldn't find that user.", ephemeral: true });
+      if (!gc(guild).muteRoleId) return interaction.reply({ content: "There is no mute role set up yet. Run `/setup quick`, or set one with `/setup roles mute_role:@Role`.", ephemeral: true });
       const stashed = mutedRoles[guild.id]?.[target.id]?.roles?.length ?? 0;
       await unmuteUser(guild, target.id, `Manual unmute by ${interaction.user.tag}`);
       return interaction.reply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔊 Member Unmuted")
-        .setDescription(`<@${target.id}> has been unmuted.\n♻️ Restored **${stashed}** stashed role${stashed === 1 ? "" : "s"}.`).setTimestamp()] });
+        .setDescription(`<@${target.id}> is unmuted, and I gave back **${stashed}** stashed role${stashed === 1 ? "" : "s"}.`).setTimestamp()] });
     }
 
     // ── /kick ──────────────────────────────────────────────
     case "kick": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const target = interaction.options.getMember("user");
       const reason = interaction.options.getString("reason") ?? "No reason provided";
       const guard = canActOn(member, target);
@@ -2577,26 +2601,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!isWhitelisted(member)) {
         if (bump(guild.id, member.id, "kicks", config.nukeKickThreshold)) {
           resetBump(guild.id, member.id, "kicks");
-          await interaction.reply({ content: "🚨 Anti-nuke triggered.", ephemeral: true });
+          await interaction.reply({ content: "Hold on - that just tripped the anti-nuke protection.", ephemeral: true });
           return nukeResponse(guild, member, `Issued ${config.nukeKickThreshold}+ kicks via commands in ${config.nukeWindowMs / 1000}s`);
         }
         const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "kick");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("kick", used, limit, resetsInMin)], ephemeral: true });
         recordModAction(guild.id, member.id, "kick");
       }
-      await tryDM(target.user, `You were kicked from **${guild.name}**. Reason: ${reason}`);
+      await tryDM(target.user, `You've been kicked from **${guild.name}**.\nReason: ${reason}`);
       await target.kick(reason).catch(() => {});
-      secLog(guild, "Member Kicked", `<@${target.id}> kicked by <@${member.id}>: ${reason}`, COLORS.danger);
+      secLog(guild, "Member Kicked", `<@${member.id}> kicked <@${target.id}> - ${reason}`, COLORS.danger);
       const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "kick");
       const e = new EmbedBuilder().setColor(COLORS.danger).setTitle("👢 Member Kicked")
-        .setDescription(`<@${target.id}> has been kicked.\n**Reason:** ${reason}`).setTimestamp();
+        .setDescription(`Kicked <@${target.id}>.\n**Reason:** ${reason}`).setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("kick", newUsed, limit) });
       return interaction.reply({ embeds: [e] });
     }
 
     // ── /ban ───────────────────────────────────────────────
     case "ban": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const target     = interaction.options.getMember("user");
       const reason     = interaction.options.getString("reason") ?? "No reason provided";
       const deleteDays = interaction.options.getInteger("delete_days") ?? 0;
@@ -2606,40 +2630,40 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!isWhitelisted(member)) {
         if (bump(guild.id, member.id, "bans", config.nukeBanThreshold)) {
           resetBump(guild.id, member.id, "bans");
-          await interaction.reply({ content: "🚨 Anti-nuke triggered.", ephemeral: true });
+          await interaction.reply({ content: "Hold on - that just tripped the anti-nuke protection.", ephemeral: true });
           return nukeResponse(guild, member, `Issued ${config.nukeBanThreshold}+ bans via commands in ${config.nukeWindowMs / 1000}s`);
         }
         const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "ban");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("ban", used, limit, resetsInMin)], ephemeral: true });
         recordModAction(guild.id, member.id, "ban");
       }
-      await tryDM(target.user, `You were banned from **${guild.name}**. Reason: ${reason}`);
+      await tryDM(target.user, `You've been banned from **${guild.name}**.\nReason: ${reason}`);
       await target.ban({ reason, deleteMessageSeconds: deleteDays * 86400 }).catch(() => {});
       const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "ban");
-      secLog(guild, "Member Banned", `<@${target.id}> banned by <@${member.id}>: ${reason}`, COLORS.danger);
+      secLog(guild, "Member Banned", `<@${member.id}> banned <@${target.id}> - ${reason}`, COLORS.danger);
       const e = new EmbedBuilder().setColor(COLORS.danger).setTitle("🔨 Member Banned")
-        .setDescription(`<@${target.id}> has been banned.\n**Reason:** ${reason}`).setTimestamp();
+        .setDescription(`Banned <@${target.id}>.\n**Reason:** ${reason}`).setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("ban", newUsed, limit) });
       return interaction.reply({ embeds: [e] });
     }
 
     // ── /unban ─────────────────────────────────────────────
     case "unban": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const userId = interaction.options.getString("user_id").trim();
       const reason = interaction.options.getString("reason") ?? "No reason provided";
-      if (!/^\d{17,20}$/.test(userId)) return interaction.reply({ content: "❌ That doesn't look like a valid user ID.", ephemeral: true });
+      if (!/^\d{17,20}$/.test(userId)) return interaction.reply({ content: "That doesn't look like a valid user ID.", ephemeral: true });
       const ban = await guild.bans.fetch(userId).catch(() => null);
-      if (!ban) return interaction.reply({ content: "❌ That user isn't banned.", ephemeral: true });
+      if (!ban) return interaction.reply({ content: "That user isn't banned.", ephemeral: true });
       await guild.bans.remove(userId, `Unban by ${interaction.user.tag}: ${reason}`).catch(() => {});
-      secLog(guild, "Member Unbanned", `\`${userId}\` unbanned by <@${member.id}>: ${reason}`, COLORS.success);
+      secLog(guild, "Member Unbanned", `<@${member.id}> lifted the ban on \`${userId}\` - ${reason}`, COLORS.success);
       return interaction.reply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("♻️ Member Unbanned")
-        .setDescription(`<@${userId}> (\`${userId}\`) has been unbanned.\n**Reason:** ${reason}`).setTimestamp()] });
+        .setDescription(`<@${userId}> (\`${userId}\`) is unbanned.\n**Reason:** ${reason}`).setTimestamp()] });
     }
 
     // ── /purge ─────────────────────────────────────────────
     case "purge": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const count      = interaction.options.getInteger("count");
       const filterUser = interaction.options.getUser("user");
 
@@ -2650,22 +2674,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await interaction.deferReply({ ephemeral: true });
       let messages = await interaction.channel.messages.fetch({ limit: 100 }).catch(() => null);
-      if (!messages) return interaction.editReply("❌ Could not fetch messages.");
+      if (!messages) return interaction.editReply("I couldn't fetch the messages here to clear them.");
       if (filterUser) messages = messages.filter(m => m.author.id === filterUser.id);
       const toDelete = [...messages.values()].slice(0, count);
       const deleted  = await interaction.channel.bulkDelete(toDelete, true).catch(() => null);
       const n = deleted?.size ?? 0;
-      secLog(guild, "Purge", `<@${member.id}> purged **${n}** messages in <#${interaction.channelId}>${filterUser ? ` from <@${filterUser.id}>` : ""}`, COLORS.warn);
+      secLog(guild, "Purge", `<@${member.id}> cleared **${n}** message${n === 1 ? "" : "s"} in <#${interaction.channelId}>${filterUser ? ` from <@${filterUser.id}>` : ""}.`, COLORS.warn);
       const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "purge");
-      const e = new EmbedBuilder().setColor(COLORS.warn).setTitle("🗑️ Purge Complete")
-        .setDescription(`Deleted **${n}** messages${filterUser ? ` from <@${filterUser.id}>` : ""}.`).setTimestamp();
+      const e = new EmbedBuilder().setColor(COLORS.warn).setTitle("🗑️ Messages Cleared")
+        .setDescription(`Cleared **${n}** message${n === 1 ? "" : "s"}${filterUser ? ` from <@${filterUser.id}>` : ""}.`).setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("purge", newUsed, limit) });
       return interaction.editReply({ embeds: [e] });
     }
 
     // ── /lockdown ──────────────────────────────────────────
     case "lockdown": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const action  = interaction.options.getString("action");
       const channel = interaction.options.getChannel("channel") ?? interaction.channel;
       const lock    = action === "lock";
@@ -2673,7 +2697,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (lock && !isWhitelisted(member)) {
         if (bump(guild.id, member.id, "chLock", config.nukeChannelThreshold)) {
           resetBump(guild.id, member.id, "chLock");
-          await interaction.reply({ content: "🚨 Anti-nuke triggered.", ephemeral: true });
+          await interaction.reply({ content: "Hold on - that just tripped the anti-nuke protection.", ephemeral: true });
           return nukeResponse(guild, member, `Locked ${config.nukeChannelThreshold}+ channels via commands in ${config.nukeWindowMs / 1000}s`);
         }
         const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "lockdown");
@@ -2682,11 +2706,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: lock ? false : null }).catch(() => {});
       secLog(guild, lock ? "Channel Locked" : "Channel Unlocked",
-        `<#${channel.id}> ${lock ? "locked" : "unlocked"} by <@${member.id}>`, lock ? COLORS.danger : COLORS.success);
+        `<@${member.id}> ${lock ? "locked down" : "reopened"} <#${channel.id}>.`, lock ? COLORS.danger : COLORS.success);
       const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "lockdown");
       const e = new EmbedBuilder().setColor(lock ? COLORS.danger : COLORS.success)
         .setTitle(lock ? "🔒 Channel Locked" : "🔓 Channel Unlocked")
-        .setDescription(`<#${channel.id}> has been ${lock ? "locked" : "unlocked"}.`).setTimestamp();
+        .setDescription(`<#${channel.id}> is now ${lock ? "locked down - only staff can send messages" : "back open"}.`).setTimestamp();
       if (lock && !isWhitelisted(member)) e.setFooter({ text: usageFooter("lockdown", newUsed, limit) });
       return interaction.reply({ embeds: [e] });
     }
@@ -2694,7 +2718,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // ── /panic (owner only) - toggles: run again to lift ────
     case "panic": {
       if (!isOwner(member) && member.id !== guild.ownerId)
-        return interaction.reply({ content: "❌ Owner only.", ephemeral: true });
+        return interaction.reply({ content: "This one's owner only.", ephemeral: true });
       await interaction.deferReply({ ephemeral: true });
 
       if (isLockdown(guild.id)) {
@@ -2706,8 +2730,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
         clearLockdown(guild.id);
-        alertOwner(guild, `✅ **PANIC LOCKDOWN LIFTED** by <@${member.id}>. Unlocked **${unlocked}** channels.`, COLORS.success, "PANIC LIFTED");
-        return interaction.editReply(`✅ Panic lockdown lifted - unlocked **${unlocked}** text channels.`);
+        alertOwner(guild, `<@${member.id}> lifted the panic lockdown. **${unlocked}** channels are back open.`, COLORS.success, "Panic Lockdown Lifted");
+        return interaction.editReply(`Done - panic lockdown lifted and **${unlocked}** text channels are back open.`);
       }
 
       let locked = 0;
@@ -2718,13 +2742,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       }
       setLockdown(guild.id, "panic", null);
-      alertOwner(guild, `🚨 **PANIC LOCKDOWN** engaged by <@${member.id}>. Locked **${locked}** channels. Run \`/panic\` again to lift.`, COLORS.nuke, "PANIC");
-      return interaction.editReply(`🚨 Panic lockdown engaged - locked **${locked}** text channels. Run \`/panic\` again to lift.`);
+      alertOwner(guild, `<@${member.id}> hit the panic button and locked down **${locked}** channels. Run \`/panic\` again to lift it.`, COLORS.nuke, "Panic Lockdown");
+      return interaction.editReply(`Panic lockdown is on - I've locked **${locked}** text channels. Run \`/panic\` again to lift it.`);
     }
 
     // ── /warn ──────────────────────────────────────────────
     case "warn": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const target = interaction.options.getMember("user");
       const reason = interaction.options.getString("reason") ?? "No reason provided";
       const guard = canActOn(member, target);
@@ -2736,64 +2760,64 @@ client.on(Events.InteractionCreate, async (interaction) => {
         recordModAction(guild.id, member.id, "warn");
       }
       const total = addWarning(guild.id, target.id, reason, member.id);
-      await tryDM(target.user, `You received a warning in **${guild.name}** (#${total}). Reason: ${reason}`);
-      secLog(guild, "Warning Issued", `<@${target.id}> warned by <@${member.id}> (total **${total}**): ${reason}`, COLORS.warn);
+      await tryDM(target.user, `You've picked up a warning in **${guild.name}** (that's #${total}). Reason: ${reason}`);
+      secLog(guild, "Warning Issued", `<@${member.id}> warned <@${target.id}> - that's **${total}** now. Reason: ${reason}`, COLORS.warn);
 
       // Escalation
       let escalation = "";
       if (config.warnBanAt && total >= config.warnBanAt) {
         await target.ban({ reason: `Auto-escalation: reached ${total} warnings` }).catch(() => {});
-        escalation = `\n🔨 **Auto-banned** (reached ${total} warnings).`;
-        secLog(guild, "Auto-Escalation", `<@${target.id}> auto-banned at ${total} warnings.`, COLORS.danger);
+        escalation = `\n🔨 That hit **${total}** warnings, so they've been auto-banned.`;
+        secLog(guild, "Auto-Escalation", `<@${target.id}> hit ${total} warnings and was auto-banned.`, COLORS.danger);
       } else if (config.warnKickAt && total >= config.warnKickAt) {
         await target.kick(`Auto-escalation: reached ${total} warnings`).catch(() => {});
-        escalation = `\n👢 **Auto-kicked** (reached ${total} warnings).`;
-        secLog(guild, "Auto-Escalation", `<@${target.id}> auto-kicked at ${total} warnings.`, COLORS.danger);
+        escalation = `\n👢 That hit **${total}** warnings, so they've been auto-kicked.`;
+        secLog(guild, "Auto-Escalation", `<@${target.id}> hit ${total} warnings and was auto-kicked.`, COLORS.danger);
       } else if (config.warnMuteAt && total >= config.warnMuteAt) {
         await muteUser(target, config.warnMuteMin, `Auto-escalation: reached ${total} warnings`);
-        escalation = `\n🔇 **Auto-muted** for ${config.warnMuteMin} min (reached ${total} warnings).`;
+        escalation = `\n🔇 That hit **${total}** warnings, so they've been auto-muted for ${config.warnMuteMin} min.`;
       }
 
       const { used: newUsed, limit } = checkModLimit(guild.id, member.id, "warn");
       const e = new EmbedBuilder().setColor(COLORS.warn).setTitle("⚠️ Warning Issued")
-        .setDescription(`<@${target.id}> has been warned. **Total: ${total}**\n**Reason:** ${reason}${escalation}`).setTimestamp();
+        .setDescription(`Warned <@${target.id}>. **That's ${total} in total.**\n**Reason:** ${reason}${escalation}`).setTimestamp();
       if (!isWhitelisted(member)) e.setFooter({ text: usageFooter("warn", newUsed, limit) });
       return interaction.reply({ embeds: [e] });
     }
 
     // ── /warnings ──────────────────────────────────────────
     case "warnings": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const target = interaction.options.getUser("user");
       const list = getWarnings(guild.id, target.id);
-      if (!list.length) return interaction.reply({ content: `✅ <@${target.id}> has no warnings.`, ephemeral: true });
+      if (!list.length) return interaction.reply({ content: `<@${target.id}> has a clean slate - no warnings.`, ephemeral: true });
       const lines = list.slice(-15).map((w, i) =>
         `**${i + 1}.** ${w.reason} - by <@${w.by}> · <t:${Math.floor(w.at / 1000)}:R>`).join("\n");
       return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.warn)
         .setTitle(`⚠️ Warnings for ${target.tag}`)
-        .setDescription(`**Total: ${list.length}**\n\n${lines}`)
-        .setFooter({ text: `Escalation: mute@${config.warnMuteAt} · kick@${config.warnKickAt} · ban@${config.warnBanAt}` })
+        .setDescription(`**${list.length} in total.**\n\n${lines}`)
+        .setFooter({ text: `Auto-actions kick in at: mute@${config.warnMuteAt} · kick@${config.warnKickAt} · ban@${config.warnBanAt}` })
         .setTimestamp()] });
     }
 
     // ── /clearwarns ────────────────────────────────────────
     case "clearwarns": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const target = interaction.options.getUser("user");
       const had = getWarnings(guild.id, target.id).length;
       clearWarnings(guild.id, target.id);
-      secLog(guild, "Warnings Cleared", `<@${member.id}> cleared **${had}** warning(s) for <@${target.id}>`, COLORS.success);
-      return interaction.reply({ embeds: [embed(COLORS.success, `Cleared **${had}** warning${had === 1 ? "" : "s"} for <@${target.id}>.`, "Warnings Cleared")], ephemeral: true });
+      secLog(guild, "Warnings Cleared", `<@${member.id}> wiped **${had}** warning${had === 1 ? "" : "s"} for <@${target.id}>.`, COLORS.success);
+      return interaction.reply({ embeds: [embed(COLORS.success, `Cleared **${had}** warning${had === 1 ? "" : "s"} for <@${target.id}>. Clean slate.`, "Warnings Cleared")], ephemeral: true });
     }
 
     // ── /limits ────────────────────────────────────────────
     case "limits": {
-      if (!isMod(member)) return interaction.reply({ content: "❌ You need the mod role.", ephemeral: true });
+      if (!isMod(member)) return interaction.reply({ content: "This one is staff only - you need the mod role.", ephemeral: true });
       const windowHours = config.modWindowMs / 3600000;
       if (isWhitelisted(member)) {
         return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info)
           .setTitle("🛡️ Your Mod Limits")
-          .setDescription(`✨ **You are whitelisted.** No rate limits apply to your account.`).setTimestamp()] });
+          .setDescription(`You're whitelisted, so none of the rate limits apply to you.`).setTimestamp()] });
       }
       const actions = [
         { key: "ban", emoji: "🔨", label: "Bans" }, { key: "kick", emoji: "👢", label: "Kicks" },
@@ -2809,13 +2833,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info)
         .setTitle("📊 Your Mod Action Limits")
-        .setDescription(`Rolling **${windowHours}h** window. Limits reset automatically as old actions age out.`)
+        .setDescription(`Here's where you're at over the last **${windowHours}h**. These top back up on their own as older actions age out.`)
         .addFields(...fields).setTimestamp()] });
     }
 
     // ── /antiping ──────────────────────────────────────────
     case "antiping": {
-      if (!isOwner(member) && member.id !== guild.ownerId) return interaction.reply({ content: "🔒 Only the bot owner or this server's owner can configure Guardian.", ephemeral: true });
+      if (!isOwner(member) && member.id !== guild.ownerId) return interaction.reply({ content: "Only the bot owner or the server owner can change these settings.", ephemeral: true });
       const sub = interaction.options.getSubcommand();
       const a = ap(guild);
       switch (sub) {
@@ -2899,7 +2923,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // ── /setup ─────────────────────────────────────────────
     case "setup": {
-      if (!isOwner(member) && member.id !== guild.ownerId) return interaction.reply({ content: "🔒 Only the bot owner or this server's owner can configure Guardian.", ephemeral: true });
+      if (!isOwner(member) && member.id !== guild.ownerId) return interaction.reply({ content: "Only the bot owner or the server owner can change these settings.", ephemeral: true });
       const sub = interaction.options.getSubcommand();
 
       if (sub === "quick") {
@@ -2925,7 +2949,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const changes = [];
         if (modRole)  { setGuild(guild.id, "modRoleId",  modRole.id);  changes.push(`Mod role → <@&${modRole.id}>`); }
         if (muteRole) { setGuild(guild.id, "muteRoleId", muteRole.id); changes.push(`Mute role → <@&${muteRole.id}> _(ensure it denies Send Messages)_`); }
-        if (!changes.length) return interaction.reply({ content: "❌ Provide at least one role.", ephemeral: true });
+        if (!changes.length) return interaction.reply({ content: "Give me at least one role to set.", ephemeral: true });
         return interaction.reply({ ephemeral: true, embeds: [buildSetupEmbed(guild, changes)] });
       }
 
@@ -2937,7 +2961,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (logCh)    { setGuild(guild.id, "logChannelId",    logCh.id);    changes.push(`Log channel → <#${logCh.id}>`); }
         if (alertCh)  { setGuild(guild.id, "alertChannelId",  alertCh.id);  changes.push(`Alert channel → <#${alertCh.id}>`); }
         if (msgLogCh) { setGuild(guild.id, "msgLogChannelId", msgLogCh.id); changes.push(`Msg log → <#${msgLogCh.id}>`); }
-        if (!changes.length) return interaction.reply({ content: "❌ Provide at least one channel.", ephemeral: true });
+        if (!changes.length) return interaction.reply({ content: "Give me at least one channel to set.", ephemeral: true });
         return interaction.reply({ ephemeral: true, embeds: [buildSetupEmbed(guild, changes)] });
       }
 
@@ -2945,7 +2969,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const action = interaction.options.getString("action");
         const user   = interaction.options.getUser("user");
         const role   = interaction.options.getRole("role");
-        if (!user && !role) return interaction.reply({ content: "❌ Provide a user or a role.", ephemeral: true });
+        if (!user && !role) return interaction.reply({ content: "Give me a user or a role.", ephemeral: true });
         const changes = [];
         if (user) {
           let arr = [...gc(guild).nukeWhitelistUserIds];
@@ -2977,7 +3001,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // ── /config ────────────────────────────────────────────
     case "config": {
-      if (!isOwner(member) && member.id !== guild.ownerId) return interaction.reply({ content: "🔒 Only the bot owner or this server's owner can view configuration.", ephemeral: true });
+      if (!isOwner(member) && member.id !== guild.ownerId) return interaction.reply({ content: "Only the bot owner or the server owner can view the config.", ephemeral: true });
       const windowHours = config.modWindowMs / 3600000;
       const gcfg = gc(guild);
       const acfg = ap(guild);
@@ -3018,7 +3042,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // ── /nuketest ──────────────────────────────────────────
     case "nuketest": {
       if (!isOwner(interaction.user) && interaction.user.id !== guild.ownerId)
-        return interaction.reply({ content: "❌ Owner only.", ephemeral: true });
+        return interaction.reply({ content: "This one's owner only.", ephemeral: true });
       const me = guild.members.me;
       const need = [
         ["View Audit Log", PermissionsBitField.Flags.ViewAuditLog],
@@ -3038,7 +3062,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // ── /status ────────────────────────────────────────────
     case "status": {
       if (!isOwner(interaction.user) && interaction.user.id !== guild.ownerId)
-        return interaction.reply({ content: "❌ Owner only.", ephemeral: true });
+        return interaction.reply({ content: "This one's owner only.", ephemeral: true });
       const mem = process.memoryUsage();
       const lockedCount = Object.keys(lockdownState).length;
       return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(COLORS.info)
@@ -3059,7 +3083,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // ── /tickets ───────────────────────────────────────────
     case "tickets": {
       if (!isOwner(member) && member.id !== guild.ownerId)
-        return interaction.reply({ content: "🔒 Only the bot owner or this server's owner can configure tickets.", ephemeral: true });
+        return interaction.reply({ content: "Only the bot owner or the server owner can set up tickets.", ephemeral: true });
       const sub = interaction.options.getSubcommand();
       const cfg = getTicketConfig(guild.id);
 
@@ -3068,7 +3092,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const label = interaction.options.getString("label").trim().slice(0, 80);
         const emoji = interaction.options.getString("emoji").trim();
         const logChannel = interaction.options.getChannel("log_channel");
-        if (!key) return interaction.reply({ content: "❌ Invalid key.", ephemeral: true });
+        if (!key) return interaction.reply({ content: "That key is not valid.", ephemeral: true });
         const types = cfg.types.filter(t => t.key !== key);
         types.push({ key, label, emoji, logChannelId: logChannel.id });
         setTicketConfig(guild.id, { types });
@@ -3093,9 +3117,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `New tickets will be created under **${category.name}**.`, "Ticket Category Set")] });
       }
       if (sub === "panel") {
-        if (!cfg.types.length) return interaction.reply({ content: "❌ Configure at least one ticket type first with `/tickets addtype`.", ephemeral: true });
+        if (!cfg.types.length) return interaction.reply({ content: "Set up at least one ticket type first with `/tickets addtype`.", ephemeral: true });
         const channel = interaction.options.getChannel("channel") || (cfg.panelChannelId ? guild.channels.cache.get(cfg.panelChannelId) : null);
-        if (!channel) return interaction.reply({ content: "❌ Provide a channel - none configured yet.", ephemeral: true });
+        if (!channel) return interaction.reply({ content: "Pick a channel - there is not one set yet.", ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
         const panelEmbed = buildTicketPanelEmbed(guild, cfg);
         const rows = buildTicketPanelRows(cfg);
@@ -3105,9 +3129,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (existingMsg) posted = await existingMsg.edit({ embeds: [panelEmbed], components: rows }).catch(() => null);
         }
         if (!posted) posted = await channel.send({ embeds: [panelEmbed], components: rows }).catch(() => null);
-        if (!posted) return interaction.editReply("❌ Could not send the panel - check my permissions in that channel.");
+        if (!posted) return interaction.editReply("I could not post the panel there. Please check my permissions in that channel.");
         setTicketConfig(guild.id, { panelChannelId: channel.id, panelMessageId: posted.id });
-        return interaction.editReply(`✅ Ticket panel posted in <#${channel.id}>.`);
+        return interaction.editReply(`Done - the ticket panel is up in <#${channel.id}>.`);
       }
       return;
     }
@@ -3115,7 +3139,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // ── /applications ──────────────────────────────────────
     case "applications": {
       if (!isOwner(member) && member.id !== guild.ownerId)
-        return interaction.reply({ content: "🔒 Only the bot owner or this server's owner can configure applications.", ephemeral: true });
+        return interaction.reply({ content: "Only the bot owner or the server owner can set up applications.", ephemeral: true });
       const sub = interaction.options.getSubcommand();
 
       if (sub === "list") {
@@ -3143,7 +3167,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ? Object.values(getApplications(guild.id))
           : (getApplication(guild.id, rawKey) ? [getApplication(guild.id, rawKey)] : []);
         if (!targets.length)
-          return interaction.editReply(`❌ No application with key \`${rawKey}\`. Use \`/applications list\` to see valid keys (or \`all\`).`);
+          return interaction.editReply(`There is no application with the key \`${rawKey}\`. Run \`/applications list\` to see the valid keys (or use \`all\`).`);
         const changed = [];
         for (const a of targets) {
           setApplication(guild.id, a.key, { closed: wantClosed });
@@ -3158,7 +3182,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const key = interaction.options.getString("key")?.trim().toLowerCase();
       const app = getApplication(guild.id, key);
-      if (!app) return interaction.reply({ content: `❌ No application with key \`${key}\`. Use \`/applications list\` to see valid keys.`, ephemeral: true });
+      if (!app) return interaction.reply({ content: `There is no application with the key \`${key}\`. Run \`/applications list\` to see the valid keys.`, ephemeral: true });
 
       if (sub === "panel") {
         const channelOpt = interaction.options.getChannel("channel");
@@ -3166,14 +3190,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         // Moving to a new channel? Re-home this app and drop its old panel message id.
         if (channelOpt && channelOpt.id !== app.panelChannelId) setApplication(guild.id, key, { panelChannelId: channelOpt.id, panelMessageId: "" });
         const channelId = channelOpt?.id || app.panelChannelId;
-        if (!channelId) return interaction.editReply("❌ Provide a channel - none configured for this application yet.");
+        if (!channelId) return interaction.editReply("Pick a channel - there is not one set for this application yet.");
         const channel = guild.channels.cache.get(channelId);
-        if (!channel) return interaction.editReply("❌ That channel doesn't exist.");
+        if (!channel) return interaction.editReply("I cannot find that channel.");
         // Render the whole channel group, so a shared channel (e.g. Gambino +
         // Colombo) posts one combined panel rather than one per app.
         const apps = appsByPanelChannel(guild.id).get(channelId) || [getApplication(guild.id, key)];
         await renderChannelPanel(guild, channelId, apps);
-        return interaction.editReply(`✅ Application panel (${apps.map(a => a.label).join(", ")}) posted in <#${channelId}>.`);
+        return interaction.editReply(`Done - the application panel (${apps.map(a => a.label).join(", ")}) is up in <#${channelId}>.`);
       }
       if (sub === "setreview") {
         const channel = interaction.options.getChannel("channel");
@@ -3359,7 +3383,7 @@ client.on(Events.GuildCreate, async (guild) => {
   if (config.ownerDM)
     for (const id of BOT_OWNER_IDS)
       client.users.fetch(id)
-        .then(u => u.send(`➕ Guardian was added to **${guild.name}** (\`${guild.id}\`). Run \`/setup quick\` there to auto-provision a mute role + log channels in one step, then \`/setup roles mod_role:@YourStaffRole\` to finish.`))
+        .then(u => u.send(`Just got added to **${guild.name}** (\`${guild.id}\`). To get set up fast, run \`/setup quick\` over there - it'll create a mute role and the log channels for you. Then point me at your staff role with \`/setup roles mod_role:@YourStaffRole\` and you're good.`))
         .catch(() => {});
 });
 
@@ -3390,7 +3414,7 @@ const sweep = setInterval(() => {
                me.permissions.has(PermissionsBitField.Flags.BanMembers) &&
                me.permissions.has(PermissionsBitField.Flags.ManageRoles);
     if (healthState.get(guild.id) !== false && !ok)
-      alertOwner(guild, "⚠️ I appear to have **lost critical permissions** (View Audit Log / Ban / Manage Roles). Anti-nuke may be blind - check my role position and permissions immediately.", COLORS.danger, "SELF-DEFENSE");
+      alertOwner(guild, "I've lost some permissions I really need (View Audit Log, Ban Members, or Manage Roles), which means anti-nuke could be flying blind right now. Please check my role position and permissions as soon as you can.", COLORS.danger, "I Need My Permissions Back");
     healthState.set(guild.id, ok);
   }
 }, 60000);
