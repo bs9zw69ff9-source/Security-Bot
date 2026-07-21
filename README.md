@@ -220,6 +220,12 @@ leftover separate/duplicate panels in a shared channel down to one combined
 message, so upgrading from the earlier one-embed-per-app layout cleans
 itself up.
 
+Each panel's description is a **REQUIREMENTS** block whose age and
+member-time minimums are per-application (`app.minAge` / `app.minMemberTime`,
+display-only): Staff is age 15 / member 2 weeks, the crime families are age
+14 / member 3 days, and NYPD is age 14 / member 1 week. These are seeded on
+a fresh install and backfilled once onto an already-seeded home guild.
+
 As with tickets, this seed runs once, only for that one guild, and never
 overwrites an existing configuration; anything else uses `/applications`.
 

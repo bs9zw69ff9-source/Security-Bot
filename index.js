@@ -430,14 +430,14 @@ function migrateApplicationsToHomeGuild() {
       panelChannelId: "1528798524660252814", panelMessageId: "",
       reviewChannelId: "1529100361720266803",
       acceptedRoleIds: ["1528801101003096295", "1528801216518426866", "1528802048131338330"],
-      questions: FAMILY_Q("Gambino"),
+      questions: FAMILY_Q("Gambino"), minAge: 14, minMemberTime: "3 days",
     },
     colombo: {
       key: "colombo", label: "Colombo", emoji: "🕴️",
       panelChannelId: "1528798524660252814", panelMessageId: "",
       reviewChannelId: "1528805634995261520",
       acceptedRoleIds: ["1528801101003096295", "1528802048131338330", "1528801296411394148"],
-      questions: FAMILY_Q("Colombo"),
+      questions: FAMILY_Q("Colombo"), minAge: 14, minMemberTime: "3 days",
     },
     staff: {
       key: "staff", label: "Staff", emoji: "🛡️",
@@ -452,6 +452,7 @@ function migrateApplicationsToHomeGuild() {
         "What will you provide for the community?",
         "What would you do if a higher up is abusing?",
       ],
+      minAge: 15, minMemberTime: "2 weeks",
     },
     nypd: {
       key: "nypd", label: "NYPD", emoji: "👮",
@@ -466,13 +467,34 @@ function migrateApplicationsToHomeGuild() {
         "What would you do if someone is robbing a gun store?",
         "A higher up is giving an unlawful order, what will you do?",
       ],
+      minAge: 14, minMemberTime: "1 week",
     },
   };
-  applicationConfigs[GUILD_ID] = { apps };
+  applicationConfigs[GUILD_ID] = { apps, reqDefaultsV1: true };
   saveApplicationConfig(GUILD_ID);
   console.log(`📝 Seeded default application types (gambino, colombo, staff, nypd) for home guild (${GUILD_ID})`);
 }
 migrateApplicationsToHomeGuild();
+
+// Backfill the per-application age / member-time requirements onto the home
+// guild's already-seeded apps (added after the initial seed). Runs once,
+// guarded by reqDefaultsV1, so it never clobbers later manual edits.
+function migrateApplicationRequirements() {
+  if (!GUILD_ID) return;
+  const cfg = applicationConfigs[GUILD_ID];
+  if (!cfg || !cfg.apps || cfg.reqDefaultsV1) return;
+  const desired = {
+    gambino: { minAge: 14, minMemberTime: "3 days" },
+    colombo: { minAge: 14, minMemberTime: "3 days" },
+    staff:   { minAge: 15, minMemberTime: "2 weeks" },
+    nypd:    { minAge: 14, minMemberTime: "1 week" },
+  };
+  for (const [key, req] of Object.entries(desired)) if (cfg.apps[key]) Object.assign(cfg.apps[key], req);
+  cfg.reqDefaultsV1 = true;
+  saveApplicationConfig(GUILD_ID);
+  console.log(`📝 Applied per-application requirements (staff 15/2wk, family 14/3d, nypd 14/1wk) for home guild (${GUILD_ID})`);
+}
+migrateApplicationRequirements();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
@@ -2163,13 +2185,18 @@ function appAnswerCap(questionCount) {
   return Math.max(200, Math.min(1024, Math.floor(5200 / Math.max(questionCount, 1))));
 }
 
-// Shown as the description on every application panel (single and combined).
-const APP_REQUIREMENTS =
-  "**REQUIREMENTS**\n" +
-  "Age: 14\n" +
-  "No Joke Applications (May result in blacklist)\n" +
-  "Use of AI is not tolerated\n" +
-  "Must be a member longer than 1 week";
+// Requirements block shown as an application panel's description. Age and
+// member-time minimums are per-app (app.minAge / app.minMemberTime), so each
+// application can state its own; both fall back to sensible defaults.
+function buildRequirements(app) {
+  const age = app?.minAge ?? 14;
+  const memberTime = app?.minMemberTime || "1 week";
+  return "**REQUIREMENTS**\n" +
+    `Age: ${age}\n` +
+    "No Joke Applications (May result in blacklist)\n" +
+    "Use of AI is not tolerated\n" +
+    `Must be a member longer than ${memberTime}`;
+}
 
 function buildAppPanelEmbed(guild, app) {
   const closed = !!app.closed;
@@ -2180,9 +2207,9 @@ function buildAppPanelEmbed(guild, app) {
     .setFooter({ text: guild.name })
     .setTimestamp();
   if (closed) {
-    e.setDescription(`🔒 **${app.label} applications are currently closed.**\n\n${APP_REQUIREMENTS}`);
+    e.setDescription(`🔒 **${app.label} applications are currently closed.**\n\n${buildRequirements(app)}`);
   } else {
-    e.setDescription(APP_REQUIREMENTS);
+    e.setDescription(buildRequirements(app));
   }
   return e;
 }
@@ -2199,11 +2226,18 @@ function buildApplyButton(app) {
 
 // Combined panel embed for a channel that hosts 2+ applications (e.g. the
 // family channel with Gambino + Colombo) - one embed, a button per app.
+// If every app shares the same requirements, show one block; otherwise show
+// each app's requirements under its own heading.
 function buildCombinedPanelEmbed(guild, apps) {
+  const blocks = apps.map(a => [a, buildRequirements(a)]);
+  const unique = [...new Set(blocks.map(([, r]) => r))];
+  const description = unique.length === 1
+    ? unique[0]
+    : blocks.map(([a, r]) => `${a.emoji || "📝"} __${a.label}__\n${r}`).join("\n\n");
   return new EmbedBuilder()
     .setColor(COLORS.info)
     .setTitle("📋 Applications")
-    .setDescription(APP_REQUIREMENTS)
+    .setDescription(description)
     .setThumbnail(guild.iconURL?.() || null)
     .setFooter({ text: guild.name })
     .setTimestamp();
