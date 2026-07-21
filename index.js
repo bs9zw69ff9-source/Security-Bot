@@ -2498,7 +2498,7 @@ async function handleAppAccept(interaction) {
   }).catch(() => {});
 
   if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(APPY_GREEN).setTitle("Application accepted")
-    .setDescription(`Your application for \`${app.label} Application\` has been accepted by <@${member.id}>.${grantedCount ? `\n\nI've set you up with ${grantedCount} new role${grantedCount === 1 ? "" : "s"} - welcome aboard!` : "\n\nWelcome aboard!"}`)] }).catch(() => {});
+    .setDescription(`Your application for \`${app.label} Application\` has been accepted by <@${member.id}>.`)] }).catch(() => {});
   secLog(guild, "Application Accepted",
     `<@${member.id}> accepted <@${userId}>'s **${app.label}** application and handed them **${grantedCount}** role${grantedCount === 1 ? "" : "s"}.` +
     (failedRoles.length ? `\nHeads up, I couldn't grant: ${failedRoles.join(", ")}` : "") +
@@ -2546,7 +2546,7 @@ async function handleAppDenyReason(interaction) {
 
   const applicant = await guild.members.fetch(userId).catch(() => null);
   if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Application denied")
-    .setDescription(`Your application for \`${app?.label || "that role"} Application\` was turned down by <@${member.id}>.${reason ? `\n\nReason: ${reason}` : ""}\n\nNo hard feelings - you're welcome to give it another shot down the line.`)] }).catch(() => {});
+    .setDescription(`Your application for \`${app?.label || "that role"} Application\` has been denied by <@${member.id}>.${reason ? `\n\nReason: ${reason}` : ""}`)] }).catch(() => {});
   secLog(guild, "Application Denied", `<@${member.id}> turned down <@${userId}>'s **${app?.label || key}** application.${reason ? ` Reason given: ${reason}` : ""}`, COLORS.danger);
 }
 
