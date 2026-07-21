@@ -2602,6 +2602,17 @@ function parseReviewCustomId(customId, prefix) {
   return { key: rest.slice(0, lastUnderscore), userId: rest.slice(lastUnderscore + 1) };
 }
 
+// Apps where existing members - anyone already holding one of the app's own
+// accepted (whitelist) roles - can review pending applications for that same
+// app, on top of staff holding the mod role. Police + crime families only;
+// staff applications still require the mod role.
+const PEER_REVIEW_APP_KEYS = new Set(["nypd", "gambino", "colombo"]);
+function canReviewApp(member, app) {
+  if (isMod(member)) return true;
+  if (!app || !PEER_REVIEW_APP_KEYS.has(app.key)) return false;
+  return (app.acceptedRoleIds || []).some(id => member.roles.cache.has(id));
+}
+
 // Shared accept path for both the plain "Accept" button and the "Accept with
 // reason" modal submit - grants roles, repaints the review message green with
 // every button retired, then DMs the applicant.
@@ -2671,19 +2682,21 @@ async function performAppDeny(interaction, key, userId, reason, messageId) {
 
 // "Accept" - immediate, no reason prompt.
 async function handleAppAccept(interaction) {
-  const { member } = interaction;
-  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
+  const { guild, member } = interaction;
   const { key, userId } = parseReviewCustomId(interaction.customId, "app_accept_");
+  const app = getApplication(guild.id, key);
+  if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
+  if (!canReviewApp(member, app)) return interaction.reply({ content: "Only staff, or a whitelisted member of this app, can review applications.", ephemeral: true });
   return performAppAccept(interaction, key, userId, null, interaction.message.id);
 }
 
 // "Accept with reason" - opens a modal, actual grant happens on submit.
 async function handleAppAcceptWithReason(interaction) {
   const { guild, member } = interaction;
-  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
   const { key, userId } = parseReviewCustomId(interaction.customId, "app_acceptwithreason_");
   const app = getApplication(guild.id, key);
   if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
+  if (!canReviewApp(member, app)) return interaction.reply({ content: "Only staff, or a whitelisted member of this app, can review applications.", ephemeral: true });
 
   const modal = new ModalBuilder().setCustomId(`app_acceptreason_${key}_${userId}_${interaction.message.id}`).setTitle(`Accept ${app.label} Application`.slice(0, 45));
   modal.addComponents(new ActionRowBuilder().addComponents(
@@ -2704,19 +2717,21 @@ async function handleAppAcceptReasonSubmit(interaction) {
 
 // "Deny" - immediate, no reason prompt.
 async function handleAppDeny(interaction) {
-  const { member } = interaction;
-  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
+  const { guild, member } = interaction;
   const { key, userId } = parseReviewCustomId(interaction.customId, "app_deny_");
+  const app = getApplication(guild.id, key);
+  if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
+  if (!canReviewApp(member, app)) return interaction.reply({ content: "Only staff, or a whitelisted member of this app, can review applications.", ephemeral: true });
   return performAppDeny(interaction, key, userId, null, interaction.message.id);
 }
 
 // "Deny with reason" - opens a modal, actual denial happens on submit.
 async function handleAppDenyWithReason(interaction) {
   const { guild, member } = interaction;
-  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
   const { key, userId } = parseReviewCustomId(interaction.customId, "app_denywithreason_");
   const app = getApplication(guild.id, key);
   if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
+  if (!canReviewApp(member, app)) return interaction.reply({ content: "Only staff, or a whitelisted member of this app, can review applications.", ephemeral: true });
 
   const modal = new ModalBuilder().setCustomId(`app_denyreason_${key}_${userId}_${interaction.message.id}`).setTitle(`Deny ${app.label} Application`.slice(0, 45));
   modal.addComponents(new ActionRowBuilder().addComponents(

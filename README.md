@@ -192,14 +192,22 @@ posts/refreshes the whole panel for that application's channel.
    duration, when they joined the guild, and when they submitted). Staff
    get four buttons: **Accept**, **Deny**, **Accept with reason**, and
    **Deny with reason**. The applicant gets a confirmation in their DMs.
-3. **Accept** (staff only) grants the application's configured roles to
-   the applicant right away, marks the embed green, retires the buttons,
-   and DMs the applicant. **Accept with reason** does the same after a
-   short modal for an optional note shared with the applicant.
-4. **Deny** (staff only) denies right away with no reason, marks the
-   embed red, retires the buttons, and DMs the applicant. **Deny with
-   reason** opens a short modal for an optional reason first, then DMs the
-   applicant with it.
+3. **Accept** (staff, or on `nypd`/`gambino`/`colombo` anyone already
+   holding one of that app's accepted roles) grants the application's
+   configured roles to the applicant right away, marks the embed green,
+   retires the buttons, and DMs the applicant. **Accept with reason** does
+   the same after a short modal for an optional note shared with the
+   applicant.
+4. **Deny** (same reviewers as Accept) denies right away with no reason,
+   marks the embed red, retires the buttons, and DMs the applicant.
+   **Deny with reason** opens a short modal for an optional reason first,
+   then DMs the applicant with it.
+
+**Peer review:** on the police and crime-family applications (`nypd`,
+`gambino`, `colombo`), existing members - anyone already holding one of
+that app's own accepted roles, not just staff with the mod role - can
+review new applications for that same app. Staff applications still
+require the mod role.
 
 Reading applicants' DM replies requires the **Direct Messages** gateway
 intent (added alongside the existing Message Content intent), so no extra
