@@ -184,14 +184,21 @@ posts/refreshes the whole panel for that application's channel.
    they get a clear ephemeral note telling them to open DMs and retry;
    only one in-progress interview per user at a time.
 2. When the last question is answered, the completed application is posted
-   to that type's review channel as an embed (every question + answer),
-   with **Accept** and **Deny** buttons, and the applicant gets a
-   confirmation in their DMs.
+   to that type's review channel as an orange-barred embed titled
+   `{username}'s '{Label} Application' Application Submitted`, with the
+   applicant's avatar as a thumbnail, every question numbered in order, and
+   a **Submission stats** field (user id, username, mention, interview
+   duration, when they joined the guild, and when they submitted). Staff
+   get four buttons: **Accept**, **Deny**, **Accept with reason**, and
+   **Deny with reason**. The applicant gets a confirmation in their DMs.
 3. **Accept** (staff only) grants the application's configured roles to
-   the applicant, marks the embed green with who accepted, disables the
-   buttons, and DMs the applicant.
-4. **Deny** (staff only) opens a short modal for an optional reason, marks
-   the embed red, and DMs the applicant with the reason.
+   the applicant right away, marks the embed green, retires the buttons,
+   and DMs the applicant. **Accept with reason** does the same after a
+   short modal for an optional note shared with the applicant.
+4. **Deny** (staff only) denies right away with no reason, marks the
+   embed red, retires the buttons, and DMs the applicant. **Deny with
+   reason** opens a short modal for an optional reason first, then DMs the
+   applicant with it.
 
 Reading applicants' DM replies requires the **Direct Messages** gateway
 intent (added alongside the existing Message Content intent), so no extra

@@ -1107,10 +1107,11 @@ const COLORS = {
   success: 0x00e5a0, warn: 0xf5a623, danger: 0xff3b5c, info: 0x5865f2,
   muted: 0xff7518, nuke: 0xff0033, neutral: 0x2f3136,
 };
-// Appy-style accent colours for the application DM flow.
+// Appy-style accent colours for the application DM flow and review embed.
 const APPY_GREEN   = 0x57f287; // intro / submitted / accepted (green left bar)
 const APPY_BLURPLE = 0x5865f2; // per-question prompts (blurple left bar)
 const APPY_RED     = 0xed4245; // denied (red left bar)
+const APP_PENDING  = 0xf59e0b; // review pending (orange left bar)
 
 function embed(color, description, title = null) {
   const e = new EmbedBuilder().setColor(color).setDescription(description).setTimestamp();
@@ -2365,6 +2366,7 @@ async function handleAppApply(interaction) {
 // Walk the applicant through the questions in DMs, one at a time (Appy-style).
 async function runDmApplication(guild, user, app, dm) {
   activeDmApps.add(user.id);
+  const startedAt = Date.now();
   try {
     const cap = appAnswerCap(app.questions.length);
     const total = app.questions.length;
@@ -2420,7 +2422,7 @@ async function runDmApplication(guild, user, app, dm) {
       return;
     }
 
-    const ok = await finalizeApplication(guild, user, fresh, answers);
+    const ok = await finalizeApplication(guild, user, fresh, answers, startedAt);
     await dm.send({ embeds: [ok
       ? new EmbedBuilder().setColor(APPY_GREEN).setTitle("Application submitted")
           .setDescription("Your application has been submitted.\n\nThe team will give it a read and get back to you right here. Thanks for taking the time, and good luck!")
@@ -2432,28 +2434,47 @@ async function runDmApplication(guild, user, app, dm) {
 }
 
 // Post a completed application to its review channel. Returns true on success.
-async function finalizeApplication(guild, user, app, answers) {
+async function finalizeApplication(guild, user, app, answers, startedAt) {
   const reviewChannel = guild.channels.cache.get(app.reviewChannelId);
   if (!reviewChannel) return false;
 
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  const durationSec = Math.max(0, Math.round((Date.now() - (startedAt ?? Date.now())) / 1000));
+  const joinedUnix = member?.joinedTimestamp ? Math.floor(member.joinedTimestamp / 1000) : null;
+  const submittedUnix = Math.floor(Date.now() / 1000);
+  const statsLines = [
+    `UserId: \`${user.id}\``,
+    `Username: \`${user.username}\``,
+    `User: <@${user.id}>`,
+    `Duration: \`${durationSec}s\``,
+    joinedUnix ? `Joined guild <t:${joinedUnix}:R>` : null,
+    `Submitted <t:${submittedUnix}:R>`,
+  ].filter(Boolean).join("\n");
+
   const reviewEmbed = new EmbedBuilder()
-    .setColor(COLORS.warn)
-    .setAuthor({ name: `${user.tag} (${user.id})`, iconURL: user.displayAvatarURL?.() })
-    .setTitle(`${app.emoji || "📝"} New ${app.label} Application`)
-    .addFields(app.questions.map((q, i) => ({
-      name: `${i + 1}. ${q}`.slice(0, 256),
-      value: (answers[i] || "*(left blank)*").slice(0, 1024),
-      inline: false,
-    })))
-    .setFooter({ text: `Applicant ID: ${user.id} • Waiting on review` })
+    .setColor(APP_PENDING)
+    .setTitle(`${user.username}'s '${app.label} Application' Application Submitted`.slice(0, 256))
+    .setThumbnail(user.displayAvatarURL?.() ?? null)
+    .addFields([
+      ...app.questions.map((q, i) => ({
+        name: `${i + 1}. ${q}`.slice(0, 256),
+        value: (answers[i] || "*(left blank)*").slice(0, 1024),
+        inline: false,
+      })),
+      { name: "Submission stats", value: statsLines.slice(0, 1024), inline: false },
+    ])
     .setTimestamp();
 
-  const controls = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`app_accept_${app.key}_${user.id}`).setLabel("Accept").setEmoji("✅").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`app_deny_${app.key}_${user.id}`).setLabel("Deny").setEmoji("⛔").setStyle(ButtonStyle.Danger),
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`app_accept_${app.key}_${user.id}`).setLabel("Accept").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`app_deny_${app.key}_${user.id}`).setLabel("Deny").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`app_acceptwithreason_${app.key}_${user.id}`).setLabel("Accept with reason").setStyle(ButtonStyle.Success),
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`app_denywithreason_${app.key}_${user.id}`).setLabel("Deny with reason").setStyle(ButtonStyle.Danger),
   );
 
-  const posted = await reviewChannel.send({ embeds: [reviewEmbed], components: [controls] }).catch(() => null);
+  const posted = await reviewChannel.send({ embeds: [reviewEmbed], components: [row1, row2] }).catch(() => null);
   if (!posted) return false;
   secLog(guild, "New Application", `<@${user.id}> just applied for **${app.label}**. It's waiting for a look in <#${reviewChannel.id}>.`, COLORS.info);
   return true;
@@ -2466,10 +2487,11 @@ function parseReviewCustomId(customId, prefix) {
   return { key: rest.slice(0, lastUnderscore), userId: rest.slice(lastUnderscore + 1) };
 }
 
-async function handleAppAccept(interaction) {
+// Shared accept path for both the plain "Accept" button and the "Accept with
+// reason" modal submit - grants roles, repaints the review message green with
+// every button retired, then DMs the applicant.
+async function performAppAccept(interaction, key, userId, reason, messageId) {
   const { guild, member } = interaction;
-  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
-  const { key, userId } = parseReviewCustomId(interaction.customId, "app_accept_");
   const app = getApplication(guild.id, key);
   if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
 
@@ -2487,29 +2509,97 @@ async function handleAppAccept(interaction) {
     }
   }
 
-  const base = interaction.message.embeds[0];
-  const updated = EmbedBuilder.from(base)
-    .setColor(COLORS.success)
-    .setFooter({ text: `Applicant ID: ${userId} • Accepted by ${member.user.tag}` });
-  await interaction.message.edit({
-    embeds: [updated],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("app_done_accept").setLabel(`Accepted by ${member.user.username}`.slice(0, 80)).setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true))],
-  }).catch(() => {});
+  const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
+  if (msg && msg.embeds[0]) {
+    const updated = EmbedBuilder.from(msg.embeds[0]).setColor(APPY_GREEN);
+    await msg.edit({
+      embeds: [updated],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("app_done_accept").setLabel(`Accepted by ${member.user.username}`.slice(0, 80)).setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true))],
+    }).catch(() => {});
+  }
 
   if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(APPY_GREEN).setTitle("Application accepted")
-    .setDescription(`Your application for \`${app.label} Application\` has been accepted by <@${member.id}>.`)] }).catch(() => {});
+    .setDescription(`Your application for \`${app.label} Application\` has been accepted by <@${member.id}>.${reason ? `\n\nReason: ${reason}` : ""}`)] }).catch(() => {});
   secLog(guild, "Application Accepted",
     `<@${member.id}> accepted <@${userId}>'s **${app.label}** application and handed them **${grantedCount}** role${grantedCount === 1 ? "" : "s"}.` +
+    (reason ? `\nReason given: ${reason}` : "") +
     (failedRoles.length ? `\nHeads up, I couldn't grant: ${failedRoles.join(", ")}` : "") +
     (!applicant ? `\nThey've since left the server, so no roles were applied.` : ""),
     COLORS.success);
 }
 
-async function handleAppDeny(interaction) {
+// Shared deny path for both the plain "Deny" button and the "Deny with
+// reason" modal submit - repaints the review message red with every button
+// retired, then DMs the applicant.
+async function performAppDeny(interaction, key, userId, reason, messageId) {
+  const { guild, member } = interaction;
+  const app = getApplication(guild.id, key);
+
+  await interaction.deferUpdate().catch(() => {});
+  const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
+  if (msg && msg.embeds[0]) {
+    const updated = EmbedBuilder.from(msg.embeds[0]).setColor(APPY_RED);
+    if (reason) updated.addFields({ name: "Reason", value: reason.slice(0, 1024), inline: false });
+    await msg.edit({
+      embeds: [updated],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("app_done_deny").setLabel(`Denied by ${member.user.username}`.slice(0, 80)).setEmoji("⛔").setStyle(ButtonStyle.Danger).setDisabled(true))],
+    }).catch(() => {});
+  }
+
+  const applicant = await guild.members.fetch(userId).catch(() => null);
+  if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Application denied")
+    .setDescription(`Your application for \`${app?.label || "that role"} Application\` has been denied by <@${member.id}>.${reason ? `\n\nReason: ${reason}` : ""}`)] }).catch(() => {});
+  secLog(guild, "Application Denied", `<@${member.id}> turned down <@${userId}>'s **${app?.label || key}** application.${reason ? ` Reason given: ${reason}` : ""}`, COLORS.danger);
+}
+
+// "Accept" - immediate, no reason prompt.
+async function handleAppAccept(interaction) {
+  const { member } = interaction;
+  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
+  const { key, userId } = parseReviewCustomId(interaction.customId, "app_accept_");
+  return performAppAccept(interaction, key, userId, null, interaction.message.id);
+}
+
+// "Accept with reason" - opens a modal, actual grant happens on submit.
+async function handleAppAcceptWithReason(interaction) {
   const { guild, member } = interaction;
   if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
+  const { key, userId } = parseReviewCustomId(interaction.customId, "app_acceptwithreason_");
+  const app = getApplication(guild.id, key);
+  if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
+
+  const modal = new ModalBuilder().setCustomId(`app_acceptreason_${key}_${userId}_${interaction.message.id}`).setTitle(`Accept ${app.label} Application`.slice(0, 45));
+  modal.addComponents(new ActionRowBuilder().addComponents(
+    new TextInputBuilder().setCustomId("reason").setLabel("Reason (optional, shared with them)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)));
+  return interaction.showModal(modal);
+}
+
+async function handleAppAcceptReasonSubmit(interaction) {
+  // customId: app_acceptreason_<key>_<userId>_<messageId>
+  const rest = interaction.customId.slice("app_acceptreason_".length);
+  const parts = rest.split("_");
+  const messageId = parts.pop();
+  const userId = parts.pop();
+  const key = parts.join("_");
+  const reason = interaction.fields.getTextInputValue("reason")?.trim();
+  return performAppAccept(interaction, key, userId, reason || null, messageId);
+}
+
+// "Deny" - immediate, no reason prompt.
+async function handleAppDeny(interaction) {
+  const { member } = interaction;
+  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
   const { key, userId } = parseReviewCustomId(interaction.customId, "app_deny_");
+  return performAppDeny(interaction, key, userId, null, interaction.message.id);
+}
+
+// "Deny with reason" - opens a modal, actual denial happens on submit.
+async function handleAppDenyWithReason(interaction) {
+  const { guild, member } = interaction;
+  if (!isMod(member)) return interaction.reply({ content: "Only staff can review applications.", ephemeral: true });
+  const { key, userId } = parseReviewCustomId(interaction.customId, "app_denywithreason_");
   const app = getApplication(guild.id, key);
   if (!app) return interaction.reply({ content: "That application type doesn't exist anymore.", ephemeral: true });
 
@@ -2526,28 +2616,8 @@ async function handleAppDenyReason(interaction) {
   const messageId = parts.pop();
   const userId = parts.pop();
   const key = parts.join("_");
-  const { guild, member } = interaction;
-  const app = getApplication(guild.id, key);
   const reason = interaction.fields.getTextInputValue("reason")?.trim();
-
-  await interaction.deferUpdate().catch(() => {});
-  const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
-  if (msg && msg.embeds[0]) {
-    const updated = EmbedBuilder.from(msg.embeds[0])
-      .setColor(COLORS.danger)
-      .setFooter({ text: `Applicant ID: ${userId} • Denied by ${member.user.tag}` });
-    if (reason) updated.addFields({ name: "Reason", value: reason.slice(0, 1024), inline: false });
-    await msg.edit({
-      embeds: [updated],
-      components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("app_done_deny").setLabel(`Denied by ${member.user.username}`.slice(0, 80)).setEmoji("⛔").setStyle(ButtonStyle.Danger).setDisabled(true))],
-    }).catch(() => {});
-  }
-
-  const applicant = await guild.members.fetch(userId).catch(() => null);
-  if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Application denied")
-    .setDescription(`Your application for \`${app?.label || "that role"} Application\` has been denied by <@${member.id}>.${reason ? `\n\nReason: ${reason}` : ""}`)] }).catch(() => {});
-  secLog(guild, "Application Denied", `<@${member.id}> turned down <@${userId}>'s **${app?.label || key}** application.${reason ? ` Reason given: ${reason}` : ""}`, COLORS.danger);
+  return performAppDeny(interaction, key, userId, reason || null, messageId);
 }
 
 // ── Slash Command Handler ─────────────────────────────────────
@@ -3308,7 +3378,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton() || !interaction.inGuild()) return;
   try {
     if (interaction.customId.startsWith("app_apply_"))  return await handleAppApply(interaction);
+    if (interaction.customId.startsWith("app_acceptwithreason_")) return await handleAppAcceptWithReason(interaction);
     if (interaction.customId.startsWith("app_accept_")) return await handleAppAccept(interaction);
+    if (interaction.customId.startsWith("app_denywithreason_")) return await handleAppDenyWithReason(interaction);
     if (interaction.customId.startsWith("app_deny_"))   return await handleAppDeny(interaction);
   } catch (err) {
     console.error("⚠️ application button handler failed:", err);
@@ -3318,12 +3390,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// ── Application deny-reason modal submit (staff review only) ───
+// ── Application accept/deny-reason modal submits (staff review only) ───
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isModalSubmit() || !interaction.inGuild()) return;
-  if (!interaction.customId.startsWith("app_denyreason_")) return;
+  const isAccept = interaction.customId.startsWith("app_acceptreason_");
+  const isDeny = interaction.customId.startsWith("app_denyreason_");
+  if (!isAccept && !isDeny) return;
   try {
-    await handleAppDenyReason(interaction);
+    if (isAccept) await handleAppAcceptReasonSubmit(interaction);
+    else await handleAppDenyReason(interaction);
   } catch (err) {
     console.error("⚠️ application modal handler failed:", err);
     const msg = { content: "⚠️ Something went wrong.", ephemeral: true };
