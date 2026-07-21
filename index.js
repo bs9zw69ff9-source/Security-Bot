@@ -460,12 +460,13 @@ function migrateApplicationsToHomeGuild() {
       reviewChannelId: "1528754488339464192",
       acceptedRoleIds: ["1528754363726827572", "1528754358697853050", "1528754369019777034"],
       questions: [
-        "How old are you?",
-        "Whats your discord and ingame name",
-        "Why do you want to join the NYPD?",
-        "How will you help?",
-        "What would you do if someone is robbing a gun store?",
-        "A higher up is giving an unlawful order, what will you do?",
+        "What's your Ingame username?",
+        "What's so special about this crime family to you?",
+        "Why would you be a good pick for this family?",
+        "What is your current k/d (guess if not known)",
+        "How long have you been playing little Italy?",
+        "How active can you be on a weekly basis?",
+        "Have you been in any gangs or factions in other servers? If so explain in depth what rank you achieved and why? As well, are you still in it, if not why?",
       ],
       minAge: 14, minMemberTime: "1 week",
     },
@@ -516,6 +517,28 @@ function migrateStaffQuestionsV2() {
   console.log(`📝 Applied updated staff application questions for home guild (${GUILD_ID})`);
 }
 migrateStaffQuestionsV2();
+
+// Backfill the new NYPD application questions onto the home guild's
+// already-seeded nypd app. Runs once, guarded by nypdQuestionsV2, so it
+// never clobbers a later manual edit via /applications setquestions.
+function migrateNypdQuestionsV2() {
+  if (!GUILD_ID) return;
+  const cfg = applicationConfigs[GUILD_ID];
+  if (!cfg || !cfg.apps || cfg.nypdQuestionsV2) return;
+  if (cfg.apps.nypd) cfg.apps.nypd.questions = [
+    "What's your Ingame username?",
+    "What's so special about this crime family to you?",
+    "Why would you be a good pick for this family?",
+    "What is your current k/d (guess if not known)",
+    "How long have you been playing little Italy?",
+    "How active can you be on a weekly basis?",
+    "Have you been in any gangs or factions in other servers? If so explain in depth what rank you achieved and why? As well, are you still in it, if not why?",
+  ];
+  cfg.nypdQuestionsV2 = true;
+  saveApplicationConfig(GUILD_ID);
+  console.log(`📝 Applied updated NYPD application questions for home guild (${GUILD_ID})`);
+}
+migrateNypdQuestionsV2();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
