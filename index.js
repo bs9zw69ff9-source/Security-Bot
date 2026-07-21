@@ -1070,6 +1070,12 @@ const commands = [
     .addSubcommand(s => s.setName("close").setDescription("Close an application so users can't apply (or 'all')")
       .addStringOption(o => o.setName("key").setDescription("The application's key, or 'all' for every application").setRequired(true))),
 
+  new SlashCommandBuilder()
+    .setName("police").setDescription("Police department resources")
+    .addSubcommandGroup(g => g.setName("manual").setDescription("Officer guide & procedures manual")
+      .addSubcommand(s => s.setName("setup").setDescription("Post the officer guide & procedures manual in a channel")
+        .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (defaults to this channel)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))),
+
   new SlashCommandBuilder().setName("help").setDescription("Show all Guardian Bot commands"),
 ];
 
@@ -2620,6 +2626,113 @@ async function handleAppDenyReason(interaction) {
   return performAppDeny(interaction, key, userId, reason || null, messageId);
 }
 
+// ── Police Department Manual ──────────────────────────────────
+// A single static embed: the officer guide & procedures reference posted via
+// /police manual setup. One long description rather than fields, so it reads
+// as one continuous sheet instead of a stack of separate boxes.
+const POLICE_MANUAL_COLOR = 0xf59e0b; // orange left bar
+function buildPoliceManualEmbed() {
+  const divider = "-".repeat(42);
+  const section = (title, body) => `${divider}\n**${title}**\n${divider}\n\n${body}`;
+  const description = [
+    "**DEPARTMENT 📖**\n*__Officer Guide & Procedures__*",
+    section("OFFICER CONDUCT 👮",
+      "**General Expectations**\n" +
+      "• Remain respectful towards civilians, suspects, and fellow officers.\n" +
+      "• Do not abuse police equipment, powers, or authority.\n" +
+      "• Avoid escalating situations without reason.\n" +
+      "• Use common sense in all situations.\n" +
+      "• Follow instructions from higher-ranking officers.\n\n" +
+      "**Professionalism**\n" +
+      "• Speak clearly and respectfully.\n" +
+      "• Avoid unnecessary arguments with civilians."),
+    section("USE OF FORCE ⚖️",
+      "**Force Progression**\n" +
+      "Verbal Commands → Non-Lethal Force → Deadly Force\n\n" +
+      "**Deadly Force Authorization**\n" +
+      "Deadly force may only be used when:\n" +
+      "• A suspect presents an immediate threat.\n" +
+      "• A suspect is actively using deadly force.\n" +
+      "• No reasonable alternative exists."),
+    section("TRAFFIC STOPS 🚗",
+      "**Initiating a Stop**\n" +
+      "• Observe a violation.\n" +
+      "• Activate emergency lights.\n" +
+      "• Follow until safely stopped.\n\n" +
+      "**Conducting a Stop**\n" +
+      "• Approach carefully.\n" +
+      "• Inform driver of reason.\n" +
+      "• Allow explanation.\n" +
+      "• Determine warning, citation, or arrest.\n\n" +
+      "**Officer Safety**\n" +
+      "• Remain aware of passengers.\n" +
+      "• Watch for suspicious movements.\n" +
+      "• Request backup when necessary."),
+    section("VEHICLE PURSUITS 🚔",
+      "**When to Pursue**\n" +
+      "• Driver refuses to stop.\n" +
+      "• Fleeing from serious crime.\n" +
+      "• Ongoing threat to public safety.\n\n" +
+      "**During a Pursuit**\n" +
+      "• Update units continuously.\n" +
+      "• Maintain visual contact.\n" +
+      "• Avoid unnecessary risks.\n\n" +
+      "**Ending a Pursuit**\n" +
+      "• Suspect apprehended.\n" +
+      "• Suspect incapacitated.\n" +
+      "• Suspect lost.\n" +
+      "• Danger outweighs necessity."),
+    section("FELONY STOPS 🔫",
+      "Used for:\n" +
+      "• Armed suspects\n" +
+      "• Violent offenders\n" +
+      "• High-risk vehicles\n\n" +
+      "**Procedure**\n" +
+      "• Maintain distance.\n" +
+      "• Give clear commands.\n" +
+      "• Remove occupants one at a time.\n" +
+      "• Secure suspects.\n" +
+      "• Clear vehicle once detained."),
+    section("HOSTAGE SITUATIONS 🏠",
+      "**Priorities**\n" +
+      "Hostage Safety → Officer Safety → Suspect Apprehension\n\n" +
+      "**Procedure**\n" +
+      "• Establish perimeter.\n" +
+      "• Keep unnecessary personnel away.\n" +
+      "• Attempt communication.\n" +
+      "• Gather information first.\n\n" +
+      "**Use of Force**\n" +
+      "Deadly force may be used if the suspect presents an immediate threat to a hostage."),
+    section("ACTIVE SHOOTER RESPONSE 🚨",
+      "**Response Priorities**\n" +
+      "• Locate the shooter.\n" +
+      "• Stop the threat.\n" +
+      "• Protect civilians.\n" +
+      "• Coordinate with responding officers.\n\n" +
+      "**Officer Actions**\n" +
+      "• Move toward the threat when safe.\n" +
+      "• Relay descriptions and locations.\n" +
+      "• Work together with units."),
+    section("ARREST PROCEDURES 🔗",
+      "**Making an Arrest**\n" +
+      "• Inform suspect they are under arrest.\n" +
+      "• Secure suspect.\n" +
+      "• State charges.\n" +
+      "• Transport safely.\n\n" +
+      "**Searches**\n" +
+      "• Arrested suspects\n" +
+      "• Vehicles connected to investigations\n" +
+      "• Areas where evidence may be located"),
+    section("FINAL NOTES 📋",
+      "This guide covers the core procedures every officer is expected to know. " +
+      "It does not replace training, briefings, or direct orders from a superior, " +
+      "and when in doubt, ask before acting. Conduct yourself professionally at all times, " +
+      "and remember that civilian safety comes first in every situation."),
+  ].join("\n\n");
+
+  return new EmbedBuilder().setColor(POLICE_MANUAL_COLOR).setDescription(description);
+}
+
 // ── Slash Command Handler ─────────────────────────────────────
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -3304,6 +3417,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    // ── /police manual setup ────────────────────────────────
+    case "police": {
+      if (!isOwner(member) && member.id !== guild.ownerId)
+        return interaction.reply({ content: "Only the bot owner or the server owner can set up the police manual.", ephemeral: true });
+      const group = interaction.options.getSubcommandGroup();
+      const sub = interaction.options.getSubcommand();
+      if (group === "manual" && sub === "setup") {
+        const channel = interaction.options.getChannel("channel") || interaction.channel;
+        await interaction.deferReply({ ephemeral: true });
+        const posted = await channel.send({ embeds: [buildPoliceManualEmbed()] }).catch(() => null);
+        if (!posted) return interaction.editReply("I couldn't post there. Check that I have permission to send messages and embeds in that channel.");
+        return interaction.editReply(`Done - the officer guide & procedures manual is up in <#${channel.id}>.`);
+      }
+      return;
+    }
+
     // ── /help ──────────────────────────────────────────────
     case "help": {
       const windowHours = config.modWindowMs / 3600000;
@@ -3327,6 +3456,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "🔧 /setup", value: "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", inline: false },
           { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", inline: false },
           { name: "📝 /applications", value: "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole` - configure the application system *(bot/server owner only)*", inline: false },
+          { name: "👮 /police", value: "`manual setup [channel]` - post the officer guide & procedures manual *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },

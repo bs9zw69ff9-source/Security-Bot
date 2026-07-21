@@ -81,7 +81,7 @@ invocation of a hidden owner command is written to the local
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/config` `/status` `/antiping` `/nuketest` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/config` `/status` `/antiping` `/nuketest` |
 
 ## Security systems
 
@@ -237,6 +237,17 @@ a fresh install and backfilled once onto an already-seeded home guild.
 
 As with tickets, this seed runs once, only for that one guild, and never
 overwrites an existing configuration; anything else uses `/applications`.
+
+## Police manual
+
+`/police manual setup [channel]` (bot/server owner only) posts a single
+static embed, the officer guide & procedures reference, to a channel
+(defaults to the channel the command was run in). It's one continuous
+orange-barred sheet covering officer conduct, use of force, traffic stops,
+vehicle pursuits, felony stops, hostage situations, active shooter
+response, and arrest procedures, ending in a final-notes reminder. Nothing
+about it is per-guild configurable beyond where it's posted - re-run the
+command to post an updated copy or move it to a different channel.
 
 ## Data
 
