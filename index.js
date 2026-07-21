@@ -2826,6 +2826,10 @@ async function renderChainOfCommand(guild) {
   if (!cfg.channelId || !cfg.roleIds.length) return;
   const channel = guild.channels.cache.get(cfg.channelId);
   if (!channel) return;
+  // Without a full member fetch, guild.members.cache (and so role.members)
+  // only holds whoever the bot has already seen - most holders would be
+  // missing on a server this bot hasn't fully cached yet.
+  await guild.members.fetch().catch(() => {});
   const payload = { embeds: [buildChainOfCommandEmbed(guild, cfg.roleIds)] };
   if (cfg.messageId) {
     const existing = await channel.messages.fetch(cfg.messageId).catch(() => null);
