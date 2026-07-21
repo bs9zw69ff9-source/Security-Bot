@@ -2163,6 +2163,14 @@ function appAnswerCap(questionCount) {
   return Math.max(200, Math.min(1024, Math.floor(5200 / Math.max(questionCount, 1))));
 }
 
+// Shown as the description on every application panel (single and combined).
+const APP_REQUIREMENTS =
+  "**REQUIREMENTS**\n" +
+  "Age: 14\n" +
+  "No Joke Applications (May result in blacklist)\n" +
+  "Use of AI is not tolerated\n" +
+  "Must be a member longer than 1 week";
+
 function buildAppPanelEmbed(guild, app) {
   const closed = !!app.closed;
   const e = new EmbedBuilder()
@@ -2172,17 +2180,9 @@ function buildAppPanelEmbed(guild, app) {
     .setFooter({ text: guild.name })
     .setTimestamp();
   if (closed) {
-    e.setDescription(
-      `🔒 **${app.label} applications are currently closed.**\n\n` +
-      `Please check back later - the button below will reactivate when applications reopen.`
-    );
+    e.setDescription(`🔒 **${app.label} applications are currently closed.**\n\n${APP_REQUIREMENTS}`);
   } else {
-    e.setDescription(
-      `Interested in **${app.label}**? Click the button below to apply.\n\n` +
-      `I'll send you the questions in your **DMs**, one at a time - just reply to each. ` +
-      `Make sure your DMs are open, and answer honestly and completely; our team reviews every submission.\n\n` +
-      `You can type **cancel** at any point to stop.`
-    );
+    e.setDescription(APP_REQUIREMENTS);
   }
   return e;
 }
@@ -2203,11 +2203,7 @@ function buildCombinedPanelEmbed(guild, apps) {
   return new EmbedBuilder()
     .setColor(COLORS.info)
     .setTitle("📋 Applications")
-    .setDescription(
-      "Pick which application you'd like to submit using the buttons below. " +
-      "I'll DM you the questions one at a time - just make sure your DMs are open.\n\n" +
-      apps.map(a => `${a.emoji || "📝"} **${a.label}**${a.closed ? " - 🔒 closed" : ""}`).join("\n")
-    )
+    .setDescription(APP_REQUIREMENTS)
     .setThumbnail(guild.iconURL?.() || null)
     .setFooter({ text: guild.name })
     .setTimestamp();
