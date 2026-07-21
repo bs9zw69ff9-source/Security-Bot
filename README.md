@@ -222,7 +222,7 @@ are posted once the bot is up, with zero commands required:
 | `gambino` | family panel | Gambino reviews | 3 roles | 7 |
 | `colombo` | family panel (same as Gambino) | Colombo reviews | 3 roles | 7 |
 | `staff` | staff panel | staff reviews | 1 role | 6 |
-| `nypd` | police panel | NYPD reviews | 3 roles | 6 |
+| `nypd` | police panel | NYPD reviews | 3 roles | 14 |
 
 Because Gambino and Colombo share the family panel channel, they post as a
 single combined panel with two buttons. On boot the bot reconciles any

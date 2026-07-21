@@ -469,6 +469,14 @@ function migrateApplicationsToHomeGuild() {
         "Time Zone:",
         "What times can you be active?",
         "Do you have previous police RP experience? If so, where?",
+        "In your opinion, when is lethal force permitted?",
+        "Scenario 1: Two gangsters are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?",
+        "Scenario 2: A player kills someone, and is pleading that it was unintentional, what do you charge them with, and do you permit them to make an argument?",
+        "Scenario 3: You see an officer accepting a bribe, how do you respond?",
+        "Should police step into a staff situation such as RDM?",
+        "Do you understand that any abuse of perms or power will lead to removal and blacklist? Y/N",
+        "Do you understand you are going to likely die quite a bit? Y/N",
+        "Any other questions or things you'd like to share?",
       ],
       minAge: 14, minMemberTime: "1 week",
     },
@@ -564,6 +572,35 @@ function migrateNypdQuestionsV2() {
   console.log(`📝 Applied updated NYPD application questions for home guild (${GUILD_ID})`);
 }
 migrateNypdQuestionsV2();
+
+// Backfill the expanded NYPD application questions onto the home guild's
+// already-seeded nypd app. Runs once, guarded by nypdQuestionsV3, so it
+// never clobbers a later manual edit via /applications setquestions.
+function migrateNypdQuestionsV3() {
+  if (!GUILD_ID) return;
+  const cfg = applicationConfigs[GUILD_ID];
+  if (!cfg || !cfg.apps || cfg.nypdQuestionsV3) return;
+  if (cfg.apps.nypd) cfg.apps.nypd.questions = [
+    "Pavlov Username:",
+    "Discord Username:",
+    "Age and Birthday:",
+    "Time Zone:",
+    "What times can you be active?",
+    "Do you have previous police RP experience? If so, where?",
+    "In your opinion, when is lethal force permitted?",
+    "Scenario 1: Two gangsters are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?",
+    "Scenario 2: A player kills someone, and is pleading that it was unintentional, what do you charge them with, and do you permit them to make an argument?",
+    "Scenario 3: You see an officer accepting a bribe, how do you respond?",
+    "Should police step into a staff situation such as RDM?",
+    "Do you understand that any abuse of perms or power will lead to removal and blacklist? Y/N",
+    "Do you understand you are going to likely die quite a bit? Y/N",
+    "Any other questions or things you'd like to share?",
+  ];
+  cfg.nypdQuestionsV3 = true;
+  saveApplicationConfig(GUILD_ID);
+  console.log(`📝 Applied expanded NYPD application questions for home guild (${GUILD_ID})`);
+}
+migrateNypdQuestionsV3();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
