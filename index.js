@@ -48,7 +48,7 @@ const DB_FILE = process.env.GUARDIAN_DB_FILE || path.join(__dirname, "guardian.d
 const db = new Database(DB_FILE);
 db.pragma("journal_mode = WAL");
 db.pragma("busy_timeout = 5000");
-for (const t of ["guild_settings", "antiping", "warnings", "muted_roles", "snapshots", "failsafe", "mod_rates", "lockdown_state", "tickets", "ticket_channels"])
+for (const t of ["guild_settings", "antiping", "warnings", "muted_roles", "snapshots", "failsafe", "mod_rates", "lockdown_state", "tickets", "ticket_channels", "applications"])
   db.exec(`CREATE TABLE IF NOT EXISTS ${t} (guild_id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
 
 function dbLoadAll(table) {
@@ -389,6 +389,90 @@ function migrateTicketsToHomeGuild() {
   console.log(`🎫 Seeded default ticket types + panel channel for home guild (${GUILD_ID})`);
 }
 migrateTicketsToHomeGuild();
+
+// ── Application system config (persisted to SQLite `applications`) ──
+// { [guildId]: { apps: { [key]: { key,label,emoji,panelChannelId,panelMessageId,reviewChannelId,acceptedRoleIds:[],questions:[] } } } }
+let applicationConfigs = {};
+function loadApplicationConfigs() { applicationConfigs = dbLoadAll("applications"); }
+function saveApplicationConfig(gid) { dbPut("applications", gid, applicationConfigs[gid]); }
+loadApplicationConfigs();
+function getApplications(guildId) {
+  const c = applicationConfigs[guildId];
+  return (c && c.apps && typeof c.apps === "object") ? c.apps : {};
+}
+function getApplication(guildId, key) {
+  return getApplications(guildId)[key] || null;
+}
+function setApplication(guildId, key, patch) {
+  if (!applicationConfigs[guildId]) applicationConfigs[guildId] = { apps: {} };
+  if (!applicationConfigs[guildId].apps) applicationConfigs[guildId].apps = {};
+  const prev = applicationConfigs[guildId].apps[key] || {};
+  applicationConfigs[guildId].apps[key] = { ...prev, ...patch };
+  saveApplicationConfig(guildId);
+}
+
+// One-time seed: pre-configure the exact application types + panel/review
+// channels + accepted roles requested for the HOME guild (GUILD_ID) only, if
+// nothing's configured yet. Never overwrites an existing configuration, and
+// never applies to any other guild - use `/applications` for other servers.
+function migrateApplicationsToHomeGuild() {
+  if (!GUILD_ID) return;
+  if (Object.keys(getApplications(GUILD_ID)).length) return;
+  const FAMILY_Q = (fam) => ([
+    "How old are you?",
+    "Whats your discord and ingame name",
+    `Why do you want to join ${fam}?`,
+    "How will you help?",
+  ]);
+  const apps = {
+    gambino: {
+      key: "gambino", label: "Gambino", emoji: "💼",
+      panelChannelId: "1528798524660252814", panelMessageId: "",
+      reviewChannelId: "1529100361720266803",
+      acceptedRoleIds: ["1528801101003096295", "1528801216518426866", "1528802048131338330"],
+      questions: FAMILY_Q("Gambino"),
+    },
+    colombo: {
+      key: "colombo", label: "Colombo", emoji: "🕴️",
+      panelChannelId: "1528798524660252814", panelMessageId: "",
+      reviewChannelId: "1528805634995261520",
+      acceptedRoleIds: ["1528801101003096295", "1528802048131338330", "1528801296411394148"],
+      questions: FAMILY_Q("Colombo"),
+    },
+    staff: {
+      key: "staff", label: "Staff", emoji: "🛡️",
+      panelChannelId: "1528754443129196747", panelMessageId: "",
+      reviewChannelId: "1528754486678392875",
+      acceptedRoleIds: ["1528754350963556466"],
+      questions: [
+        "How old are you?",
+        "Whats your discord and ingame name",
+        "Why do you want to join the staff team?",
+        "How will you help?",
+        "What will you provide for the community?",
+        "What would you do if a higher up is abusing?",
+      ],
+    },
+    nypd: {
+      key: "nypd", label: "NYPD", emoji: "👮",
+      panelChannelId: "1528754445968740472", panelMessageId: "",
+      reviewChannelId: "1528754488339464192",
+      acceptedRoleIds: ["1528754363726827572", "1528754358697853050", "1528754369019777034"],
+      questions: [
+        "How old are you?",
+        "Whats your discord and ingame name",
+        "Why do you want to join the NYPD?",
+        "How will you help?",
+        "What would you do if someone is robbing a gun store?",
+        "A higher up is giving an unlawful order, what will you do?",
+      ],
+    },
+  };
+  applicationConfigs[GUILD_ID] = { apps };
+  saveApplicationConfig(GUILD_ID);
+  console.log(`📝 Seeded default application types (gambino, colombo, staff, nypd) for home guild (${GUILD_ID})`);
+}
+migrateApplicationsToHomeGuild();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
@@ -939,6 +1023,25 @@ const commands = [
       .addChannelOption(o => o.setName("category").setDescription("Category channel").setRequired(true).addChannelTypes(ChannelType.GuildCategory)))
     .addSubcommand(s => s.setName("panel").setDescription("Post or refresh the ticket panel")
       .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (defaults to the last-used one)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))),
+
+  new SlashCommandBuilder()
+    .setName("applications").setDescription("Configure the application system")
+    .addSubcommand(s => s.setName("list").setDescription("List configured applications and their channels/roles"))
+    .addSubcommand(s => s.setName("panel").setDescription("Post or refresh an application's panel (Apply button)")
+      .addStringOption(o => o.setName("key").setDescription("The application's key, e.g. gambino").setRequired(true))
+      .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (defaults to its configured one)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+    .addSubcommand(s => s.setName("setreview").setDescription("Set where submitted applications go for staff review")
+      .addStringOption(o => o.setName("key").setDescription("The application's key").setRequired(true))
+      .addChannelOption(o => o.setName("channel").setDescription("Review channel").setRequired(true).addChannelTypes(ChannelType.GuildText)))
+    .addSubcommand(s => s.setName("setpanelchannel").setDescription("Set which channel an application's Apply panel posts to")
+      .addStringOption(o => o.setName("key").setDescription("The application's key").setRequired(true))
+      .addChannelOption(o => o.setName("channel").setDescription("Panel channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+    .addSubcommand(s => s.setName("addrole").setDescription("Add a role granted when an application is accepted")
+      .addStringOption(o => o.setName("key").setDescription("The application's key").setRequired(true))
+      .addRoleOption(o => o.setName("role").setDescription("Role to grant on accept").setRequired(true)))
+    .addSubcommand(s => s.setName("removerole").setDescription("Remove an accepted-role from an application")
+      .addStringOption(o => o.setName("key").setDescription("The application's key").setRequired(true))
+      .addRoleOption(o => o.setName("role").setDescription("Role to remove").setRequired(true))),
 
   new SlashCommandBuilder().setName("help").setDescription("Show all Guardian Bot commands"),
 ];
@@ -1905,7 +2008,7 @@ async function createTicketChannel(interaction, key, reason) {
     if (category) setTicketConfig(guild.id, { categoryId: category.id });
   }
 
-  // Explicit `type` (0 = role, 1 = member) on every overwrite — without it,
+  // Explicit `type` (0 = role, 1 = member) on every overwrite - without it,
   // discord.js tries to guess by checking caches and throws "Supplied
   // parameter is not a cached User or Role" whenever it can't resolve one
   // (e.g. a modRoleId that isn't cached at that instant).
@@ -2042,6 +2145,243 @@ async function handleTicketClose(interaction) {
 
   await channel.send("🗑️ This channel will be deleted in 5 seconds…").catch(() => {});
   setTimeout(() => channel.delete("Ticket closed").catch(() => {}), 5000);
+}
+
+// ── Application System (Appy-style forms → staff review → role grant) ──
+const MODAL_MAX_QUESTIONS = 5;        // Discord hard limit: 5 text inputs per modal
+const APP_ANSWER_MAX = 700;           // per-answer cap (keeps the review embed under Discord's 6000-char total)
+// Partial answers for multi-modal (>5 question) applications, held only between
+// the first modal submit and the follow-up modal submit. Keyed "gid:uid:key".
+const pendingApps = new Map();
+function pendingKey(gid, uid, key) { return `${gid}:${uid}:${key}`; }
+
+function buildAppPanelEmbed(guild, app) {
+  return new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setTitle(`${app.emoji || "📝"} ${app.label} Application`)
+    .setDescription(
+      `Interested in **${app.label}**? Click the button below to apply.\n\n` +
+      `You'll be asked a few quick questions. Answer honestly and completely - our team reviews every submission.\n\n` +
+      `**Questions (${app.questions.length}):**\n` +
+      app.questions.map((q, i) => `**${i + 1}.** ${q}`).join("\n")
+    )
+    .setThumbnail(guild.iconURL?.() || null)
+    .setFooter({ text: guild.name })
+    .setTimestamp();
+}
+function buildAppPanelRow(app) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`app_apply_${app.key}`).setLabel(`Apply for ${app.label}`.slice(0, 80)).setEmoji(app.emoji || "📝").setStyle(ButtonStyle.Primary),
+  );
+}
+
+// Post each app's panel (or leave it if already posted and still present).
+async function ensureApplicationPanels(guild) {
+  for (const app of Object.values(getApplications(guild.id))) {
+    if (!app.panelChannelId || !app.questions?.length) continue;
+    const channel = guild.channels.cache.get(app.panelChannelId);
+    if (!channel) continue;
+    if (app.panelMessageId) {
+      const existing = await channel.messages.fetch(app.panelMessageId).catch(() => null);
+      if (existing) continue;
+    }
+    const posted = await channel.send({ embeds: [buildAppPanelEmbed(guild, app)], components: [buildAppPanelRow(app)] }).catch(() => null);
+    if (posted) {
+      setApplication(guild.id, app.key, { panelMessageId: posted.id });
+      console.log(`📝 Posted ${app.label} application panel in #${channel.name} (${guild.name})`);
+    }
+  }
+}
+
+// Build the modal for a given "part" (0-based) of an application. Each part
+// holds up to 5 questions; part index maps to slice [part*5, part*5+5).
+function buildAppModal(app, part) {
+  const start = part * MODAL_MAX_QUESTIONS;
+  const slice = app.questions.slice(start, start + MODAL_MAX_QUESTIONS);
+  const totalParts = Math.ceil(app.questions.length / MODAL_MAX_QUESTIONS);
+  const suffix = totalParts > 1 ? ` (${part + 1}/${totalParts})` : "";
+  const modal = new ModalBuilder().setCustomId(`app_modal_${app.key}_${part}`).setTitle(`${app.label} Application${suffix}`.slice(0, 45));
+  slice.forEach((q, i) => {
+    const input = new TextInputBuilder()
+      .setCustomId(`q${start + i}`)
+      .setLabel(q.length > 45 ? q.slice(0, 44) + "…" : q)
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(true)
+      .setMaxLength(APP_ANSWER_MAX);
+    if (q.length > 45) input.setPlaceholder(q.slice(0, 100)); // full question when the label had to be truncated
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+  });
+  return modal;
+}
+
+async function handleAppApply(interaction) {
+  const key = interaction.customId.replace("app_apply_", "");
+  const app = getApplication(interaction.guild.id, key);
+  if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
+  if (!app.reviewChannelId) return interaction.reply({ content: "❌ This application isn't fully set up yet (no review channel). Please contact an admin.", ephemeral: true });
+  pendingApps.delete(pendingKey(interaction.guild.id, interaction.user.id, key)); // fresh start
+  return interaction.showModal(buildAppModal(app, 0));
+}
+
+async function handleAppModalSubmit(interaction) {
+  // customId: app_modal_<key>_<part>
+  const rest = interaction.customId.slice("app_modal_".length);
+  const lastUnderscore = rest.lastIndexOf("_");
+  const key = rest.slice(0, lastUnderscore);
+  const part = parseInt(rest.slice(lastUnderscore + 1), 10) || 0;
+  const app = getApplication(interaction.guild.id, key);
+  if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
+
+  const start = part * MODAL_MAX_QUESTIONS;
+  const slice = app.questions.slice(start, start + MODAL_MAX_QUESTIONS);
+  const pKey = pendingKey(interaction.guild.id, interaction.user.id, key);
+  const answers = pendingApps.get(pKey) || [];
+  slice.forEach((_, i) => { answers[start + i] = interaction.fields.getTextInputValue(`q${start + i}`); });
+
+  const totalParts = Math.ceil(app.questions.length / MODAL_MAX_QUESTIONS);
+  if (part + 1 < totalParts) {
+    // More questions remain - stash and offer a Continue button (can't chain modal→modal directly).
+    pendingApps.set(pKey, answers);
+    setTimeout(() => pendingApps.delete(pKey), 15 * 60 * 1000).unref?.();
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`app_continue_${key}_${part + 1}`).setLabel("Continue application").setEmoji("➡️").setStyle(ButtonStyle.Primary));
+    return interaction.reply({ ephemeral: true, content: `✅ Part ${part + 1}/${totalParts} saved. Click **Continue** to finish.`, components: [row] });
+  }
+
+  // Final part - finalize and submit for review.
+  pendingApps.delete(pKey);
+  return finalizeApplication(interaction, app, answers);
+}
+
+async function handleAppContinue(interaction) {
+  // customId: app_continue_<key>_<part>
+  const rest = interaction.customId.slice("app_continue_".length);
+  const lastUnderscore = rest.lastIndexOf("_");
+  const key = rest.slice(0, lastUnderscore);
+  const part = parseInt(rest.slice(lastUnderscore + 1), 10) || 0;
+  const app = getApplication(interaction.guild.id, key);
+  if (!app) return interaction.reply({ content: "❌ This application is no longer available.", ephemeral: true });
+  if (!pendingApps.has(pendingKey(interaction.guild.id, interaction.user.id, key)))
+    return interaction.reply({ content: "❌ Your application session expired. Please start over from the panel.", ephemeral: true });
+  return interaction.showModal(buildAppModal(app, part));
+}
+
+async function finalizeApplication(interaction, app, answers) {
+  const { guild, user } = interaction;
+  const reviewChannel = guild.channels.cache.get(app.reviewChannelId);
+  if (!reviewChannel) return interaction.reply({ content: "❌ The review channel for this application no longer exists. Please contact an admin.", ephemeral: true });
+
+  const reviewEmbed = new EmbedBuilder()
+    .setColor(COLORS.warn)
+    .setAuthor({ name: `${user.tag} (${user.id})`, iconURL: user.displayAvatarURL?.() })
+    .setTitle(`${app.emoji || "📝"} New ${app.label} Application`)
+    .addFields(app.questions.map((q, i) => ({
+      name: `${i + 1}. ${q}`.slice(0, 256),
+      value: (answers[i] || "*(no answer)*").slice(0, 1024),
+      inline: false,
+    })))
+    .setFooter({ text: `Applicant ID: ${user.id} • Status: 🟡 Pending` })
+    .setTimestamp();
+
+  const controls = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`app_accept_${app.key}_${user.id}`).setLabel("Accept").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`app_deny_${app.key}_${user.id}`).setLabel("Deny").setEmoji("⛔").setStyle(ButtonStyle.Danger),
+  );
+
+  const posted = await reviewChannel.send({ embeds: [reviewEmbed], components: [controls] }).catch(() => null);
+  if (!posted) return interaction.reply({ content: "❌ Could not submit your application - I may be missing permission to post in the review channel. Please contact an admin.", ephemeral: true });
+
+  secLog(guild, "Application Submitted", `<@${user.id}> submitted a **${app.label}** application → <#${reviewChannel.id}>`, COLORS.info);
+  return interaction.reply({ ephemeral: true, content: `✅ Your **${app.label}** application has been submitted. You'll be notified once it's reviewed. Good luck!` });
+}
+
+// Parse "app_accept_<key>_<userId>" / "app_deny_<key>_<userId>" → { key, userId }.
+function parseReviewCustomId(customId, prefix) {
+  const rest = customId.slice(prefix.length);
+  const lastUnderscore = rest.lastIndexOf("_");
+  return { key: rest.slice(0, lastUnderscore), userId: rest.slice(lastUnderscore + 1) };
+}
+
+async function handleAppAccept(interaction) {
+  const { guild, member } = interaction;
+  if (!isMod(member)) return interaction.reply({ content: "❌ Only staff can review applications.", ephemeral: true });
+  const { key, userId } = parseReviewCustomId(interaction.customId, "app_accept_");
+  const app = getApplication(guild.id, key);
+  if (!app) return interaction.reply({ content: "❌ This application type no longer exists.", ephemeral: true });
+
+  await interaction.deferUpdate().catch(() => {});
+  const applicant = await guild.members.fetch(userId).catch(() => null);
+
+  let grantedCount = 0; const failedRoles = [];
+  if (applicant) {
+    for (const roleId of app.acceptedRoleIds || []) {
+      const role = guild.roles.cache.get(roleId);
+      if (!role) { failedRoles.push(`\`${roleId}\` (missing)`); continue; }
+      if (!role.editable) { failedRoles.push(`${role.name} (above me)`); continue; }
+      const ok = await applicant.roles.add(role, `Application accepted by ${member.user.tag}`).then(() => true).catch(() => false);
+      if (ok) grantedCount++; else failedRoles.push(role.name);
+    }
+  }
+
+  const base = interaction.message.embeds[0];
+  const updated = EmbedBuilder.from(base)
+    .setColor(COLORS.success)
+    .setFooter({ text: `Applicant ID: ${userId} • ✅ Accepted by ${member.user.tag}` });
+  await interaction.message.edit({
+    embeds: [updated],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("app_done_accept").setLabel(`Accepted by ${member.user.username}`.slice(0, 80)).setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true))],
+  }).catch(() => {});
+
+  if (applicant) await tryDM(applicant.user, `🎉 Your **${app.label}** application in **${guild.name}** was **accepted**! ${grantedCount ? `You've been granted ${grantedCount} role(s).` : ""}`);
+  secLog(guild, "Application Accepted",
+    `<@${member.id}> accepted <@${userId}>'s **${app.label}** application. Granted **${grantedCount}** role(s).` +
+    (failedRoles.length ? `\n⚠️ Could not grant: ${failedRoles.join(", ")}` : "") +
+    (!applicant ? `\n⚠️ Applicant is no longer in the server - roles not granted.` : ""),
+    COLORS.success);
+}
+
+async function handleAppDeny(interaction) {
+  const { guild, member } = interaction;
+  if (!isMod(member)) return interaction.reply({ content: "❌ Only staff can review applications.", ephemeral: true });
+  const { key, userId } = parseReviewCustomId(interaction.customId, "app_deny_");
+  const app = getApplication(guild.id, key);
+  if (!app) return interaction.reply({ content: "❌ This application type no longer exists.", ephemeral: true });
+
+  const modal = new ModalBuilder().setCustomId(`app_denyreason_${key}_${userId}_${interaction.message.id}`).setTitle(`Deny ${app.label} Application`.slice(0, 45));
+  modal.addComponents(new ActionRowBuilder().addComponents(
+    new TextInputBuilder().setCustomId("reason").setLabel("Reason (optional - shown to applicant)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)));
+  return interaction.showModal(modal);
+}
+
+async function handleAppDenyReason(interaction) {
+  // customId: app_denyreason_<key>_<userId>_<messageId>
+  const rest = interaction.customId.slice("app_denyreason_".length);
+  const parts = rest.split("_");
+  const messageId = parts.pop();
+  const userId = parts.pop();
+  const key = parts.join("_");
+  const { guild, member } = interaction;
+  const app = getApplication(guild.id, key);
+  const reason = interaction.fields.getTextInputValue("reason")?.trim();
+
+  await interaction.deferUpdate().catch(() => {});
+  const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
+  if (msg && msg.embeds[0]) {
+    const updated = EmbedBuilder.from(msg.embeds[0])
+      .setColor(COLORS.danger)
+      .setFooter({ text: `Applicant ID: ${userId} • ⛔ Denied by ${member.user.tag}` });
+    if (reason) updated.addFields({ name: "Denial reason", value: reason.slice(0, 1024), inline: false });
+    await msg.edit({
+      embeds: [updated],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("app_done_deny").setLabel(`Denied by ${member.user.username}`.slice(0, 80)).setEmoji("⛔").setStyle(ButtonStyle.Danger).setDisabled(true))],
+    }).catch(() => {});
+  }
+
+  const applicant = await guild.members.fetch(userId).catch(() => null);
+  if (applicant) await tryDM(applicant.user, `Your **${app?.label || "application"}** application in **${guild.name}** was **denied**.${reason ? `\n**Reason:** ${reason}` : ""}`);
+  secLog(guild, "Application Denied", `<@${member.id}> denied <@${userId}>'s **${app?.label || key}** application.${reason ? ` Reason: ${reason}` : ""}`, COLORS.danger);
 }
 
 // ── Slash Command Handler ─────────────────────────────────────
@@ -2640,6 +2980,73 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    // ── /applications ──────────────────────────────────────
+    case "applications": {
+      if (!isOwner(member) && member.id !== guild.ownerId)
+        return interaction.reply({ content: "🔒 Only the bot owner or this server's owner can configure applications.", ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === "list") {
+        const apps = Object.values(getApplications(guild.id));
+        if (!apps.length) return interaction.reply({ content: "No applications configured. They're seeded automatically when `GUILD_ID` is set.", ephemeral: true });
+        const e = new EmbedBuilder().setColor(COLORS.info).setTitle("📝 Applications").setTimestamp();
+        for (const a of apps) {
+          e.addFields({
+            name: `${a.emoji || "📝"} ${a.label} (\`${a.key}\`)`,
+            value: `Panel: ${a.panelChannelId ? `<#${a.panelChannelId}>` : "❌ not set"} · Review: ${a.reviewChannelId ? `<#${a.reviewChannelId}>` : "❌ not set"}\n` +
+                   `Roles on accept: ${a.acceptedRoleIds?.length ? a.acceptedRoleIds.map(id => `<@&${id}>`).join(", ") : "none"}\n` +
+                   `Questions: ${a.questions?.length || 0}`,
+            inline: false,
+          });
+        }
+        return interaction.reply({ ephemeral: true, embeds: [e] });
+      }
+
+      const key = interaction.options.getString("key")?.trim().toLowerCase();
+      const app = getApplication(guild.id, key);
+      if (!app) return interaction.reply({ content: `❌ No application with key \`${key}\`. Use \`/applications list\` to see valid keys.`, ephemeral: true });
+
+      if (sub === "panel") {
+        const channel = interaction.options.getChannel("channel") || (app.panelChannelId ? guild.channels.cache.get(app.panelChannelId) : null);
+        if (!channel) return interaction.reply({ content: "❌ Provide a channel - none configured for this application yet.", ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        const panelEmbed = buildAppPanelEmbed(guild, app);
+        const row = buildAppPanelRow(app);
+        let posted = null;
+        if (app.panelChannelId === channel.id && app.panelMessageId) {
+          const existing = await channel.messages.fetch(app.panelMessageId).catch(() => null);
+          if (existing) posted = await existing.edit({ embeds: [panelEmbed], components: [row] }).catch(() => null);
+        }
+        if (!posted) posted = await channel.send({ embeds: [panelEmbed], components: [row] }).catch(() => null);
+        if (!posted) return interaction.editReply("❌ Could not send the panel - check my permissions in that channel.");
+        setApplication(guild.id, key, { panelChannelId: channel.id, panelMessageId: posted.id });
+        return interaction.editReply(`✅ **${app.label}** application panel posted in <#${channel.id}>.`);
+      }
+      if (sub === "setreview") {
+        const channel = interaction.options.getChannel("channel");
+        setApplication(guild.id, key, { reviewChannelId: channel.id });
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `**${app.label}** applications will be sent to <#${channel.id}> for review.`, "Applications")] });
+      }
+      if (sub === "setpanelchannel") {
+        const channel = interaction.options.getChannel("channel");
+        setApplication(guild.id, key, { panelChannelId: channel.id, panelMessageId: "" });
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `**${app.label}** panel channel set to <#${channel.id}>. Run \`/applications panel key:${key}\` to post it.`, "Applications")] });
+      }
+      if (sub === "addrole") {
+        const role = interaction.options.getRole("role");
+        const roles = [...(app.acceptedRoleIds || [])];
+        if (!roles.includes(role.id)) roles.push(role.id);
+        setApplication(guild.id, key, { acceptedRoleIds: roles });
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `<@&${role.id}> will be granted when a **${app.label}** application is accepted.`, "Applications")] });
+      }
+      if (sub === "removerole") {
+        const role = interaction.options.getRole("role");
+        setApplication(guild.id, key, { acceptedRoleIds: (app.acceptedRoleIds || []).filter(id => id !== role.id) });
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `<@&${role.id}> removed from **${app.label}** accepted-roles.`, "Applications")] });
+      }
+      return;
+    }
+
     // ── /help ──────────────────────────────────────────────
     case "help": {
       const windowHours = config.modWindowMs / 3600000;
@@ -2662,6 +3069,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "⚙️ /config", value: "View configuration *(bot owner only)*", inline: false },
           { name: "🔧 /setup", value: "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", inline: false },
           { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", inline: false },
+          { name: "📝 /applications", value: "`list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole` - configure the application system *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },
@@ -2708,6 +3116,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+// ── Application buttons (apply / continue / accept / deny) ──────
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton() || !interaction.inGuild()) return;
+  try {
+    if (interaction.customId.startsWith("app_apply_"))    return await handleAppApply(interaction);
+    if (interaction.customId.startsWith("app_continue_")) return await handleAppContinue(interaction);
+    if (interaction.customId.startsWith("app_accept_"))   return await handleAppAccept(interaction);
+    if (interaction.customId.startsWith("app_deny_"))     return await handleAppDeny(interaction);
+  } catch (err) {
+    console.error("⚠️ application button handler failed:", err);
+    const msg = { content: "⚠️ Something went wrong.", ephemeral: true };
+    if (interaction.deferred || interaction.replied) interaction.followUp(msg).catch(() => {});
+    else interaction.reply(msg).catch(() => {});
+  }
+});
+
+// ── Application modal submits (form parts + deny reason) ───────
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isModalSubmit() || !interaction.inGuild()) return;
+  try {
+    if (interaction.customId.startsWith("app_modal_"))     return await handleAppModalSubmit(interaction);
+    if (interaction.customId.startsWith("app_denyreason_")) return await handleAppDenyReason(interaction);
+  } catch (err) {
+    console.error("⚠️ application modal handler failed:", err);
+    const msg = { content: "⚠️ Something went wrong with your application.", ephemeral: true };
+    if (interaction.deferred || interaction.replied) interaction.followUp(msg).catch(() => {});
+    else interaction.reply(msg).catch(() => {});
+  }
+});
+
 // ── Boot ──────────────────────────────────────────────────────
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Guardian Bot online as ${client.user.tag}`);
@@ -2718,9 +3156,10 @@ client.once(Events.ClientReady, async () => {
   await recoverMutes();
   await recoverLockdowns();
 
-  // Post any configured ticket panel that isn't already up (idempotent).
+  // Post any configured ticket + application panels that aren't already up (idempotent).
   for (const guild of client.guilds.cache.values()) {
     try { await ensureTicketPanel(guild); } catch (_) {}
+    try { await ensureApplicationPanels(guild); } catch (_) {}
   }
 
   // Permission self-audit
@@ -2754,6 +3193,7 @@ client.on(Events.GuildCreate, async (guild) => {
   console.log(`➕ Joined guild ${guild.name} (${guild.id})`);
   try { await snapshotGuild(guild); } catch (_) {}
   try { await ensureTicketPanel(guild); } catch (_) {}
+  try { await ensureApplicationPanels(guild); } catch (_) {}
   // Clear any stray guild-scoped commands (e.g. from earlier per-guild testing on
   // this server before Guardian was invited) so nothing duplicates the global set.
   try {
@@ -2834,4 +3274,5 @@ module.exports = {
   canActOn,
   getTicketConfig, setTicketConfig,
   getOpenTicket, setOpenTicket, deleteOpenTicket, findOpenTicketByUser,
+  getApplications, getApplication, setApplication,
 };

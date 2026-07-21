@@ -2,8 +2,8 @@
 
 A multi-server Discord security bot: anti-nuke, anti-raid, anti-spam,
 anti-ping, warnings with auto-escalation, full-guild snapshots/rollback,
-a button-driven ticket system with transcripts, and per-server
-configuration - all backed by SQLite.
+a button-driven ticket system with transcripts, an Appy-style application
+system, and per-server configuration - all backed by SQLite.
 
 ## Requirements
 
@@ -81,7 +81,7 @@ invocation of a hidden owner command is written to the local
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/config` `/status` `/antiping` `/nuketest` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/config` `/status` `/antiping` `/nuketest` |
 
 ## Security systems
 
@@ -150,11 +150,54 @@ commands needed. This seed only ever runs once, only for that one guild,
 and never overwrites an existing configuration; every other server (or
 this one, to reconfigure) uses the `/tickets` commands above.
 
+## Application system
+
+An Appy-style application system: an embed panel with an **Apply** button
+per application type, a form the applicant fills in, and a staff review
+step with **Accept**/**Deny** that grants roles on acceptance.
+
+**Configuring it** (`/applications`, bot/server owner only):
+
+- `/applications list` - show every configured application, its panel/review channels, accepted roles, and question count
+- `/applications panel key:<key> [channel]` - post or refresh an application's Apply panel
+- `/applications setreview key:<key> channel:<#channel>` - where submitted applications go for staff review
+- `/applications setpanelchannel key:<key> channel:<#channel>` - where the Apply button panel is posted
+- `/applications addrole key:<key> role:<@role>` / `removerole` - roles granted on acceptance
+
+**The flow, end to end:**
+
+1. An applicant clicks **Apply** on a panel and fills in the questions in
+   a modal. Applications with more than 5 questions are split across two
+   modals automatically (Discord caps a modal at 5 inputs) - the applicant
+   answers the first 5, clicks **Continue**, then answers the rest.
+2. On submit, the completed application is posted to that type's review
+   channel as an embed (every question + answer), with **Accept** and
+   **Deny** buttons.
+3. **Accept** (staff only) grants the application's configured roles to
+   the applicant, marks the embed green with who accepted, disables the
+   buttons, and DMs the applicant.
+4. **Deny** (staff only) opens a short modal for an optional reason, marks
+   the embed red, and DMs the applicant with the reason.
+
+**Zero-touch setup for this specific deployment:** if `GUILD_ID` is set,
+four applications are seeded automatically on first boot and their panels
+are posted once the bot is up, with zero commands required:
+
+| Key | Panel channel | Review channel | Roles on accept | Questions |
+|-----|---------------|----------------|-----------------|-----------|
+| `gambino` | family panel | Gambino reviews | 3 roles | 4 |
+| `colombo` | family panel (same as Gambino) | Colombo reviews | 3 roles | 4 |
+| `staff` | staff panel | staff reviews | 1 role | 6 |
+| `nypd` | police panel | NYPD reviews | 3 roles | 6 |
+
+As with tickets, this seed runs once, only for that one guild, and never
+overwrites an existing configuration; anything else uses `/applications`.
+
 ## Data
 
 Runtime state (guild settings, anti-ping config, warnings, muted-role
-stashes, snapshots, failsafe backups, ticket config, open-ticket tracking)
-lives in `guardian.db`, a
+stashes, snapshots, failsafe backups, ticket config, open-ticket tracking,
+application config) lives in `guardian.db`, a
 `better-sqlite3` database created automatically on first boot. Legacy
 JSON files (`antiping.json`, `mutedroles.json`, `warnings.json`, etc.) are
 imported into it once if present, then no longer used. All of these are
@@ -169,7 +212,7 @@ npm run check   # syntax check (node --check) for index.js and shard.js
 npm run lint    # eslint .
 npm test        # node --test - unit tests for config merging, per-guild rate
                  # limits/lockdown isolation (incl. surviving a simulated
-                 # restart), ticket config/open-ticket isolation, permission
+                 # restart), ticket + application config isolation, permission
                  # checks, and formatting helpers
 ```
 
@@ -180,12 +223,13 @@ npm test        # node --test - unit tests for config merging, per-guild rate
 three on every push/PR against Node 20 and 22.
 
 **What's covered by automated tests vs. only by manual testing:** the
-per-guild isolation of rate limits/lockdown/config/ticket state (including
-that it survives a restart), and the permission-hierarchy logic, are
-covered by real regression tests. Anything that requires a live gateway
-connection - the actual anti-nuke/anti-raid/anti-spam detection firing
-against real Discord events, role/channel snapshot-and-restore, mute-role
-stashing, and the whole ticket flow (button clicks, modal submission,
-channel creation, claim/close, transcript generation) - is not, and has
-only been exercised by hand. Treat this bot as reviewed-and-tested-where-
-practical, not as verified against live abuse scenarios at scale.
+per-guild isolation of rate limits/lockdown/config/ticket/application
+state (including that it survives a restart), and the permission-hierarchy
+logic, are covered by real regression tests. Anything that requires a live
+gateway connection - the actual anti-nuke/anti-raid/anti-spam detection
+firing against real Discord events, role/channel snapshot-and-restore,
+mute-role stashing, the whole ticket flow, and the whole application flow
+(Apply buttons, form modals, multi-modal splitting, staff accept/deny,
+role granting) - is not, and has only been exercised by hand. Treat this
+bot as reviewed-and-tested-where-practical, not as verified against live
+abuse scenarios at scale.
