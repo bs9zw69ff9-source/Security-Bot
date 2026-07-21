@@ -370,20 +370,47 @@ function findOpenTicketByUser(guildId, userId, typeKey) {
 }
 
 // ── Chain of command config (persisted to SQLite `chain_of_command`) ──
-// { [guildId]: { channelId, messageId, roleIds: [] } } - roleIds is the
-// hierarchy order, top rank first; the posted embed lists who currently
-// holds each one, and stays synced as roles change.
+// { [guildId]: { [key]: { channelId, messageId, title, groups: [{label, roleIds}] } } }
+// A guild can have more than one board (e.g. "default" for staff, "police"
+// for the department) each posted to its own channel. Within a board,
+// groups are optional sub-headers (e.g. "Ranks" / "Sub Classes"); a group
+// with no label just renders as a flat list. roleIds are top-rank-first.
 let chainOfCommandConfigs = {};
 function loadChainOfCommandConfigs() { chainOfCommandConfigs = dbLoadAll("chain_of_command"); }
 function saveChainOfCommandConfig(gid) { dbPut("chain_of_command", gid, chainOfCommandConfigs[gid]); }
 loadChainOfCommandConfigs();
-function getChainOfCommand(guildId) {
-  const c = chainOfCommandConfigs[guildId] || {};
-  return { channelId: c.channelId || "", messageId: c.messageId || "", roleIds: Array.isArray(c.roleIds) ? c.roleIds : [] };
-}
-function setChainOfCommand(guildId, patch) {
-  chainOfCommandConfigs[guildId] = { ...getChainOfCommand(guildId), ...patch };
+// Older configs stored one flat {channelId, messageId, roleIds} per guild
+// (no key, no groups). Wrap that into a "default" board so already-posted
+// boards keep editing the same message instead of duplicating.
+function migrateChainOfCommandShape(guildId) {
+  const raw = chainOfCommandConfigs[guildId];
+  if (!raw || raw.default !== undefined || (!("channelId" in raw) && !("roleIds" in raw))) return;
+  chainOfCommandConfigs[guildId] = { default: {
+    channelId: raw.channelId || "", messageId: raw.messageId || "", title: "",
+    groups: [{ label: null, roleIds: Array.isArray(raw.roleIds) ? raw.roleIds : [] }],
+  } };
   saveChainOfCommandConfig(guildId);
+}
+for (const gid of Object.keys(chainOfCommandConfigs)) migrateChainOfCommandShape(gid);
+
+function getChainKeys(guildId) { return Object.keys(chainOfCommandConfigs[guildId] || {}); }
+function getChain(guildId, key) {
+  const c = (chainOfCommandConfigs[guildId] || {})[key] || {};
+  return {
+    channelId: c.channelId || "", messageId: c.messageId || "",
+    title: c.title || "", groups: Array.isArray(c.groups) ? c.groups : [],
+  };
+}
+function setChain(guildId, key, patch) {
+  if (!chainOfCommandConfigs[guildId]) chainOfCommandConfigs[guildId] = {};
+  chainOfCommandConfigs[guildId][key] = { ...getChain(guildId, key), ...patch };
+  saveChainOfCommandConfig(guildId);
+}
+// All role ids tracked by any board in a guild - used to decide whether a
+// role change is worth reacting to at all.
+function getAllChainRoleIds(guildId) {
+  const chains = chainOfCommandConfigs[guildId] || {};
+  return new Set(Object.values(chains).flatMap(c => (c.groups || []).flatMap(g => g.roleIds || [])));
 }
 
 // One-time seed: pre-configure the exact ticket types + panel channel requested
@@ -620,13 +647,14 @@ function migrateNypdQuestionsV3() {
 migrateNypdQuestionsV3();
 
 // One-time seed: the requested chain-of-command role hierarchy for the HOME
-// guild (GUILD_ID) only, top rank first. Never overwrites an existing
-// configuration - use /chainofcommand setroles for any other change.
+// guild (GUILD_ID) only, top rank first, as the "default" board. Never
+// overwrites an existing configuration - use /chainofcommand setroles for
+// any other change.
 function migrateChainOfCommandToHomeGuild() {
   if (!GUILD_ID) return;
-  if (getChainOfCommand(GUILD_ID).roleIds.length) return;
-  setChainOfCommand(GUILD_ID, {
-    roleIds: [
+  if (getChain(GUILD_ID, "default").groups.length) return;
+  setChain(GUILD_ID, "default", {
+    groups: [{ label: null, roleIds: [
       "1528754338472792085",
       "1528754340964208702",
       "1529251949671743671",
@@ -636,11 +664,43 @@ function migrateChainOfCommandToHomeGuild() {
       "1529184185137500192",
       "1529252370586796213",
       "1529184126358257684",
-    ],
+    ] }],
   });
   console.log(`📋 Seeded chain-of-command role order for home guild (${GUILD_ID})`);
 }
 migrateChainOfCommandToHomeGuild();
+
+// One-time seed: the requested police chain-of-command board for the HOME
+// guild (GUILD_ID) only - its own channel, and two labeled groups (Ranks,
+// then Sub Classes). Never overwrites an existing configuration - use
+// /chainofcommand setgroup for any other change.
+function migratePoliceChainOfCommandToHomeGuild() {
+  if (!GUILD_ID) return;
+  if (getChain(GUILD_ID, "police").groups.length) return;
+  setChain(GUILD_ID, "police", {
+    channelId: "1529246137087951100",
+    title: "🚓 Police Chain of Command",
+    groups: [
+      { label: "Ranks", roleIds: [
+        "1528754354264342633",
+        "1528754356063703100",
+        "1528754356688781375",
+        "1528754359947624639",
+        "1528754360845078720",
+        "1528754361906499584",
+        "1528754362921254942",
+        "1528754363726827572",
+      ] },
+      { label: "Sub Classes", roleIds: [
+        "1528754365739958292",
+        "1528754366851317872",
+        "1528754367963074591",
+      ] },
+    ],
+  });
+  console.log(`📋 Seeded police chain-of-command board for home guild (${GUILD_ID})`);
+}
+migratePoliceChainOfCommandToHomeGuild();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
@@ -1227,12 +1287,25 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("chainofcommand").setDescription("Auto-updating chain of command")
-    .addSubcommand(s => s.setName("setup").setDescription("Post (or move) the chain-of-command embed")
-      .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (defaults to this channel)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
-    .addSubcommand(s => s.setName("setroles").setDescription("Replace the role hierarchy, top rank first")
-      .addStringOption(o => o.setName("roles").setDescription("Roles in order, mentioned or as IDs, separated by spaces or commas").setRequired(true)))
-    .addSubcommand(s => s.setName("refresh").setDescription("Manually re-render the chain-of-command embed now"))
-    .addSubcommand(s => s.setName("view").setDescription("Show the configured channel and role order")),
+    .addSubcommand(s => s.setName("setup").setDescription("Post (or move) a chain-of-command board")
+      .addStringOption(o => o.setName("key").setDescription("Board id, e.g. 'police' (defaults to the main 'default' board)"))
+      .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (defaults to this channel)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+      .addStringOption(o => o.setName("title").setDescription("Embed title (defaults to '📋 Chain of Command')")))
+    .addSubcommand(s => s.setName("setroles").setDescription("Replace a board's whole role list with one flat, unlabeled group")
+      .addStringOption(o => o.setName("roles").setDescription("Roles in order, mentioned or as IDs, separated by spaces or commas").setRequired(true))
+      .addStringOption(o => o.setName("key").setDescription("Board id (defaults to 'default')")))
+    .addSubcommand(s => s.setName("setgroup").setDescription("Add or replace one labeled group within a board")
+      .addStringOption(o => o.setName("label").setDescription("Group header, e.g. 'Ranks'").setRequired(true))
+      .addStringOption(o => o.setName("roles").setDescription("Roles in order, mentioned or as IDs, separated by spaces or commas").setRequired(true))
+      .addStringOption(o => o.setName("key").setDescription("Board id (defaults to 'default')")))
+    .addSubcommand(s => s.setName("removegroup").setDescription("Remove one labeled group from a board")
+      .addStringOption(o => o.setName("label").setDescription("Group header to remove").setRequired(true))
+      .addStringOption(o => o.setName("key").setDescription("Board id (defaults to 'default')")))
+    .addSubcommand(s => s.setName("refresh").setDescription("Manually re-render a board now")
+      .addStringOption(o => o.setName("key").setDescription("Board id (defaults to 'default')")))
+    .addSubcommand(s => s.setName("view").setDescription("Show a board's configured channel and groups")
+      .addStringOption(o => o.setName("key").setDescription("Board id (defaults to 'default')")))
+    .addSubcommand(s => s.setName("list").setDescription("List every board configured for this server")),
 
   new SlashCommandBuilder().setName("help").setDescription("Show all Guardian Bot commands"),
 ];
@@ -2800,53 +2873,63 @@ async function handleAppDenyReason(interaction) {
 }
 
 // ── Chain of Command ──────────────────────────────────────────
-// A single embed listing each configured role (in hierarchy order) next to
-// whoever currently holds it. Posted once via /chainofcommand setup, then
-// kept in sync automatically as members' roles change.
-function buildChainOfCommandEmbed(guild, roleIds) {
+// One embed per board, listing each group's roles (in hierarchy order) next
+// to whoever currently holds them. Posted once via /chainofcommand setup,
+// then kept in sync automatically as members' roles change.
+function buildChainOfCommandEmbed(guild, groups, title) {
   // Discord only resolves @mentions in an embed's description/field VALUE,
-  // never in a field NAME - so the role has to live in the description
-  // alongside its holders, not as a field header, or it renders as raw
+  // never in a field NAME - so roles have to live in the description
+  // alongside their holders, not as field headers, or they render as raw
   // <@&id> text instead of an actual mention.
-  const blocks = [];
-  for (const roleId of roleIds) {
-    const role = guild.roles.cache.get(roleId);
-    if (!role) continue;
-    const holders = [...role.members.values()].sort((a, b) => a.user.username.localeCompare(b.user.username));
-    blocks.push(`<@&${roleId}>\n${holders.length ? holders.map(m => `<@${m.id}>`).join("\n") : "*(none)*"}`);
+  const groupBlocks = [];
+  for (const group of groups) {
+    const roleBlocks = [];
+    for (const roleId of group.roleIds || []) {
+      const role = guild.roles.cache.get(roleId);
+      if (!role) continue;
+      const holders = [...role.members.values()].sort((a, b) => a.user.username.localeCompare(b.user.username));
+      roleBlocks.push(`<@&${roleId}>\n${holders.length ? holders.map(m => `<@${m.id}>`).join("\n") : "*(none)*"}`);
+    }
+    if (!roleBlocks.length) continue;
+    groupBlocks.push(group.label ? `**${group.label}**\n${roleBlocks.join("\n\n")}` : roleBlocks.join("\n\n"));
   }
-  return new EmbedBuilder().setColor(COLORS.info).setTitle("📋 Chain of Command").setTimestamp()
-    .setDescription(blocks.length ? blocks.join("\n\n").slice(0, 4096) : "None of the configured roles exist in this server anymore.");
+  return new EmbedBuilder().setColor(COLORS.info).setTitle(title || "📋 Chain of Command").setTimestamp()
+    .setDescription(groupBlocks.length ? groupBlocks.join("\n\n").slice(0, 4096) : "None of the configured roles exist in this server anymore.");
 }
 
-// Post or refresh (edit-in-place) the chain-of-command message for a guild,
-// if one is configured. Safe to call often - a no-op when unconfigured.
-async function renderChainOfCommand(guild) {
-  const cfg = getChainOfCommand(guild.id);
-  if (!cfg.channelId || !cfg.roleIds.length) return;
+// Post or refresh (edit-in-place) one board for a guild, if configured.
+// Safe to call often - a no-op when that key isn't set up yet.
+async function renderChainOfCommand(guild, key) {
+  const cfg = getChain(guild.id, key);
+  if (!cfg.channelId || !cfg.groups.length) return;
   const channel = guild.channels.cache.get(cfg.channelId);
   if (!channel) return;
   // Without a full member fetch, guild.members.cache (and so role.members)
   // only holds whoever the bot has already seen - most holders would be
   // missing on a server this bot hasn't fully cached yet.
   await guild.members.fetch().catch(() => {});
-  const payload = { embeds: [buildChainOfCommandEmbed(guild, cfg.roleIds)] };
+  const payload = { embeds: [buildChainOfCommandEmbed(guild, cfg.groups, cfg.title)] };
   if (cfg.messageId) {
     const existing = await channel.messages.fetch(cfg.messageId).catch(() => null);
     if (existing) { await existing.edit(payload).catch(() => {}); return; }
   }
   const posted = await channel.send(payload).catch(() => null);
-  if (posted) setChainOfCommand(guild.id, { messageId: posted.id });
+  if (posted) setChain(guild.id, key, { messageId: posted.id });
+}
+
+// Render every board configured for a guild - used on boot/join and after a
+// tracked role change, since either could touch any one of them.
+async function renderAllChainsOfCommand(guild) {
+  for (const key of getChainKeys(guild.id)) await renderChainOfCommand(guild, key).catch(() => {});
 }
 
 // Debounced per-guild refresh so a burst of role changes (e.g. a bulk sync)
 // collapses into one re-render instead of one edit per member.
 const chainOfCommandRefreshTimers = new Map(); // guildId -> Timeout
 function scheduleChainOfCommandRefresh(guild) {
-  const cfg = getChainOfCommand(guild.id);
-  if (!cfg.channelId || !cfg.roleIds.length) return;
+  if (!getChainKeys(guild.id).length) return;
   clearTimeout(chainOfCommandRefreshTimers.get(guild.id));
-  const t = setTimeout(() => renderChainOfCommand(guild).catch(() => {}), 3000);
+  const t = setTimeout(() => renderAllChainsOfCommand(guild).catch(() => {}), 3000);
   if (t.unref) t.unref();
   chainOfCommandRefreshTimers.set(guild.id, t);
 }
@@ -3671,37 +3754,76 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply({ content: "Only the bot owner or the server owner can set up the chain of command.", ephemeral: true });
       const sub = interaction.options.getSubcommand();
 
+      if (sub === "list") {
+        const keys = getChainKeys(guild.id);
+        if (!keys.length) return interaction.reply({ content: "No chain-of-command boards configured yet.", ephemeral: true });
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.info,
+          keys.map(k => {
+            const c = getChain(guild.id, k);
+            return `\`${k}\` - ${c.channelId ? `<#${c.channelId}>` : "*(no channel set)*"} - ${c.groups.reduce((n, g) => n + (g.roleIds?.length || 0), 0)} role(s)`;
+          }).join("\n"), "Chain of Command Boards")] });
+      }
+
+      const key = interaction.options.getString("key")?.trim().toLowerCase() || "default";
+
       if (sub === "setroles") {
         const raw = interaction.options.getString("roles");
         const roleIds = [...new Set(raw.match(/\d{15,25}/g) || [])];
         if (!roleIds.length) return interaction.reply({ content: "Give at least one role, mentioned or by ID.", ephemeral: true });
-        setChainOfCommand(guild.id, { roleIds });
-        await renderChainOfCommand(guild);
+        setChain(guild.id, key, { groups: [{ label: null, roleIds }] });
+        await renderChainOfCommand(guild, key);
         return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success,
-          `Chain of command now tracks **${roleIds.length}** role(s), top rank first:\n${roleIds.map((id, i) => `${i + 1}. <@&${id}>`).join("\n")}`, "Chain of Command")] });
+          `Board \`${key}\` now tracks **${roleIds.length}** role(s), top rank first:\n${roleIds.map((id, i) => `${i + 1}. <@&${id}>`).join("\n")}`, "Chain of Command")] });
+      }
+      if (sub === "setgroup") {
+        const label = interaction.options.getString("label").trim();
+        const raw = interaction.options.getString("roles");
+        const roleIds = [...new Set(raw.match(/\d{15,25}/g) || [])];
+        if (!roleIds.length) return interaction.reply({ content: "Give at least one role, mentioned or by ID.", ephemeral: true });
+        const cfg = getChain(guild.id, key);
+        const groups = [...cfg.groups];
+        const idx = groups.findIndex(g => (g.label || "").toLowerCase() === label.toLowerCase());
+        if (idx >= 0) groups[idx] = { label, roleIds }; else groups.push({ label, roleIds });
+        setChain(guild.id, key, { groups });
+        await renderChainOfCommand(guild, key);
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success,
+          `Board \`${key}\` group **${label}** now tracks **${roleIds.length}** role(s):\n${roleIds.map((id, i) => `${i + 1}. <@&${id}>`).join("\n")}`, "Chain of Command")] });
+      }
+      if (sub === "removegroup") {
+        const label = interaction.options.getString("label").trim();
+        const cfg = getChain(guild.id, key);
+        const groups = cfg.groups.filter(g => (g.label || "").toLowerCase() !== label.toLowerCase());
+        if (groups.length === cfg.groups.length) return interaction.reply({ content: `Board \`${key}\` has no group called **${label}**.`, ephemeral: true });
+        setChain(guild.id, key, { groups });
+        await renderChainOfCommand(guild, key);
+        return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.success, `Removed group **${label}** from board \`${key}\`.`, "Chain of Command")] });
       }
       if (sub === "setup") {
-        const cfg = getChainOfCommand(guild.id);
-        if (!cfg.roleIds.length) return interaction.reply({ content: "No roles configured yet - run `/chainofcommand setroles` first.", ephemeral: true });
+        const cfg = getChain(guild.id, key);
+        if (!cfg.groups.length) return interaction.reply({ content: `Board \`${key}\` has no roles configured yet - run \`/chainofcommand setroles\` or \`setgroup\` first.`, ephemeral: true });
         const channel = interaction.options.getChannel("channel") || interaction.channel;
+        const title = interaction.options.getString("title")?.trim();
         await interaction.deferReply({ ephemeral: true });
-        if (channel.id !== cfg.channelId) setChainOfCommand(guild.id, { channelId: channel.id, messageId: "" });
-        await renderChainOfCommand(guild);
-        return interaction.editReply(`Done - the chain of command is up in <#${channel.id}>, and will keep itself updated as roles change.`);
+        const patch = {};
+        if (channel.id !== cfg.channelId) { patch.channelId = channel.id; patch.messageId = ""; }
+        if (title) patch.title = title;
+        if (Object.keys(patch).length) setChain(guild.id, key, patch);
+        await renderChainOfCommand(guild, key);
+        return interaction.editReply(`Done - board \`${key}\` is up in <#${channel.id}>, and will keep itself updated as roles change.`);
       }
       if (sub === "refresh") {
-        const cfg = getChainOfCommand(guild.id);
-        if (!cfg.channelId || !cfg.roleIds.length) return interaction.reply({ content: "Nothing configured yet - run `/chainofcommand setroles` and `/chainofcommand setup` first.", ephemeral: true });
+        const cfg = getChain(guild.id, key);
+        if (!cfg.channelId || !cfg.groups.length) return interaction.reply({ content: `Board \`${key}\` isn't fully configured yet - run \`setroles\`/\`setgroup\` and \`setup\` first.`, ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
-        await renderChainOfCommand(guild);
+        await renderChainOfCommand(guild, key);
         return interaction.editReply("Refreshed.");
       }
       if (sub === "view") {
-        const cfg = getChainOfCommand(guild.id);
-        if (!cfg.roleIds.length) return interaction.reply({ content: "No roles configured yet.", ephemeral: true });
+        const cfg = getChain(guild.id, key);
+        if (!cfg.groups.length) return interaction.reply({ content: `Board \`${key}\` has no roles configured yet.`, ephemeral: true });
+        const body = cfg.groups.map(g => `${g.label ? `**${g.label}**\n` : ""}${(g.roleIds || []).map((id, i) => `${i + 1}. <@&${id}>`).join("\n")}`).join("\n\n");
         return interaction.reply({ ephemeral: true, embeds: [embed(COLORS.info,
-          `Channel: ${cfg.channelId ? `<#${cfg.channelId}>` : "*(not set)*"}\n\n${cfg.roleIds.map((id, i) => `${i + 1}. <@&${id}>`).join("\n")}`,
-          "Chain of Command")] });
+          `Channel: ${cfg.channelId ? `<#${cfg.channelId}>` : "*(not set)*"}\n\n${body}`, `Chain of Command - \`${key}\``)] });
       }
       return;
     }
@@ -3730,7 +3852,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "🎫 /tickets", value: "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", inline: false },
           { name: "📝 /applications", value: "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole`/`setquestions` - configure the application system *(bot/server owner only)*", inline: false },
           { name: "👮 /police", value: "`manual setup [channel]` - post the officer guide & procedures manual *(bot/server owner only)*", inline: false },
-          { name: "📋 /chainofcommand", value: "`setroles`/`setup [channel]`/`refresh`/`view` - auto-updating role hierarchy embed *(bot/server owner only)*", inline: false },
+          { name: "📋 /chainofcommand", value: "`setroles`/`setgroup`/`removegroup`/`setup [channel]`/`refresh`/`view`/`list` - auto-updating role hierarchy boards, each keyed by `key` (defaults to `default`) *(bot/server owner only)*", inline: false },
           { name: "🧪 /nuketest", value: "Confirm anti-nuke + check my permissions *(owner only)*", inline: false },
           { name: "📈 /status", value: "Bot health: uptime, latency, guild count, memory *(owner only)*", inline: false },
           { name: "⏱️ Rate Limits", value: `Mod actions are rate-limited over a **${windowHours}h** window. Use \`/limits\`.`, inline: false },
@@ -3826,7 +3948,7 @@ client.once(Events.ClientReady, async () => {
   for (const guild of client.guilds.cache.values()) {
     try { await ensureTicketPanel(guild); } catch (_) {}
     try { await ensureApplicationPanels(guild); } catch (_) {}
-    try { await renderChainOfCommand(guild); } catch (_) {}
+    try { await renderAllChainsOfCommand(guild); } catch (_) {}
   }
 
   // Permission self-audit
@@ -3861,7 +3983,7 @@ client.on(Events.GuildCreate, async (guild) => {
   try { await snapshotGuild(guild); } catch (_) {}
   try { await ensureTicketPanel(guild); } catch (_) {}
   try { await ensureApplicationPanels(guild); } catch (_) {}
-  try { await renderChainOfCommand(guild); } catch (_) {}
+  try { await renderAllChainsOfCommand(guild); } catch (_) {}
   // Clear any stray guild-scoped commands (e.g. from earlier per-guild testing on
   // this server before Guardian was invited) so nothing duplicates the global set.
   try {
@@ -3882,14 +4004,14 @@ client.on(Events.GuildCreate, async (guild) => {
 // Chain of command: refresh whenever a tracked role is gained/lost, or a
 // holder leaves the server outright.
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
-  const cfg = getChainOfCommand(newMember.guild.id);
-  if (!cfg.roleIds.length) return;
-  const touchesTracked = cfg.roleIds.some(id => oldMember.roles.cache.has(id) !== newMember.roles.cache.has(id));
+  const tracked = getAllChainRoleIds(newMember.guild.id);
+  if (!tracked.size) return;
+  const touchesTracked = [...tracked].some(id => oldMember.roles.cache.has(id) !== newMember.roles.cache.has(id));
   if (touchesTracked) scheduleChainOfCommandRefresh(newMember.guild);
 });
 client.on(Events.GuildMemberRemove, (member) => {
-  const cfg = getChainOfCommand(member.guild.id);
-  if (cfg.roleIds.some(id => member.roles?.cache?.has(id))) scheduleChainOfCommandRefresh(member.guild);
+  const tracked = getAllChainRoleIds(member.guild.id);
+  if ([...tracked].some(id => member.roles?.cache?.has(id))) scheduleChainOfCommandRefresh(member.guild);
 });
 
 // Periodic sweep: trim stale tracker entries + self-defense health check.
