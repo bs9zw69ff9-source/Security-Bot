@@ -1108,8 +1108,9 @@ const COLORS = {
   muted: 0xff7518, nuke: 0xff0033, neutral: 0x2f3136,
 };
 // Appy-style accent colours for the application DM flow.
-const APPY_GREEN   = 0x57f287; // "Application Started" intro
-const APPY_BLURPLE = 0x5865f2; // per-question prompts
+const APPY_GREEN   = 0x57f287; // intro / submitted / accepted (green left bar)
+const APPY_BLURPLE = 0x5865f2; // per-question prompts (blurple left bar)
+const APPY_RED     = 0xed4245; // denied (red left bar)
 
 function embed(color, description, title = null) {
   const e = new EmbedBuilder().setColor(color).setDescription(description).setTimestamp();
@@ -2340,17 +2341,24 @@ async function handleAppApply(interaction) {
 
   // Open a DM and send the intro BEFORE acknowledging, so a closed-DM user gets a
   // clear message instead of silently starting an interview they can't see.
-  let dm;
+  let dm, introMsg;
   try {
     dm = await interaction.user.createDM();
-    await dm.send({ embeds: [new EmbedBuilder().setColor(APPY_GREEN)
+    introMsg = await dm.send({ embeds: [new EmbedBuilder().setColor(APPY_GREEN)
       .setTitle("Application Started")
-      .setDescription("Please answer the questions below by sending a message to the bot. Take your time, and answer honestly.")] });
+      .setDescription("Just answer the questions below by sending a message to the bot. Take your time, and be honest.")] });
   } catch {
-    return interaction.reply({ content: "I couldn't send you a DM. Turn on direct messages for this server (Privacy Settings → Allow direct messages from server members), then hit Apply again.", ephemeral: true });
+    return interaction.reply({ content: "I couldn't slide into your DMs. Turn on direct messages for this server (Privacy Settings → Allow direct messages from server members), then give Apply another tap.", ephemeral: true });
   }
 
-  await interaction.reply({ content: `All set - I've sent the **${app.label}** application to your DMs. Just answer there and you're good to go.`, ephemeral: true });
+  // Appy-style ephemeral confirmation: a green "Application started" card with a
+  // Jump-to-application link button pointing at the DM.
+  const jumpRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("Jump to application")
+      .setURL(`https://discord.com/channels/@me/${dm.id}/${introMsg.id}`));
+  await interaction.reply({ ephemeral: true, components: [jumpRow], embeds: [new EmbedBuilder().setColor(APPY_GREEN)
+    .setTitle("Application started")
+    .setDescription("Your application's up and waiting in your DMs. Hit the button below to jump straight to it.")] });
   runDmApplication(interaction.guild, interaction.user, app, dm).catch(err => console.error("⚠️ DM application flow failed:", err));
 }
 
@@ -2368,7 +2376,7 @@ async function runDmApplication(guild, user, app, dm) {
       const qMsg = await dm.send({
         embeds: [new EmbedBuilder().setColor(APPY_BLURPLE)
           .setTitle(`${app.label} Application`)
-          .setDescription(`${i + 1}/${total}. ${app.questions[i]}\n\n*To answer this question, just send your response as a message here.*`)],
+          .setDescription(`${i + 1}/${total}. ${app.questions[i]}\n\n-# To answer this one, just send your response as a message here.`)],
         components: [cancelRow],
       }).catch(() => null);
 
@@ -2383,21 +2391,21 @@ async function runDmApplication(guild, user, app, dm) {
       if (qMsg) await qMsg.edit({ components: [] }).catch(() => {}); // retire the Cancel button for this question
 
       if (result === "CANCEL") {
-        await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Cancelled")
-          .setDescription(`No worries - I've cancelled your **${app.label}** application. Nothing was sent. You can start again anytime from the panel.`)] }).catch(() => {});
+        await dm.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Application cancelled")
+          .setDescription(`All good, I've scrapped your ${app.label} application. Nothing got sent. Swing by the panel whenever you want to give it another go.`)] }).catch(() => {});
         return;
       }
       if (result === "TIMEOUT") {
-        await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Timed Out")
-          .setDescription(`Looks like you stepped away, so I've cancelled your **${app.label}** application for now. Feel free to start again whenever you're ready.`)] }).catch(() => {});
+        await dm.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Application cancelled")
+          .setDescription(`Looks like you wandered off, so I've closed out your ${app.label} application for now. Start fresh from the panel whenever you're ready.`)] }).catch(() => {});
         return;
       }
 
       const msg = result;
       let content = (msg.content || "").trim();
       if (content.toLowerCase() === "cancel") {
-        await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Cancelled")
-          .setDescription(`No worries - I've cancelled your **${app.label}** application. Nothing was sent.`)] }).catch(() => {});
+        await dm.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Application cancelled")
+          .setDescription(`All good, I've scrapped your ${app.label} application. Nothing got sent.`)] }).catch(() => {});
         return;
       }
       if (!content && msg.attachments?.size) content = [...msg.attachments.values()].map(a => a.url).join("\n"); // image/file-only answer
@@ -2407,17 +2415,17 @@ async function runDmApplication(guild, user, app, dm) {
     // The application could have been closed or deleted mid-interview - re-check before submitting.
     const fresh = getApplication(guild.id, app.key);
     if (!fresh || fresh.closed || !fresh.reviewChannelId) {
-      await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle("Application Closed")
-        .setDescription(`**${app.label}** applications closed while you were filling this out, so I wasn't able to send it in. Sorry about that - do try again once they reopen.`)] }).catch(() => {});
+      await dm.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Applications closed")
+        .setDescription(`Ah, ${app.label} applications shut just as you were wrapping up, so this one didn't make it through. Sorry about the timing - catch it next time they open.`)] }).catch(() => {});
       return;
     }
 
     const ok = await finalizeApplication(guild, user, fresh, answers);
     await dm.send({ embeds: [ok
-      ? new EmbedBuilder().setColor(APPY_GREEN).setTitle("Application Submitted")
-          .setDescription(`That's everything - thanks for applying! Your **${app.label}** application is with the team now, and you'll hear back here once they've had a look. Good luck!`)
-      : new EmbedBuilder().setColor(COLORS.danger).setTitle("Something Went Wrong")
-          .setDescription("Something went wrong on my end and I couldn't send your application through. Please let a staff member know so they can sort it out.")] }).catch(() => {});
+      ? new EmbedBuilder().setColor(APPY_GREEN).setTitle("Application submitted")
+          .setDescription("Your application has been submitted.\n\nThe team will give it a read and get back to you right here. Thanks for taking the time, and good luck!")
+      : new EmbedBuilder().setColor(APPY_RED).setTitle("Something went wrong")
+          .setDescription("Something broke on my end and your application didn't go through. Give a staff member a nudge and they'll get it sorted.")] }).catch(() => {});
   } finally {
     activeDmApps.delete(user.id);
   }
@@ -2489,7 +2497,8 @@ async function handleAppAccept(interaction) {
       new ButtonBuilder().setCustomId("app_done_accept").setLabel(`Accepted by ${member.user.username}`.slice(0, 80)).setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(true))],
   }).catch(() => {});
 
-  if (applicant) await tryDM(applicant.user, `Great news - your **${app.label}** application over in **${guild.name}** got accepted!${grantedCount ? ` You've picked up ${grantedCount} new role${grantedCount === 1 ? "" : "s"}.` : ""} Welcome aboard.`);
+  if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(APPY_GREEN).setTitle("Application accepted")
+    .setDescription(`Your application for \`${app.label} Application\` has been accepted by <@${member.id}>.${grantedCount ? `\n\nI've set you up with ${grantedCount} new role${grantedCount === 1 ? "" : "s"} - welcome aboard!` : "\n\nWelcome aboard!"}`)] }).catch(() => {});
   secLog(guild, "Application Accepted",
     `<@${member.id}> accepted <@${userId}>'s **${app.label}** application and handed them **${grantedCount}** role${grantedCount === 1 ? "" : "s"}.` +
     (failedRoles.length ? `\nHeads up, I couldn't grant: ${failedRoles.join(", ")}` : "") +
@@ -2536,7 +2545,8 @@ async function handleAppDenyReason(interaction) {
   }
 
   const applicant = await guild.members.fetch(userId).catch(() => null);
-  if (applicant) await tryDM(applicant.user, `Thanks for applying for **${app?.label || "that role"}** in **${guild.name}**. It wasn't accepted this time.${reason ? ` Here's the reason they gave: ${reason}` : ""} You're welcome to try again down the line.`);
+  if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(APPY_RED).setTitle("Application denied")
+    .setDescription(`Your application for \`${app?.label || "that role"} Application\` was turned down by <@${member.id}>.${reason ? `\n\nReason: ${reason}` : ""}\n\nNo hard feelings - you're welcome to give it another shot down the line.`)] }).catch(() => {});
   secLog(guild, "Application Denied", `<@${member.id}> turned down <@${userId}>'s **${app?.label || key}** application.${reason ? ` Reason given: ${reason}` : ""}`, COLORS.danger);
 }
 
