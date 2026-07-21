@@ -418,11 +418,14 @@ function setApplication(guildId, key, patch) {
 function migrateApplicationsToHomeGuild() {
   if (!GUILD_ID) return;
   if (Object.keys(getApplications(GUILD_ID)).length) return;
-  const FAMILY_Q = (fam) => ([
-    "How old are you?",
-    "Whats your discord and ingame name",
-    `Why do you want to join ${fam}?`,
-    "How will you help?",
+  const FAMILY_Q = () => ([
+    "What's your Ingame username?",
+    "What's so special about this crime family to you?",
+    "Why would you be a good pick for this family?",
+    "What is your current k/d (guess if not known)",
+    "How long have you been playing little Italy?",
+    "How active can you be on a weekly basis?",
+    "Have you been in any gangs or factions in other servers? If so explain in depth what rank you achieved and why? As well, are you still in it, if not why?",
   ]);
   const apps = {
     gambino: {
@@ -430,14 +433,14 @@ function migrateApplicationsToHomeGuild() {
       panelChannelId: "1528798524660252814", panelMessageId: "",
       reviewChannelId: "1529100361720266803",
       acceptedRoleIds: ["1528801101003096295", "1528801216518426866", "1528802048131338330"],
-      questions: FAMILY_Q("Gambino"), minAge: 14, minMemberTime: "3 days",
+      questions: FAMILY_Q(), minAge: 14, minMemberTime: "3 days",
     },
     colombo: {
       key: "colombo", label: "Colombo", emoji: "🕴️",
       panelChannelId: "1528798524660252814", panelMessageId: "",
       reviewChannelId: "1528805634995261520",
       acceptedRoleIds: ["1528801101003096295", "1528802048131338330", "1528801296411394148"],
-      questions: FAMILY_Q("Colombo"), minAge: 14, minMemberTime: "3 days",
+      questions: FAMILY_Q(), minAge: 14, minMemberTime: "3 days",
     },
     staff: {
       key: "staff", label: "Staff", emoji: "🛡️",
@@ -460,13 +463,12 @@ function migrateApplicationsToHomeGuild() {
       reviewChannelId: "1528754488339464192",
       acceptedRoleIds: ["1528754363726827572", "1528754358697853050", "1528754369019777034"],
       questions: [
-        "What's your Ingame username?",
-        "What's so special about this crime family to you?",
-        "Why would you be a good pick for this family?",
-        "What is your current k/d (guess if not known)",
-        "How long have you been playing little Italy?",
-        "How active can you be on a weekly basis?",
-        "Have you been in any gangs or factions in other servers? If so explain in depth what rank you achieved and why? As well, are you still in it, if not why?",
+        "How old are you?",
+        "Whats your discord and ingame name",
+        "Why do you want to join the NYPD?",
+        "How will you help?",
+        "What would you do if someone is robbing a gun store?",
+        "A higher up is giving an unlawful order, what will you do?",
       ],
       minAge: 14, minMemberTime: "1 week",
     },
@@ -518,14 +520,15 @@ function migrateStaffQuestionsV2() {
 }
 migrateStaffQuestionsV2();
 
-// Backfill the new NYPD application questions onto the home guild's
-// already-seeded nypd app. Runs once, guarded by nypdQuestionsV2, so it
-// never clobbers a later manual edit via /applications setquestions.
-function migrateNypdQuestionsV2() {
+// Backfill the new crime-family application questions onto the home guild's
+// already-seeded gambino/colombo apps. Runs once, guarded by
+// familyQuestionsV2, so it never clobbers a later manual edit via
+// /applications setquestions.
+function migrateFamilyQuestionsV2() {
   if (!GUILD_ID) return;
   const cfg = applicationConfigs[GUILD_ID];
-  if (!cfg || !cfg.apps || cfg.nypdQuestionsV2) return;
-  if (cfg.apps.nypd) cfg.apps.nypd.questions = [
+  if (!cfg || !cfg.apps || cfg.familyQuestionsV2) return;
+  const questions = [
     "What's your Ingame username?",
     "What's so special about this crime family to you?",
     "Why would you be a good pick for this family?",
@@ -534,11 +537,12 @@ function migrateNypdQuestionsV2() {
     "How active can you be on a weekly basis?",
     "Have you been in any gangs or factions in other servers? If so explain in depth what rank you achieved and why? As well, are you still in it, if not why?",
   ];
-  cfg.nypdQuestionsV2 = true;
+  for (const key of ["gambino", "colombo"]) if (cfg.apps[key]) cfg.apps[key].questions = questions;
+  cfg.familyQuestionsV2 = true;
   saveApplicationConfig(GUILD_ID);
-  console.log(`📝 Applied updated NYPD application questions for home guild (${GUILD_ID})`);
+  console.log(`📝 Applied updated crime-family application questions for home guild (${GUILD_ID})`);
 }
-migrateNypdQuestionsV2();
+migrateFamilyQuestionsV2();
 
 function addWarning(guildId, userId, reason, by) {
   if (!warnings[guildId]) warnings[guildId] = {};
