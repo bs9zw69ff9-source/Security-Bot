@@ -87,10 +87,10 @@ invocation of a hidden owner command is written to the local
 
 - **Anti-nuke** - watches the audit log for channel/role mass-delete or
   mass-create, ban/kick floods, webhook abuse, dangerous permission
-  escalation, dangerous role grants, unauthorized bot adds, and mass
-  emoji/sticker deletion. Responders strip dangerous roles and ban (or
-  kick, or de-perm) the executor. Several responses in a short window
-  trigger a server-wide emergency lockdown.
+  escalation, unauthorized bot adds, and mass emoji/sticker deletion.
+  Responders strip dangerous roles and ban (or kick, or de-perm) the
+  executor. Several responses in a short window trigger a server-wide
+  emergency lockdown.
 - **Anti-raid** - join-velocity detection with a timed lockdown, plus
   optional quarantine (kick) of brand-new accounts joining during
   lockdown.

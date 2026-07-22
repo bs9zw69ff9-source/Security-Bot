@@ -169,23 +169,6 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
         break;
       }
 
-      case AuditLogEvent.MemberRoleUpdate: {
-        const added = entry.changes?.find(c => c.key === "$add")?.new || [];
-        const dangerous = added.filter(r => {
-          const role = guild.roles.cache.get(r.id);
-          return role && role.permissions.any(DANGER_PERMS);
-        });
-        if (!dangerous.length) break;
-        const target = await guild.members.fetch(targetId).catch(() => null);
-        if (target) await target.roles.remove(dangerous.map(r => r.id), "Anti-nuke: revert dangerous role grant").catch(() => {});
-        alertOwner(guild, `<@${executorId}> just gave <@${targetId}> some dangerous role(s): ${dangerous.map(r => `<@&${r.id}>`).join(", ")}. I've taken them back off.`, COLORS.warn, "Role Grant Reverted");
-        if (bump(guild.id, executorId, "dangerGrant", config.nukeMemberRoleThreshold)) {
-          resetBump(guild.id, executorId, "dangerGrant");
-          return nukeResponse(guild, executor, `Granted dangerous roles ${config.nukeMemberRoleThreshold}+ times in ${config.nukeWindowMs / 1000}s`);
-        }
-        break;
-      }
-
       case AuditLogEvent.BotAdd: {
         const added = await guild.members.fetch(targetId).catch(() => null);
         if (config.nukeBotAddAction === "kick" && added && added.kickable)

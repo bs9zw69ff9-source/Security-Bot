@@ -504,7 +504,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "Role Del/Create", value: `≥ ${config.nukeRoleThreshold} / ${config.nukeRoleCreateThresh}`, inline: true },
           { name: "Bans / Kicks", value: `≥ ${config.nukeBanThreshold} / ${config.nukeKickThreshold}`, inline: true },
           { name: "Webhooks", value: `≥ ${config.nukeWebhookThreshold}`, inline: true },
-          { name: "Dangerous grants", value: `≥ ${config.nukeMemberRoleThreshold}`, inline: true },
           { name: "Bot add", value: `${config.nukeBotAddAction}`, inline: true },
           { name: "⚠️ Warn Escalation", value: `mute @ ${config.warnMuteAt} (${config.warnMuteMin}m) · kick @ ${config.warnKickAt} · ban @ ${config.warnBanAt}`, inline: false },
           { name: `📊 Mod Daily Limits (${windowHours}h - whitelisted exempt)`, value: "​", inline: false },
