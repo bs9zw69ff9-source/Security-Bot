@@ -305,10 +305,32 @@ git-ignored - they're state, not source. A `security_log.jsonl` forensic
 trail is also appended locally for every security event, so it survives a
 wiped log channel.
 
+## Code layout
+
+`index.js` is just the entry point/orchestrator now (boot sequence, the
+`messageCreate` anti-spam/anti-ping dispatch, the periodic sweep, and the
+test-suite exports) - the actual bot lives in:
+
+- `lib/` - low-level shared pieces: SQLite persistence (`db.js`), env config
+  and constants (`config.js`), the Discord client instance (`client.js`),
+  embed/logging helpers (`embeds.js`), permission checks (`permissions.js`)
+- `state/` - per-guild config get/set (and home-guild seed migrations) for
+  each persisted table: guild settings, mod rate limits, lockdown, anti-ping,
+  muted-role stash, warnings, tickets, applications, chain of command
+- `systems/` - feature logic: mute/unmute, anti-spam, anti-ping, anti-raid,
+  anti-nuke, snapshot/rollback, failsafe, message logging, hidden owner
+  commands, `/setup` helpers, the ticket system, the application system, the
+  police manual, and the chain-of-command boards - each attaches its own
+  Discord event listeners as a side effect of being required
+- `commands/` - slash-command definitions (`definitions.js`), registration
+  (`register.js`), and the `/`-command switch (`handler.js`)
+
+`shard.js` is unaffected - it still just spawns `index.js` per shard.
+
 ## Development
 
 ```bash
-npm run check   # syntax check (node --check) for index.js and shard.js
+npm run check   # syntax check (node --check) for index.js, shard.js, and every lib/state/systems/commands file
 npm run lint    # eslint .
 npm test        # node --test - unit tests for config merging, per-guild rate
                  # limits/lockdown isolation (incl. surviving a simulated

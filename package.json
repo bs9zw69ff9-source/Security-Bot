@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node index.js",
     "start:sharded": "node shard.js",
-    "check": "node --check index.js && node --check shard.js",
+    "check": "node --check index.js && node --check shard.js && for f in lib/*.js state/*.js systems/*.js commands/*.js; do node --check \"$f\" || exit 1; done",
     "test": "node --test",
     "lint": "eslint ."
   },
