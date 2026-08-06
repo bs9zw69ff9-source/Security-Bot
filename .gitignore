@@ -14,3 +14,6 @@ warnings.json
 guildsettings.json
 guild_snapshot.json
 failsafe_backup.json
+
+# Rust build artifacts
+rust/target/

@@ -327,6 +327,15 @@ test-suite exports) - the actual bot lives in:
 
 `shard.js` is unaffected - it still just spawns `index.js` per shard.
 
+## Rust port
+
+A feature-for-feature Rust port lives in [`rust/`](rust/) (serenity + tokio +
+rusqlite). It speaks the same `guardian.db` schema as this bot - byte-identical
+rows - so the two are drop-in swappable without migrating state. See
+[`rust/README.md`](rust/README.md) for how to build and run it, and for the
+handful of runtime-level differences. Run only one implementation against a
+given database at a time.
+
 ## Development
 
 ```bash
