@@ -91,6 +91,12 @@ invocation of a hidden owner command is written to the local
   Responders strip dangerous roles and ban (or kick, or de-perm) the
   executor. Several responses in a short window trigger a server-wide
   emergency lockdown.
+  On top of the per-category limits there is one shared counter
+  (`NUKE_TOTAL_THRESHOLD`, default 3) fed by every destructive action. Without
+  it, an attacker could stay just under each individual threshold and rack up
+  more than twenty actions across categories before anything fired. The shared
+  counter caps the total no matter how the actions are mixed. Set it to `0` to
+  turn the aggregate check off and fall back to per-category limits only.
 - **Anti-raid** - join-velocity detection with a timed lockdown, plus
   optional quarantine (kick) of brand-new accounts joining during
   lockdown.

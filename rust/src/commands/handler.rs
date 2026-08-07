@@ -25,7 +25,7 @@ use crate::state::mod_rates::{check_mod_limit, record_mod_action};
 use crate::state::muted_roles::stashed_count;
 use crate::state::tickets::{get_ticket_config, update_ticket_config, TicketType};
 use crate::state::warnings::{add_warning, clear_warnings, get_warnings};
-use crate::systems::anti_nuke::{bump, nuke_response, reset_bump};
+use crate::systems::anti_nuke::{bump_destructive, nuke_response, total_reason, Trip};
 use crate::systems::applications::{apps_by_panel_channel, refresh_app_panel, render_channel_panel};
 use crate::systems::chain_of_command::render_chain_of_command;
 use crate::systems::mute::{lock_all_text_channels, mute_user, set_send_messages, unlock_all_text_channels, unmute_user};
@@ -250,20 +250,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return reply_text(ctx, i, &why).await;
             }
             if !exempt {
-                if bump(&gid, &i.user.id.to_string(), "kicks", CONFIG.nuke_kick_threshold) {
-                    reset_bump(&gid, &i.user.id.to_string(), "kicks");
+                if let Some(trip) = bump_destructive(&gid, &i.user.id.to_string(), "kicks", CONFIG.nuke_kick_threshold) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
-                    return nuke_response(
-                        ctx,
-                        guild_id,
-                        i.user.id,
-                        &format!(
+                    let reason = if trip == Trip::Category {
+                        format!(
                             "Issued {}+ kicks via commands in {}s",
                             CONFIG.nuke_kick_threshold,
                             CONFIG.nuke_window_ms / 1000
-                        ),
-                    )
-                    .await;
+                        )
+                    } else {
+                        total_reason()
+                    };
+                    return nuke_response(ctx, guild_id, i.user.id, &reason).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "kick");
                 if !c.allowed {
@@ -308,20 +306,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return reply_text(ctx, i, &why).await;
             }
             if !exempt {
-                if bump(&gid, &i.user.id.to_string(), "bans", CONFIG.nuke_ban_threshold) {
-                    reset_bump(&gid, &i.user.id.to_string(), "bans");
+                if let Some(trip) = bump_destructive(&gid, &i.user.id.to_string(), "bans", CONFIG.nuke_ban_threshold) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
-                    return nuke_response(
-                        ctx,
-                        guild_id,
-                        i.user.id,
-                        &format!(
+                    let reason = if trip == Trip::Category {
+                        format!(
                             "Issued {}+ bans via commands in {}s",
                             CONFIG.nuke_ban_threshold,
                             CONFIG.nuke_window_ms / 1000
-                        ),
-                    )
-                    .await;
+                        )
+                    } else {
+                        total_reason()
+                    };
+                    return nuke_response(ctx, guild_id, i.user.id, &reason).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "ban");
                 if !c.allowed {
@@ -449,20 +445,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             let lock = opts.str("action").unwrap_or("lock") == "lock";
             let channel_id = opts.channel("channel").unwrap_or(i.channel_id);
             if lock && !exempt {
-                if bump(&gid, &i.user.id.to_string(), "chLock", CONFIG.nuke_channel_threshold) {
-                    reset_bump(&gid, &i.user.id.to_string(), "chLock");
+                if let Some(trip) = bump_destructive(&gid, &i.user.id.to_string(), "chLock", CONFIG.nuke_channel_threshold) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
-                    return nuke_response(
-                        ctx,
-                        guild_id,
-                        i.user.id,
-                        &format!(
+                    let reason = if trip == Trip::Category {
+                        format!(
                             "Locked {}+ channels via commands in {}s",
                             CONFIG.nuke_channel_threshold,
                             CONFIG.nuke_window_ms / 1000
-                        ),
-                    )
-                    .await;
+                        )
+                    } else {
+                        total_reason()
+                    };
+                    return nuke_response(ctx, guild_id, i.user.id, &reason).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "lockdown");
                 if !c.allowed {
@@ -1030,6 +1024,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .field("Bans / Kicks", format!("≥ {} / {}", CONFIG.nuke_ban_threshold, CONFIG.nuke_kick_threshold), true)
                 .field("Webhooks", format!("≥ {}", CONFIG.nuke_webhook_threshold), true)
                 .field("Bot add", CONFIG.nuke_bot_add_action.clone(), true)
+                .field("Any mix", if CONFIG.nuke_total_threshold > 0 { format!("≥ {}", CONFIG.nuke_total_threshold) } else { "off".to_string() }, true)
                 .field("⚠️ Warn Escalation", format!("mute @ {} ({}m) · kick @ {} · ban @ {}", CONFIG.warn_mute_at, CONFIG.warn_mute_min, CONFIG.warn_kick_at, CONFIG.warn_ban_at), false)
                 .field(format!("📊 Mod Daily Limits ({window_hours}h - whitelisted exempt)"), "\u{200b}", false)
                 .field("🔨 Bans", CONFIG.mod_ban_limit.to_string(), true)

@@ -22,6 +22,11 @@ fn env_bool_default_true(key: &str) -> bool {
 fn env_bool_default_false(key: &str) -> bool {
     matches!(env_str(key).as_deref(), Some("true"))
 }
+/// Like [`env_int`] but accepts an explicit `0` instead of treating it as unset -
+/// needed wherever 0 is a meaningful value (e.g. "disable this check").
+fn env_int_allow_zero(key: &str, default: i64) -> i64 {
+    env_str(key).and_then(|s| s.parse::<i64>().ok()).unwrap_or(default)
+}
 fn env_csv(key: &str) -> Vec<String> {
     env_str(key)
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
@@ -94,6 +99,9 @@ pub struct Config {
     pub nuke_webhook_threshold: usize,
     pub nuke_bot_add_action: String,
     pub nuke_emoji_threshold: usize,
+    /// Shared across EVERY destructive action, so a nuke split across
+    /// categories can't stay under each individual threshold. 0 disables it.
+    pub nuke_total_threshold: usize,
 
     // Nuke recovery + hardening
     pub snapshot_interval_ms: u64,
@@ -156,14 +164,15 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| Config {
 
     nuke_window_ms: env_int("NUKE_WINDOW_MS", 10000),
     nuke_channel_threshold: env_int("NUKE_CHANNEL_THRESHOLD", 3) as usize,
-    nuke_channel_create_thresh: env_int("NUKE_CHANNEL_CREATE_THRESH", 4) as usize,
+    nuke_channel_create_thresh: env_int("NUKE_CHANNEL_CREATE_THRESH", 3) as usize,
     nuke_role_threshold: env_int("NUKE_ROLE_THRESHOLD", 3) as usize,
-    nuke_role_create_thresh: env_int("NUKE_ROLE_CREATE_THRESH", 4) as usize,
-    nuke_ban_threshold: env_int("NUKE_BAN_THRESHOLD", 5) as usize,
-    nuke_kick_threshold: env_int("NUKE_KICK_THRESHOLD", 5) as usize,
+    nuke_role_create_thresh: env_int("NUKE_ROLE_CREATE_THRESH", 3) as usize,
+    nuke_ban_threshold: env_int("NUKE_BAN_THRESHOLD", 3) as usize,
+    nuke_kick_threshold: env_int("NUKE_KICK_THRESHOLD", 3) as usize,
     nuke_webhook_threshold: env_int("NUKE_WEBHOOK_THRESHOLD", 3) as usize,
     nuke_bot_add_action: env_str("NUKE_BOT_ADD_ACTION").unwrap_or_else(|| "kick".to_string()),
-    nuke_emoji_threshold: env_int("NUKE_EMOJI_THRESHOLD", 5) as usize,
+    nuke_emoji_threshold: env_int("NUKE_EMOJI_THRESHOLD", 3) as usize,
+    nuke_total_threshold: env_int_allow_zero("NUKE_TOTAL_THRESHOLD", 3) as usize,
 
     snapshot_interval_ms: env_int("SNAPSHOT_INTERVAL_MS", 1_800_000) as u64,
     snapshot_max: env_int("SNAPSHOT_MAX", 5) as usize,

@@ -57,6 +57,42 @@ pub fn reset_bump(guild_id: &str, user_id: &str, key: &str) {
     }
 }
 
+/// Shared counter fed by EVERY destructive action, on top of the per-category
+/// one. Without it a nuke that spreads itself across categories (a couple of
+/// channel deletes, a couple of bans, a couple of webhooks) stays under every
+/// individual threshold and never trips anything - the per-category limits sum
+/// to ~24 free actions. This caps the total regardless of the mix.
+const TOTAL_KEY: &str = "allDestructive";
+
+/// Which counter actually crossed its line, so the alert can name the real reason.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Trip {
+    Category,
+    Total,
+}
+
+/// Feeds both the per-category counter and the shared one. Returns `None` when
+/// nothing tripped.
+pub fn bump_destructive(guild_id: &str, user_id: &str, key: &str, threshold: usize) -> Option<Trip> {
+    let over_category = bump(guild_id, user_id, key, threshold);
+    // A total threshold of 0 disables the aggregate check entirely.
+    let over_total = CONFIG.nuke_total_threshold > 0 && bump(guild_id, user_id, TOTAL_KEY, CONFIG.nuke_total_threshold);
+    if !over_category && !over_total {
+        return None;
+    }
+    reset_bump(guild_id, user_id, key);
+    reset_bump(guild_id, user_id, TOTAL_KEY);
+    Some(if over_category { Trip::Category } else { Trip::Total })
+}
+
+pub fn total_reason() -> String {
+    format!(
+        "{}+ destructive actions in {}s",
+        CONFIG.nuke_total_threshold,
+        CONFIG.nuke_window_ms / 1000
+    )
+}
+
 /// Push a timestamp for this guild's nuke-storm tracker; returns true once the
 /// per-guild threshold is reached (and resets that guild's counter).
 pub fn bump_storm(guild_id: &str) -> bool {
@@ -254,8 +290,8 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
         _ => None,
     };
     if let Some((key, threshold, reason)) = simple {
-        if bump(&gid, &uid, key, threshold) {
-            reset_bump(&gid, &uid, key);
+        if let Some(trip) = bump_destructive(&gid, &uid, key, threshold) {
+            let reason = if trip == Trip::Category { reason } else { total_reason() };
             nuke_response(ctx, guild_id, executor_id, &reason).await;
         }
         return;
@@ -263,8 +299,7 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
 
     match entry.action {
         Action::Webhook(WebhookAction::Create) => {
-            if bump(&gid, &uid, "webhooks", CONFIG.nuke_webhook_threshold) {
-                reset_bump(&gid, &uid, "webhooks");
+            if let Some(trip) = bump_destructive(&gid, &uid, "webhooks", CONFIG.nuke_webhook_threshold) {
                 // Clean up whatever this user's webhooks were, best effort.
                 if let Ok(channels) = guild_id.channels(&ctx.http).await {
                     for (cid, _) in channels {
@@ -275,13 +310,12 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
                         }
                     }
                 }
-                nuke_response(
-                    ctx,
-                    guild_id,
-                    executor_id,
-                    &format!("Created {}+ webhooks in {win}s", CONFIG.nuke_webhook_threshold),
-                )
-                .await;
+                let reason = if trip == Trip::Category {
+                    format!("Created {}+ webhooks in {win}s", CONFIG.nuke_webhook_threshold)
+                } else {
+                    total_reason()
+                };
+                nuke_response(ctx, guild_id, executor_id, &reason).await;
             }
         }
 
@@ -305,9 +339,13 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
                 "Permission Change Reverted",
             )
             .await;
-            if bump(&gid, &uid, "permEsc", 3) {
-                reset_bump(&gid, &uid, "permEsc");
-                nuke_response(ctx, guild_id, executor_id, "Repeated permission escalation").await;
+            if let Some(trip) = bump_destructive(&gid, &uid, "permEsc", 3) {
+                let reason = if trip == Trip::Category {
+                    "Repeated permission escalation".to_string()
+                } else {
+                    total_reason()
+                };
+                nuke_response(ctx, guild_id, executor_id, &reason).await;
             }
         }
 
@@ -392,4 +430,56 @@ fn permission_change(changes: &[serenity::model::guild::audit_log::Change]) -> O
         Change::Permissions { old, new } => Some((old.unwrap_or_else(Permissions::empty), new.unwrap_or_else(Permissions::empty))),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gap this closes: rotating through categories used to keep every
+    /// per-category counter under its own limit, so an attacker got the sum of
+    /// all of them for free. The shared counter has to catch that.
+    #[test]
+    fn rotating_categories_trips_on_the_shared_counter() {
+        let cats = [
+            ("chDel", CONFIG.nuke_channel_threshold),
+            ("chCreate", CONFIG.nuke_channel_create_thresh),
+            ("roleDel", CONFIG.nuke_role_threshold),
+            ("roleCreate", CONFIG.nuke_role_create_thresh),
+            ("bans", CONFIG.nuke_ban_threshold),
+            ("kicks", CONFIG.nuke_kick_threshold),
+            ("webhooks", CONFIG.nuke_webhook_threshold),
+            ("emojiDel", CONFIG.nuke_emoji_threshold),
+        ];
+        nuke_lock().clear();
+        let mut landed = 0;
+        let mut trip = None;
+        for i in 0..100 {
+            let (key, threshold) = cats[i % cats.len()];
+            landed += 1;
+            trip = bump_destructive("g", "rotating", key, threshold);
+            if trip.is_some() {
+                break;
+            }
+        }
+        assert!(trip == Some(Trip::Total), "a rotating attack must trip the shared counter");
+        assert_eq!(landed, CONFIG.nuke_total_threshold, "no more actions may land than the shared threshold allows");
+    }
+
+    /// Hammering one category still trips that category, not the shared one.
+    #[test]
+    fn single_category_burst_still_trips_its_own_counter() {
+        nuke_lock().clear();
+        let mut landed = 0;
+        let mut trip = None;
+        for _ in 0..100 {
+            landed += 1;
+            trip = bump_destructive("g", "burst", "chDel", CONFIG.nuke_channel_threshold);
+            if trip.is_some() {
+                break;
+            }
+        }
+        assert!(trip.is_some());
+        assert_eq!(landed, CONFIG.nuke_channel_threshold.min(CONFIG.nuke_total_threshold));
+    }
 }

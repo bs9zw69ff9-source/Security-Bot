@@ -29,6 +29,29 @@ function resetBump(guildId, userId, key) {
   entry[key] = [];
 }
 
+// Shared counter fed by EVERY destructive action, on top of the per-category
+// one. Without it a nuke that spreads itself across categories (a couple of
+// channel deletes, a couple of bans, a couple of webhooks) stays under every
+// individual threshold and never trips anything - the per-category limits sum
+// to ~24 free actions. This caps the total regardless of the mix.
+const TOTAL_KEY = "allDestructive";
+
+// Returns null (nothing tripped), "category", or "total" - so the alert can
+// name the reason that actually fired.
+function bumpDestructive(guildId, userId, key, threshold) {
+  const overCategory = bump(guildId, userId, key, threshold);
+  // A total threshold of 0 disables the aggregate check entirely.
+  const overTotal = config.nukeTotalThreshold > 0 &&
+    bump(guildId, userId, TOTAL_KEY, config.nukeTotalThreshold);
+  if (!overCategory && !overTotal) return null;
+  resetBump(guildId, userId, key);
+  resetBump(guildId, userId, TOTAL_KEY);
+  return overCategory ? "category" : "total";
+}
+
+const totalReason = () =>
+  `${config.nukeTotalThreshold}+ destructive actions in ${config.nukeWindowMs / 1000}s`;
+
 // ── Nuke-storm: multiple nuke responses in a short window → server-wide lockdown ──
 const nukeStormTracker = new Map(); // gid -> [timestamps]
 // Push a timestamp for this guild's nuke-storm tracker; returns true once the
@@ -101,59 +124,62 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
 
     switch (action) {
       case AuditLogEvent.ChannelDelete:
-        if (bump(guild.id, executorId, "chDel", config.nukeChannelThreshold)) {
-          resetBump(guild.id, executorId, "chDel");
-          return nukeResponse(guild, executor, `Deleted ${config.nukeChannelThreshold}+ channels in ${config.nukeWindowMs / 1000}s`);
+        {
+          const trip = bumpDestructive(guild.id, executorId, "chDel", config.nukeChannelThreshold);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? `Deleted ${config.nukeChannelThreshold}+ channels in ${config.nukeWindowMs / 1000}s` : totalReason());
         }
         break;
 
       case AuditLogEvent.ChannelCreate:
-        if (bump(guild.id, executorId, "chCreate", config.nukeChannelCreateThresh)) {
-          resetBump(guild.id, executorId, "chCreate");
-          return nukeResponse(guild, executor, `Created ${config.nukeChannelCreateThresh}+ channels in ${config.nukeWindowMs / 1000}s`);
+        {
+          const trip = bumpDestructive(guild.id, executorId, "chCreate", config.nukeChannelCreateThresh);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? `Created ${config.nukeChannelCreateThresh}+ channels in ${config.nukeWindowMs / 1000}s` : totalReason());
         }
         break;
 
       case AuditLogEvent.RoleDelete:
-        if (bump(guild.id, executorId, "roleDel", config.nukeRoleThreshold)) {
-          resetBump(guild.id, executorId, "roleDel");
-          return nukeResponse(guild, executor, `Deleted ${config.nukeRoleThreshold}+ roles in ${config.nukeWindowMs / 1000}s`);
+        {
+          const trip = bumpDestructive(guild.id, executorId, "roleDel", config.nukeRoleThreshold);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? `Deleted ${config.nukeRoleThreshold}+ roles in ${config.nukeWindowMs / 1000}s` : totalReason());
         }
         break;
 
       case AuditLogEvent.RoleCreate:
-        if (bump(guild.id, executorId, "roleCreate", config.nukeRoleCreateThresh)) {
-          resetBump(guild.id, executorId, "roleCreate");
-          return nukeResponse(guild, executor, `Created ${config.nukeRoleCreateThresh}+ roles in ${config.nukeWindowMs / 1000}s`);
+        {
+          const trip = bumpDestructive(guild.id, executorId, "roleCreate", config.nukeRoleCreateThresh);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? `Created ${config.nukeRoleCreateThresh}+ roles in ${config.nukeWindowMs / 1000}s` : totalReason());
         }
         break;
 
       case AuditLogEvent.MemberBanAdd:
-        if (bump(guild.id, executorId, "bans", config.nukeBanThreshold)) {
-          resetBump(guild.id, executorId, "bans");
-          return nukeResponse(guild, executor, `Issued ${config.nukeBanThreshold}+ bans in ${config.nukeWindowMs / 1000}s`);
+        {
+          const trip = bumpDestructive(guild.id, executorId, "bans", config.nukeBanThreshold);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? `Issued ${config.nukeBanThreshold}+ bans in ${config.nukeWindowMs / 1000}s` : totalReason());
         }
         break;
 
       case AuditLogEvent.MemberKick:
       case AuditLogEvent.MemberPrune:
-        if (bump(guild.id, executorId, "kicks", config.nukeKickThreshold)) {
-          resetBump(guild.id, executorId, "kicks");
-          return nukeResponse(guild, executor, `Removed ${config.nukeKickThreshold}+ members in ${config.nukeWindowMs / 1000}s`);
+        {
+          const trip = bumpDestructive(guild.id, executorId, "kicks", config.nukeKickThreshold);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? `Removed ${config.nukeKickThreshold}+ members in ${config.nukeWindowMs / 1000}s` : totalReason());
         }
         break;
 
-      case AuditLogEvent.WebhookCreate:
-        if (bump(guild.id, executorId, "webhooks", config.nukeWebhookThreshold)) {
-          resetBump(guild.id, executorId, "webhooks");
+      case AuditLogEvent.WebhookCreate: {
+        const trip = bumpDestructive(guild.id, executorId, "webhooks", config.nukeWebhookThreshold);
+        if (trip) {
           const chId = entry.changes?.find(c => c.key === "channel_id")?.new || entry.extra?.channel?.id;
           const channel = chId ? guild.channels.cache.get(chId) : null;
           const hooks = channel ? await channel.fetchWebhooks().catch(() => null) : null;
           if (hooks) for (const wh of hooks.filter(w => w.owner?.id === executorId).values())
             await wh.delete("Anti-nuke: webhook abuse").catch(() => {});
-          return nukeResponse(guild, executor, `Created ${config.nukeWebhookThreshold}+ webhooks in ${config.nukeWindowMs / 1000}s`);
+          return nukeResponse(guild, executor, trip === "category"
+            ? `Created ${config.nukeWebhookThreshold}+ webhooks in ${config.nukeWindowMs / 1000}s`
+            : totalReason());
         }
         break;
+      }
 
       case AuditLogEvent.RoleUpdate: {
         const permChange = entry.changes?.find(c => c.key === "permissions");
@@ -165,7 +191,10 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
         const role = guild.roles.cache.get(targetId);
         if (role && role.editable) await role.setPermissions(oldP, "Anti-nuke: revert perm escalation").catch(() => {});
         alertOwner(guild, `<@${executorId}> just handed <@&${targetId}> some dangerous permissions. I've rolled that back.`, COLORS.warn, "Permission Change Reverted");
-        if (bump(guild.id, executorId, "permEsc", 3)) { resetBump(guild.id, executorId, "permEsc"); return nukeResponse(guild, executor, "Repeated permission escalation"); }
+        {
+          const trip = bumpDestructive(guild.id, executorId, "permEsc", 3);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? "Repeated permission escalation" : totalReason());
+        }
         break;
       }
 
@@ -195,9 +224,9 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
 
       case AuditLogEvent.EmojiDelete:
       case AuditLogEvent.StickerDelete:
-        if (bump(guild.id, executorId, "emojiDel", config.nukeEmojiThreshold)) {
-          resetBump(guild.id, executorId, "emojiDel");
-          return nukeResponse(guild, executor, `Deleted ${config.nukeEmojiThreshold}+ emojis/stickers in ${config.nukeWindowMs / 1000}s`);
+        {
+          const trip = bumpDestructive(guild.id, executorId, "emojiDel", config.nukeEmojiThreshold);
+          if (trip) return nukeResponse(guild, executor, trip === "category" ? `Deleted ${config.nukeEmojiThreshold}+ emojis/stickers in ${config.nukeWindowMs / 1000}s` : totalReason());
         }
         break;
 
@@ -212,6 +241,6 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
 
 module.exports = {
   nukeTracker, nukeStormTracker,
-  getNukeEntry, pruneOld, bump, resetBump, bumpStorm,
+  getNukeEntry, pruneOld, bump, resetBump, bumpStorm, bumpDestructive, totalReason,
   nukeResponse, serverEmergencyLock,
 };

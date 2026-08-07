@@ -11,7 +11,7 @@ const { ap, setAntiPing, antiPingDefaults } = require("../state/antiPing");
 const { mutedRoles } = require("../state/mutedRoles");
 const { addWarning, getWarnings, clearWarnings } = require("../state/warnings");
 const { muteUser, unmuteUser } = require("../systems/mute");
-const { bump, resetBump, nukeResponse } = require("../systems/antiNuke");
+const { bumpDestructive, totalReason, nukeResponse } = require("../systems/antiNuke");
 const { buildSetupEmbed, quickSetupGuild } = require("../systems/setupHelpers");
 const { getTicketConfig, setTicketConfig } = require("../state/tickets");
 const { buildTicketPanelEmbed, buildTicketPanelRows } = require("../systems/tickets");
@@ -79,10 +79,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!guard.ok) return interaction.reply({ content: guard.why, ephemeral: true });
 
       if (!isWhitelisted(member)) {
-        if (bump(guild.id, member.id, "kicks", config.nukeKickThreshold)) {
-          resetBump(guild.id, member.id, "kicks");
+        const trip = bumpDestructive(guild.id, member.id, "kicks", config.nukeKickThreshold);
+        if (trip) {
           await interaction.reply({ content: "Hold on - that just tripped the anti-nuke protection.", ephemeral: true });
-          return nukeResponse(guild, member, `Issued ${config.nukeKickThreshold}+ kicks via commands in ${config.nukeWindowMs / 1000}s`);
+          return nukeResponse(guild, member, trip === "category"
+            ? `Issued ${config.nukeKickThreshold}+ kicks via commands in ${config.nukeWindowMs / 1000}s`
+            : totalReason());
         }
         const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "kick");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("kick", used, limit, resetsInMin)], ephemeral: true });
@@ -108,10 +110,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!guard.ok) return interaction.reply({ content: guard.why, ephemeral: true });
 
       if (!isWhitelisted(member)) {
-        if (bump(guild.id, member.id, "bans", config.nukeBanThreshold)) {
-          resetBump(guild.id, member.id, "bans");
+        const trip = bumpDestructive(guild.id, member.id, "bans", config.nukeBanThreshold);
+        if (trip) {
           await interaction.reply({ content: "Hold on - that just tripped the anti-nuke protection.", ephemeral: true });
-          return nukeResponse(guild, member, `Issued ${config.nukeBanThreshold}+ bans via commands in ${config.nukeWindowMs / 1000}s`);
+          return nukeResponse(guild, member, trip === "category"
+            ? `Issued ${config.nukeBanThreshold}+ bans via commands in ${config.nukeWindowMs / 1000}s`
+            : totalReason());
         }
         const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "ban");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("ban", used, limit, resetsInMin)], ephemeral: true });
@@ -175,10 +179,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const lock    = action === "lock";
 
       if (lock && !isWhitelisted(member)) {
-        if (bump(guild.id, member.id, "chLock", config.nukeChannelThreshold)) {
-          resetBump(guild.id, member.id, "chLock");
+        const trip = bumpDestructive(guild.id, member.id, "chLock", config.nukeChannelThreshold);
+        if (trip) {
           await interaction.reply({ content: "Hold on - that just tripped the anti-nuke protection.", ephemeral: true });
-          return nukeResponse(guild, member, `Locked ${config.nukeChannelThreshold}+ channels via commands in ${config.nukeWindowMs / 1000}s`);
+          return nukeResponse(guild, member, trip === "category"
+            ? `Locked ${config.nukeChannelThreshold}+ channels via commands in ${config.nukeWindowMs / 1000}s`
+            : totalReason());
         }
         const { allowed, used, limit, resetsInMin } = checkModLimit(guild.id, member.id, "lockdown");
         if (!allowed) return interaction.reply({ embeds: [limitDeniedEmbed("lockdown", used, limit, resetsInMin)], ephemeral: true });
@@ -505,6 +511,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "Bans / Kicks", value: `≥ ${config.nukeBanThreshold} / ${config.nukeKickThreshold}`, inline: true },
           { name: "Webhooks", value: `≥ ${config.nukeWebhookThreshold}`, inline: true },
           { name: "Bot add", value: `${config.nukeBotAddAction}`, inline: true },
+          { name: "Any mix", value: config.nukeTotalThreshold > 0 ? `≥ ${config.nukeTotalThreshold}` : "off", inline: true },
           { name: "⚠️ Warn Escalation", value: `mute @ ${config.warnMuteAt} (${config.warnMuteMin}m) · kick @ ${config.warnKickAt} · ban @ ${config.warnBanAt}`, inline: false },
           { name: `📊 Mod Daily Limits (${windowHours}h - whitelisted exempt)`, value: "​", inline: false },
           { name: "🔨 Bans", value: `${config.modBanLimit}`, inline: true },
