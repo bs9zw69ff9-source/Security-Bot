@@ -11,10 +11,12 @@ use crate::common::db;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LockdownState {
-    /// "raid" | "panic" | "nukestorm" | "manual"
+    /// "raid" | "panic" | "manual". "nukestorm" also appears in databases
+    /// written before the storm escalation was removed; it is still honoured on
+    /// boot so an old lock does not silently lift itself.
     pub reason: String,
     pub locked_at: i64,
-    /// `None` for manual/panic/nukestorm locks, which never auto-expire.
+    /// `None` for manual/panic locks, which never auto-expire.
     pub expires_at: Option<i64>,
 }
 

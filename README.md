@@ -141,14 +141,24 @@ invocation of a hidden owner command is written to the local
   mass-create, ban/kick floods, webhook abuse, dangerous permission
   escalation, unauthorized bot adds, and mass emoji/sticker deletion.
   Responders strip dangerous roles and ban (or kick, or de-perm) the
-  executor. Several responses in a short window trigger a server-wide
-  emergency lockdown.
+  executor.
   On top of the per-category limits there is one shared counter
   (`NUKE_TOTAL_THRESHOLD`, default 3) fed by every destructive action. Without
   it, an attacker could stay just under each individual threshold and rack up
   more than twenty actions across categories before anything fired. The shared
   counter caps the total no matter how the actions are mixed. Set it to `0` to
   turn the aggregate check off and fall back to per-category limits only.
+
+  Detection is deliberately front-loaded: counting is a plain in-memory
+  operation done before any network call, so the response fires on the
+  earliest audit-log entry that crosses the line rather than one HTTP round
+  trip later. The response then strips roles and bans *before* it alerts, and
+  only one response runs per user at a time, so entries still arriving from
+  actions already performed cannot start a second overlapping run.
+
+  Anti-nuke never locks the whole server down on its own. It acts on the
+  account responsible and leaves everyone else working; `/panic` is there when
+  a human decides a server-wide lock is warranted.
 - **Anti-raid** - join-velocity detection with a timed lockdown, plus
   optional quarantine (kick) of brand-new accounts joining during
   lockdown.

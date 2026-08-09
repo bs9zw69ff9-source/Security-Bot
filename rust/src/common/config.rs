@@ -106,8 +106,6 @@ pub struct Config {
     // Nuke recovery + hardening
     pub snapshot_interval_ms: u64,
     pub snapshot_max: usize,
-    pub nuke_storm_threshold: usize,
-    pub nuke_storm_window_ms: i64,
     pub scam_block: bool,
     pub owner_dm: bool,
 
@@ -176,8 +174,6 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| Config {
 
     snapshot_interval_ms: env_int("SNAPSHOT_INTERVAL_MS", 1_800_000) as u64,
     snapshot_max: env_int("SNAPSHOT_MAX", 5) as usize,
-    nuke_storm_threshold: env_int("NUKE_STORM_THRESHOLD", 3) as usize,
-    nuke_storm_window_ms: env_int("NUKE_STORM_WINDOW_MS", 60000),
     scam_block: env_bool_default_true("SCAM_BLOCK"),
     owner_dm: env_bool_default_true("OWNER_DM"),
 

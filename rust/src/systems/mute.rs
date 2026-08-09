@@ -292,9 +292,8 @@ pub async fn lift_lockdown_channels(ctx: &Context, guild_id: GuildId, note: &str
     sec_log(ctx, guild_id, "Lockdown Lifted", note, colors::SUCCESS).await;
 }
 
-/// Boot recovery: reschedule / expire raid lockdowns; leave panic and
-/// nuke-storm lockdowns active (they have no auto-expiry, same as before a
-/// restart).
+/// Boot recovery: reschedule / expire raid lockdowns; leave every other kind
+/// active (they have no auto-expiry, same as before a restart).
 pub async fn recover_lockdowns(ctx: &Context) {
     for (guild_id_str, state) in lockdown::all() {
         let Ok(raw) = guild_id_str.parse::<u64>() else { continue };
@@ -318,7 +317,7 @@ pub async fn recover_lockdowns(ctx: &Context) {
 }
 
 /// Lock every text channel in a guild for @everyone. Shared by the raid
-/// responder, the nuke-storm emergency lock, and /panic.
+/// responder and /panic.
 pub async fn lock_all_text_channels(ctx: &Context, guild_id: GuildId) -> usize {
     let channels = guild_id.channels(&ctx.http).await.unwrap_or_default();
     let everyone = RoleId::new(guild_id.get());
