@@ -15,45 +15,91 @@ use std::sync::Mutex;
 use crate::common::embeds::colors;
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
 
+/// One member, reduced to what a board actually needs.
+pub struct Holder {
+    pub id: u64,
+    pub name: String,
+    pub roles: Vec<RoleId>,
+}
+
+/// Every member of the guild, fetched over HTTP.
+///
+/// It has to be HTTP rather than `ctx.cache`. Serenity's cache is only ever
+/// filled by gateway events, and `GUILD_CREATE` sends just a slice of the
+/// member list (`large_threshold`, 50 by default). Reading the cache here
+/// meant most role holders simply weren't in it, and the board rendered
+/// "(none)" under roles that plainly had people in them. Note that the HTTP
+/// fetch does not populate the cache either - `Http` holds no reference to
+/// it - so the returned members have to be used directly.
+pub async fn fetch_holders(ctx: &Context, guild_id: GuildId) -> Vec<Holder> {
+    use serenity::futures::StreamExt;
+
+    // members_iter pages through in chunks of 1000; a plain members() call
+    // would silently stop at the first page.
+    let mut stream = Box::pin(guild_id.members_iter(&ctx.http));
+    let mut out = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(m) => out.push(Holder {
+                id: m.user.id.get(),
+                name: m.user.name.to_string(),
+                roles: m.roles.clone(),
+            }),
+            Err(e) => {
+                // Partial results still beat rendering an empty board, so keep
+                // whatever arrived before the failure.
+                eprintln!("⚠️ chain of command: member fetch stopped early: {e}");
+                break;
+            }
+        }
+    }
+    out
+}
+
 pub fn build_chain_of_command_embed(
     ctx: &Context,
     guild_id: GuildId,
     groups: &[ChainGroup],
     title: &str,
+    members: &[Holder],
 ) -> CreateEmbed {
+    // Roles, unlike members, are sent complete in GUILD_CREATE, so the cache is
+    // trustworthy here.
+    let existing_roles: Vec<RoleId> =
+        ctx.cache.guild(guild_id).map(|g| g.roles.keys().copied().collect()).unwrap_or_default();
+
+    CreateEmbed::new()
+        .color(colors::INFO)
+        .title(if title.is_empty() { "📋 Chain of Command" } else { title })
+        .timestamp(Timestamp::now())
+        .description(chain_description(groups, members, &existing_roles))
+}
+
+/// The board's description text. Split out from the embed so it can be tested
+/// without a live `Context`.
+fn chain_description(groups: &[ChainGroup], members: &[Holder], existing_roles: &[RoleId]) -> String {
     // Discord only resolves @mentions in an embed's description/field VALUE,
     // never in a field NAME - so roles have to live in the description
     // alongside their holders, not as field headers, or they render as raw
     // <@&id> text instead of an actual mention.
     let mut group_blocks: Vec<String> = Vec::new();
 
-    // Snapshot who holds what once, without holding the cache guard across an
-    // await (there are none here, but the guard is still kept tight).
-    let members: Vec<(u64, String, Vec<RoleId>)> = ctx
-        .cache
-        .guild(guild_id)
-        .map(|g| {
-            g.members
-                .values()
-                .map(|m| (m.user.id.get(), m.user.name.to_string(), m.roles.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let existing_roles: Vec<RoleId> =
-        ctx.cache.guild(guild_id).map(|g| g.roles.keys().copied().collect()).unwrap_or_default();
+    // If the role list is somehow empty, skip the existence filter rather than
+    // dropping every role and rendering an empty board.
+    let filter_missing_roles = !existing_roles.is_empty();
 
     for group in groups {
         let mut role_blocks: Vec<String> = Vec::new();
         for role_id_str in &group.role_ids {
             let Ok(raw) = role_id_str.parse::<u64>() else { continue };
             let role = RoleId::new(raw);
-            if !existing_roles.contains(&role) {
+            if filter_missing_roles && !existing_roles.contains(&role) {
                 continue;
             }
             let mut holders: Vec<(String, u64)> = members
                 .iter()
-                .filter(|(_, _, roles)| roles.contains(&role))
-                .map(|(id, name, _)| (name.clone(), *id))
+                .filter(|m| m.roles.contains(&role))
+                .map(|m| (m.name.clone(), m.id))
                 .collect();
             holders.sort_by(|a, b| a.0.cmp(&b.0));
             let body = if holders.is_empty() {
@@ -72,38 +118,42 @@ pub fn build_chain_of_command_embed(
         });
     }
 
-    let description = if group_blocks.is_empty() {
-        "None of the configured roles exist in this server anymore.".to_string()
-    } else {
-        let joined = group_blocks.join("\n\n");
-        // Discord counts the 4096 description limit in UTF-16 units.
-        if joined.encode_utf16().count() > 4096 {
-            let mut truncated = String::new();
-            let mut used = 0usize;
-            for ch in joined.chars() {
-                let w = ch.len_utf16();
-                if used + w > 4096 {
-                    break;
-                }
-                truncated.push(ch);
-                used += w;
-            }
-            truncated
-        } else {
-            joined
+    if group_blocks.is_empty() {
+        return "None of the configured roles exist in this server anymore.".to_string();
+    }
+    let joined = group_blocks.join("\n\n");
+    // Discord counts the 4096 description limit in UTF-16 units.
+    if joined.encode_utf16().count() <= 4096 {
+        return joined;
+    }
+    let mut truncated = String::new();
+    let mut used = 0usize;
+    for ch in joined.chars() {
+        let w = ch.len_utf16();
+        if used + w > 4096 {
+            break;
         }
-    };
-
-    CreateEmbed::new()
-        .color(colors::INFO)
-        .title(if title.is_empty() { "📋 Chain of Command" } else { title })
-        .timestamp(Timestamp::now())
-        .description(description)
+        truncated.push(ch);
+        used += w;
+    }
+    truncated
 }
 
 /// Post or refresh (edit-in-place) one board for a guild, if configured.
 /// Safe to call often - a no-op when that key isn't set up yet.
 pub async fn render_chain_of_command(ctx: &Context, guild_id: GuildId, key: &str) {
+    // Only worth paying for the member fetch if this board is actually set up.
+    let cfg = get_chain(&guild_id.to_string(), key);
+    if cfg.channel_id.is_empty() || cfg.groups.is_empty() {
+        return;
+    }
+    let members = fetch_holders(ctx, guild_id).await;
+    render_chain_of_command_with(ctx, guild_id, key, &members).await;
+}
+
+/// Render one board against an already-fetched member list, so a guild with
+/// several boards pays for one fetch rather than one per board.
+async fn render_chain_of_command_with(ctx: &Context, guild_id: GuildId, key: &str, members: &[Holder]) {
     let cfg = get_chain(&guild_id.to_string(), key);
     if cfg.channel_id.is_empty() || cfg.groups.is_empty() {
         return;
@@ -111,12 +161,7 @@ pub async fn render_chain_of_command(ctx: &Context, guild_id: GuildId, key: &str
     let Ok(raw) = cfg.channel_id.parse::<u64>() else { return };
     let channel = ChannelId::new(raw);
 
-    // Without a full member fetch, the cache only holds whoever the bot has
-    // already seen - most holders would be missing on a server it hasn't fully
-    // cached yet.
-    let _ = guild_id.members(&ctx.http, None, None).await;
-
-    let embed = build_chain_of_command_embed(ctx, guild_id, &cfg.groups, &cfg.title);
+    let embed = build_chain_of_command_embed(ctx, guild_id, &cfg.groups, &cfg.title, members);
 
     if !cfg.message_id.is_empty() {
         if let Ok(mid) = cfg.message_id.parse::<u64>() {
@@ -134,8 +179,13 @@ pub async fn render_chain_of_command(ctx: &Context, guild_id: GuildId, key: &str
 /// Render every board configured for a guild - used on boot/join and after a
 /// tracked role change, since either could touch any one of them.
 pub async fn render_all_chains_of_command(ctx: &Context, guild_id: GuildId) {
-    for key in get_chain_keys(&guild_id.to_string()) {
-        render_chain_of_command(ctx, guild_id, &key).await;
+    let keys = get_chain_keys(&guild_id.to_string());
+    if keys.is_empty() {
+        return;
+    }
+    let members = fetch_holders(ctx, guild_id).await;
+    for key in keys {
+        render_chain_of_command_with(ctx, guild_id, &key, &members).await;
     }
 }
 
@@ -174,4 +224,89 @@ pub fn schedule_chain_of_command_refresh(ctx: &Context, guild_id: GuildId) {
             render_all_chains_of_command(&ctx2, guild_id).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn holder(id: u64, name: &str, roles: &[u64]) -> Holder {
+        Holder {
+            id,
+            name: name.to_string(),
+            roles: roles.iter().map(|r| RoleId::new(*r)).collect(),
+        }
+    }
+
+    fn group(label: Option<&str>, roles: &[u64]) -> ChainGroup {
+        ChainGroup {
+            label: label.map(|s| s.to_string()),
+            role_ids: roles.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    /// The reported bug: a role with someone in it rendered as "(none)".
+    /// It happened because holders were read from a cache holding only a slice
+    /// of the guild, so the regression test is simply that a member passed in
+    /// actually shows up under their role.
+    #[test]
+    fn a_role_with_a_holder_does_not_render_as_none() {
+        let groups = [group(None, &[100, 200])];
+        let members = [holder(7, "alice", &[100])];
+        let out = chain_description(&groups, &members, &[RoleId::new(100), RoleId::new(200)]);
+
+        assert!(out.contains("<@&100>\n<@7>"), "role 100 should list its holder, got:\n{out}");
+        assert!(out.contains("<@&200>\n*(none)*"), "role 200 is genuinely empty, got:\n{out}");
+    }
+
+    #[test]
+    fn every_holder_of_a_role_is_listed_sorted_by_name() {
+        let groups = [group(None, &[100])];
+        let members = [
+            holder(3, "carol", &[100]),
+            holder(1, "alice", &[100]),
+            holder(2, "bob", &[100, 200]),
+        ];
+        let out = chain_description(&groups, &members, &[RoleId::new(100)]);
+        assert_eq!(out, "<@&100>\n<@1>\n<@2>\n<@3>");
+    }
+
+    #[test]
+    fn labeled_groups_render_as_sub_headers() {
+        let groups = [group(Some("Ranks"), &[100]), group(Some("Sub Classes"), &[200])];
+        let members = [holder(1, "alice", &[100]), holder(2, "bob", &[200])];
+        let out = chain_description(&groups, &members, &[RoleId::new(100), RoleId::new(200)]);
+        assert_eq!(out, "**Ranks**\n<@&100>\n<@1>\n\n**Sub Classes**\n<@&200>\n<@2>");
+    }
+
+    /// A role deleted from the server is dropped from the board entirely.
+    #[test]
+    fn roles_that_no_longer_exist_are_skipped() {
+        let groups = [group(None, &[100, 999])];
+        let members = [holder(1, "alice", &[100])];
+        let out = chain_description(&groups, &members, &[RoleId::new(100)]);
+        assert_eq!(out, "<@&100>\n<@1>");
+    }
+
+    /// An empty role list means "I don't know what exists", not "nothing
+    /// exists" - blanking the board there would be the same class of failure
+    /// as the original bug.
+    #[test]
+    fn an_unknown_role_list_does_not_blank_the_board() {
+        let groups = [group(None, &[100])];
+        let members = [holder(1, "alice", &[100])];
+        let out = chain_description(&groups, &members, &[]);
+        assert_eq!(out, "<@&100>\n<@1>");
+    }
+
+    #[test]
+    fn description_is_truncated_to_the_discord_limit_in_utf16_units() {
+        let role_ids: Vec<u64> = (1..=400).collect();
+        let groups = [group(None, &role_ids)];
+        let members: Vec<Holder> =
+            (1..=400).map(|i| holder(i, &format!("user{i}"), &[i])).collect();
+        let existing: Vec<RoleId> = role_ids.iter().map(|r| RoleId::new(*r)).collect();
+        let out = chain_description(&groups, &members, &existing);
+        assert!(out.encode_utf16().count() <= 4096, "must fit Discord's limit");
+    }
 }
