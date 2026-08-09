@@ -162,6 +162,22 @@ invocation of a hidden owner command is written to the local
 - **Anti-raid** - join-velocity detection with a timed lockdown, plus
   optional quarantine (kick) of brand-new accounts joining during
   lockdown.
+- **Server-wide lockdown** (`/panic`, and the automatic raid lock) - takes
+  away every way of talking, not just Send Messages: threads have their own
+  permission, so denying Send Messages alone leaves every existing thread
+  writable. Send Messages, Send Messages in Threads, and both Create Thread
+  permissions all go together, across text, announcement, forum, voice and
+  stage channels. An explicit *allow* on another role's overwrite out-ranks
+  @everyone's deny, so those are stripped too and handed back on lift.
+  Members with Administrator still bypass channel overwrites; that is
+  Discord's own rule, and it is what keeps the owner able to act.
+
+  Lifting restores **only what the lock actually changed**. Each edit is
+  recorded when the lock goes on, so a channel that was already read-only
+  beforehand is never recorded and never reopened, and a permission an admin
+  changed while the lock was active is left alone. A lockdown that predates
+  this record (written by an older build) falls back to clearing the
+  permissions everywhere, which is the old behaviour.
 - **Anti-spam** - message flooding, duplicate flooding, mass mentions,
   invite links, and scam/phishing/IP-grabber links.
 - **Anti-ping** - configurable per-server protection for staff/VIPs from

@@ -8,6 +8,31 @@ use std::sync::Mutex;
 use crate::common::config::now_ms;
 use crate::common::db;
 
+/// One permission overwrite the lockdown edited, and exactly what it changed.
+///
+/// Restoring from this instead of blanket-clearing the permission is what keeps
+/// a lift from opening channels that were deliberately read-only long before
+/// the lockdown started.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockedTarget {
+    /// Role or member id the overwrite belongs to.
+    pub id: String,
+    /// "role" | "member"
+    pub kind: String,
+    /// Bits this lockdown added to `deny`, as a decimal string.
+    pub denied: String,
+    /// Bits this lockdown removed from `allow`, as a decimal string.
+    pub allow_removed: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockedChannel {
+    pub channel_id: String,
+    pub targets: Vec<LockedTarget>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LockdownState {
@@ -18,6 +43,11 @@ pub struct LockdownState {
     pub locked_at: i64,
     /// `None` for manual/panic locks, which never auto-expire.
     pub expires_at: Option<i64>,
+    /// What this lockdown actually changed. Empty on locks written before this
+    /// was recorded, which the lift path treats as "unknown" rather than
+    /// "nothing".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<LockedChannel>,
 }
 
 static STATE: Lazy<Mutex<HashMap<String, LockdownState>>> = Lazy::new(|| Mutex::new(db::load_all("lockdown_state")));
@@ -43,9 +73,39 @@ pub fn all() -> Vec<(String, LockdownState)> {
 }
 
 pub fn set_lockdown(guild_id: &str, reason: &str, expires_at: Option<i64>) {
-    let state = LockdownState { reason: reason.to_string(), locked_at: now_ms(), expires_at };
+    set_lockdown_with_changes(guild_id, reason, expires_at, Vec::new());
+}
+
+pub fn set_lockdown_with_changes(
+    guild_id: &str,
+    reason: &str,
+    expires_at: Option<i64>,
+    changed: Vec<LockedChannel>,
+) {
+    let state = LockdownState { reason: reason.to_string(), locked_at: now_ms(), expires_at, changed };
     lock().insert(guild_id.to_string(), state.clone());
     db::put("lockdown_state", guild_id, &state);
+}
+
+/// What the active lockdown changed, if anything is on record.
+pub fn changed_channels(guild_id: &str) -> Option<Vec<LockedChannel>> {
+    lock().get(guild_id).map(|s| s.changed.clone())
+}
+
+/// Attach the change record to a lockdown that is already marked active,
+/// keeping its original `locked_at` and expiry.
+///
+/// Locking runs one HTTP call per overwrite, so the lockdown is marked first to
+/// keep a second trigger from starting its own pass, and the record lands when
+/// that work finishes.
+pub fn record_changes(guild_id: &str, changed: Vec<LockedChannel>) {
+    let mut map = lock();
+    if let Some(state) = map.get_mut(guild_id) {
+        state.changed = changed;
+        let snapshot = state.clone();
+        drop(map);
+        db::put("lockdown_state", guild_id, &snapshot);
+    }
 }
 
 pub fn clear_lockdown(guild_id: &str) {

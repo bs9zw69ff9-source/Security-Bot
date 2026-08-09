@@ -20,7 +20,7 @@ use crate::state::anti_ping::{ap, AntiPing};
 use crate::state::applications::{get_application, get_applications, update_application};
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
 use crate::state::guild_settings::{gc, update as update_guild};
-use crate::state::lockdown::{clear_lockdown, is_lockdown, locked_count, set_lockdown};
+use crate::state::lockdown::{clear_lockdown, is_lockdown, locked_count, record_changes, set_lockdown};
 use crate::state::mod_rates::{check_mod_limit, record_mod_action};
 use crate::state::muted_roles::stashed_count;
 use crate::state::tickets::{get_ticket_config, update_ticket_config, TicketType};
@@ -520,8 +520,10 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 )
                 .await;
             }
-            let locked = lock_all_text_channels(ctx, guild_id).await;
             set_lockdown(&gid, "panic", None);
+            let outcome = lock_all_text_channels(ctx, guild_id).await;
+            let locked = outcome.locked;
+            record_changes(&gid, outcome.changes);
             alert_owner(
                 ctx,
                 guild_id,

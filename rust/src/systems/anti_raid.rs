@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use crate::common::config::{now_ms, CONFIG};
 use crate::common::embeds::{alert_owner, colors, sec_log};
 use crate::common::permissions::try_dm;
-use crate::state::lockdown::{is_lockdown, set_lockdown};
+use crate::state::lockdown::{self, is_lockdown, set_lockdown};
 use super::mute::{lift_lockdown_channels, lock_all_text_channels};
 
 /// guild id -> recent join timestamps
@@ -82,7 +82,8 @@ pub async fn on_member_join(ctx: &Context, member: &Member) {
             "Raid Detected",
         )
         .await;
-        lock_all_text_channels(ctx, guild_id).await;
+        let outcome = lock_all_text_channels(ctx, guild_id).await;
+        lockdown::record_changes(&gid, outcome.changes);
 
         let ctx2 = ctx.clone();
         let delay = std::time::Duration::from_millis((expires_at - now_ms()).max(0) as u64);
