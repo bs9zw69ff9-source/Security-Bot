@@ -127,8 +127,8 @@ pub fn sweep() {
     });
 }
 
-/// Strip the executor's dangerous roles, then ban (falling back to kick, then
-/// to leaving them de-permed with a loud alert).
+/// Ban the executor immediately; if that is refused, fall back to stripping
+/// their dangerous roles and kicking, then to a loud alert.
 pub async fn nuke_response(ctx: &Context, guild_id: GuildId, user_id: UserId, reason: &str) {
     let gid = guild_id.to_string();
     let uid = user_id.to_string();
@@ -142,39 +142,92 @@ pub async fn nuke_response(ctx: &Context, guild_id: GuildId, user_id: UserId, re
     end_response(&gid, &uid);
 }
 
+/// Whether the whitelist can be settled from ids alone.
+///
+/// Three of the four whitelist conditions are id-only: bot owner, guild owner,
+/// and the whitelisted-user list. Only the fourth, the whitelisted-role list,
+/// needs the member object. When a guild whitelists no roles the fourth cannot
+/// apply, so the ban goes out without waiting on a member fetch first.
+#[derive(PartialEq, Eq, Debug)]
+pub enum WhitelistCheck {
+    /// Settled without the member: true means immune.
+    Decided(bool),
+    /// The guild whitelists roles, so the member's roles have to be read.
+    NeedsMember,
+}
+
+pub fn whitelist_from_ids(guild_id: GuildId, user_id: UserId, guild_owner_id: UserId) -> WhitelistCheck {
+    if crate::common::permissions::is_owner(user_id) || user_id == guild_owner_id {
+        return WhitelistCheck::Decided(true);
+    }
+    let g = crate::state::guild_settings::gc(&guild_id.to_string());
+    if g.nuke_whitelist_user_ids.contains(&user_id.to_string()) {
+        return WhitelistCheck::Decided(true);
+    }
+    if g.nuke_whitelist_role_ids.is_empty() {
+        return WhitelistCheck::Decided(false);
+    }
+    WhitelistCheck::NeedsMember
+}
+
 async fn run_nuke_response(ctx: &Context, guild_id: GuildId, user_id: UserId, reason: &str) {
     let Some(info) = GuildInfo::from_cache(ctx, guild_id) else { return };
-    let Some(member) = fetch_member(ctx, guild_id, user_id).await else { return };
-    // Re-guard: never punish owner/whitelisted, even if reached here.
-    if is_whitelisted(&member, info.owner_id) {
-        return;
-    }
 
-    // Roles come off and the ban goes out BEFORE anyone is told about it.
-    // Alerting first meant an owner DM plus a channel send, each a full HTTP
-    // round trip, while the attacker carried on working. Stop the bleeding,
-    // then narrate.
-    let to_remove = info.dangerous_editable_roles(&member.roles);
-    let strip_error = if to_remove.is_empty() {
-        None
-    } else {
-        member.remove_roles(&ctx.http, &to_remove).await.err().map(|e| e.to_string())
+    // Re-guard: never punish owner/whitelisted, even if reached here.
+    let member = match whitelist_from_ids(guild_id, user_id, info.owner_id) {
+        WhitelistCheck::Decided(true) => return,
+        WhitelistCheck::Decided(false) => None,
+        WhitelistCheck::NeedsMember => {
+            let Some(m) = fetch_member(ctx, guild_id, user_id).await else { return };
+            if is_whitelisted(&m, info.owner_id) {
+                return;
+            }
+            Some(m)
+        }
     };
 
+    // The ban is the first request made, and nothing waits in front of it.
+    //
+    // Stripping roles used to run first, which put a whole HTTP round trip
+    // between the trip and the only call that actually stops the attacker. A
+    // ban already removes them and their roles from the guild, so the strip is
+    // a fallback for when the ban is refused, not a prerequisite. Everything
+    // else - the role strip, the kick, the alerts - now happens behind it.
     let ban_result = guild_id.ban_with_reason(&ctx.http, user_id, 0, &format!("Anti-Nuke: {reason}")).await;
-    // Only now that they are de-permed and banned does anything get written.
+
+    // Ban refused (usually a role above the bot). Fall back to de-perming and
+    // kicking, which is the only point at which stripping roles is worth a
+    // round trip.
+    let mut strip_error = None;
     let kicked = match &ban_result {
         Ok(()) => false,
-        // Ban failed (likely above the bot). Try kick; otherwise leave
-        // de-permed + escalate.
-        Err(_) => guild_id.kick_with_reason(&ctx.http, user_id, &format!("Anti-Nuke: {reason}")).await.is_ok(),
+        Err(_) => {
+            // Off the critical path, so fetching the member here if the fast
+            // whitelist path skipped it costs the attacker nothing.
+            let member = match member {
+                Some(m) => Some(m),
+                None => fetch_member(ctx, guild_id, user_id).await,
+            };
+            if let Some(member) = &member {
+                let to_remove = info.dangerous_editable_roles(&member.roles);
+                if !to_remove.is_empty() {
+                    strip_error = member.remove_roles(&ctx.http, &to_remove).await.err().map(|e| e.to_string());
+                }
+            }
+            guild_id.kick_with_reason(&ctx.http, user_id, &format!("Anti-Nuke: {reason}")).await.is_ok()
+        }
     };
 
+    let action_taken = match (&ban_result, kicked) {
+        (Ok(()), _) => "banned them straight away.",
+        (Err(_), true) => "couldn't ban them, so I pulled their dangerous roles and kicked them.",
+        (Err(_), false) => "couldn't ban or kick them, so I've only managed to strip their roles.",
+    };
     alert_owner(
         ctx,
         guild_id,
         &format!(
-            "Anti-nuke just kicked in on <@{user_id}> (`{user_id}`).\n**What set it off:** {reason}\n**What I did:** pulled their dangerous roles and moved to ban them."
+            "Anti-nuke just kicked in on <@{user_id}> (`{user_id}`).\n**What set it off:** {reason}\n**What I did:** {action_taken}"
         ),
         colors::NUKE,
         "Anti-Nuke Triggered",
@@ -225,7 +278,6 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
     if executor_id == ctx.cache.current_user().id {
         return;
     }
-    let Some(info) = GuildInfo::from_cache(ctx, guild_id) else { return };
 
     let gid = guild_id.to_string();
     let uid = executor_id.to_string();
@@ -298,6 +350,10 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
         }
         return;
     }
+
+    // Only the branches below need guild state, so a cache miss can no longer
+    // stop the counters above from running.
+    let Some(info) = GuildInfo::from_cache(ctx, guild_id) else { return };
 
     match entry.action {
         Action::Webhook(WebhookAction::Create) => {
@@ -608,6 +664,37 @@ mod tests {
         assert!(
             bump_destructive("guild-b", &user, "chDel", 99).is_none(),
             "another guild's count must not carry over"
+        );
+    }
+
+    /// The whitelist fast path is what removes the last round trip in front of
+    /// the ban, so it has to stay exactly as conservative as the full check.
+    #[test]
+    fn the_id_only_whitelist_path_protects_both_owners() {
+        let guild = GuildId::new(1);
+        let owner = UserId::new(999);
+
+        // Guild owner is immune without anyone reading their roles.
+        assert_eq!(whitelist_from_ids(guild, owner, owner), WhitelistCheck::Decided(true));
+
+        // An unconfigured guild whitelists no roles, so a stranger is settled
+        // as not-immune with no member fetch at all.
+        assert_eq!(whitelist_from_ids(guild, UserId::new(12345), owner), WhitelistCheck::Decided(false));
+    }
+
+    /// A bot owner is immune in every guild, including ones it has no member
+    /// record in.
+    #[test]
+    fn the_bot_owner_is_immune_without_a_member_record() {
+        let owner_id: UserId = crate::common::config::BOT_OWNER_IDS
+            .iter()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(UserId::new)
+            .expect("a bot owner is always configured");
+        assert_eq!(
+            whitelist_from_ids(GuildId::new(1), owner_id, UserId::new(999)),
+            WhitelistCheck::Decided(true)
         );
     }
 }

@@ -152,9 +152,25 @@ invocation of a hidden owner command is written to the local
   Detection is deliberately front-loaded: counting is a plain in-memory
   operation done before any network call, so the response fires on the
   earliest audit-log entry that crosses the line rather than one HTTP round
-  trip later. The response then strips roles and bans *before* it alerts, and
-  only one response runs per user at a time, so entries still arriving from
-  actions already performed cannot start a second overlapping run.
+  trip later. Only one response runs per user at a time, so entries still
+  arriving from actions already performed cannot start a second overlapping
+  run.
+
+  The response is ordered around one question: what actually stops them? That
+  is the ban, so it is the first request made and nothing queues in front of
+  it. Stripping roles and kicking are fallbacks for when the ban is refused,
+  and the alerts come last. The whitelist re-check in front of the ban is
+  settled from ids alone whenever it can be, which is any time the server
+  whitelists no *roles*, so in that common case the ban goes out with no
+  preceding round trip at all.
+
+  What this cannot do is undo an action that already happened. Anti-nuke reads
+  the audit log, so it is inherently reactive: a bot issuing deletes in
+  parallel will have issued several before Discord emits the first entry. The
+  above minimises what lands after the threshold is crossed. If you want a
+  hard ceiling instead of a fast reaction, the lever is permissions - keep
+  Manage Channels, Manage Roles and Ban Members off anyone who is not
+  whitelisted, so the actions cannot start.
 
   Anti-nuke never locks the whole server down on its own. It acts on the
   account responsible and leaves everyone else working; `/panic` is there when
