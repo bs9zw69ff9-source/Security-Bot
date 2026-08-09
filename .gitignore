@@ -1,5 +1,9 @@
 .env
 
+# deploy.sh process management
+guardian-bot.pid
+guardian-bot.log
+
 # runtime state (SQLite DB + WAL/SHM + forensic log)
 guardian.db
 guardian.db-wal

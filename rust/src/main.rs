@@ -344,6 +344,40 @@ fn spawn_sweep_timer(ctx: Context) {
     });
 }
 
+/// Resolves the moment the process is asked to stop, naming the signal that
+/// did it.
+///
+/// SIGTERM matters as much as SIGINT here: it is what systemd, `docker stop`,
+/// Kubernetes and `deploy.sh` all send. Without a handler for it the process
+/// dies on the spot and the shards never disconnect cleanly.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            // Registering SIGTERM failed, which should not happen on a normal
+            // Unix host. Fall back to SIGINT alone rather than giving up on
+            // graceful shutdown entirely.
+            eprintln!("⚠️ couldn't listen for SIGTERM ({e}); only SIGINT will shut down cleanly.");
+            tokio::signal::ctrl_c().await.ok();
+            return "SIGINT";
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term.recv()             => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    tokio::signal::ctrl_c().await.ok();
+    "SIGINT"
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -377,8 +411,8 @@ async fn main() {
     let shard_manager = client.shard_manager.clone();
     let _ = SHARD_MANAGER.set(shard_manager.clone());
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        println!("\nSIGINT received - shutting down…");
+        let signal = wait_for_shutdown_signal().await;
+        println!("\n{signal} received - shutting down…");
         shard_manager.shutdown_all().await;
     });
 
