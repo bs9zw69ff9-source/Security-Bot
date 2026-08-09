@@ -34,6 +34,48 @@ every server the bot is in; propagation to brand-new servers can take up to
 Sharding is automatic (`start_autosharded`), so there's nothing extra to run
 as the bot grows; every shard lives in the one process.
 
+### Deploying updates
+
+[`deploy.sh`](deploy.sh) pulls, builds, and restarts in one go:
+
+```bash
+./deploy.sh            # pull, build, restart
+./deploy.sh restart    # build and restart, no pull
+./deploy.sh start      # start only if it isn't already running
+./deploy.sh stop
+./deploy.sh status     # running? on which commit?
+./deploy.sh logs       # tail -f
+```
+
+It builds *before* stopping anything, so a commit that doesn't compile
+leaves the running bot alone rather than taking it down with nothing to put
+back. It refuses to run on a dirty working tree, retries the pull with
+backoff, and stops the bot with SIGTERM, escalating to SIGKILL only if it
+hasn't exited within 15 seconds.
+
+Without systemd it manages the process itself, writing `guardian-bot.pid`
+and appending to `guardian-bot.log` (both git-ignored). If a systemd unit
+named `guardian-bot` is installed it defers to `systemctl` instead, so the
+two never fight over the same process. A minimal unit:
+
+```ini
+[Unit]
+Description=Guardian Bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/Security-Bot
+ExecStart=/opt/Security-Bot/rust/target/release/guardian-bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+No `KillSignal` override is needed: the bot handles SIGTERM (systemd's
+default) as well as SIGINT, and disconnects its shards cleanly on either.
+
 ### Per-server setup
 
 In each server, a bot/server owner runs:
