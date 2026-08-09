@@ -1,22 +1,25 @@
-# Guardian Bot - Rust port
+# Guardian Bot
 
-A port of the Node.js bot in the parent directory to Rust
-([serenity](https://github.com/serenity-rs/serenity) 0.12 + tokio +
-rusqlite). Feature-for-feature equivalent: same commands, same embeds, same
-thresholds, same customIds, and the **same `guardian.db` schema** - the two
-implementations read and write byte-identical rows, so you can switch between
-them without migrating anything.
+The bot crate: [serenity](https://github.com/serenity-rs/serenity) 0.12 +
+tokio + rusqlite. See the [root README](../README.md) for what the bot
+actually does; this file covers building and running it.
+
+This started life as a Node.js bot, which is why the persisted schema and
+several in-code comments still reference it. That implementation has been
+removed, but the `guardian.db` format is unchanged, so an existing database
+from the old bot is picked up as-is with nothing to migrate.
 
 ## Running it
 
 ```bash
 cd rust
 cargo build --release
-DISCORD_TOKEN=... ./target/release/guardian-bot
+./target/release/guardian-bot
 ```
 
-It reads the same `.env` as the JS bot (`dotenvy` loads it), and the same
-state files, because paths resolve to the **parent** directory:
+`dotenvy` walks up from the working directory and picks up the repo-root
+`.env`; `DISCORD_TOKEN` is the only value it truly needs. State files resolve
+to the crate's **parent** directory, so they sit at the repo root:
 
 | File | Purpose |
 |------|---------|
@@ -24,13 +27,21 @@ state files, because paths resolve to the **parent** directory:
 | `../security_log.jsonl` | forensic trail, appended on every security event |
 | `../antiping.json`, `../warnings.json`, … | legacy JSON, imported once if present |
 
-Only run **one** of the two implementations against a given database at a
-time - they both keep authoritative in-memory copies, so running both
-concurrently would let one overwrite the other's writes.
+Those paths are resolved from `CARGO_MANIFEST_DIR` at compile time, so the
+binary writes to the same place regardless of the directory you launch it
+from. Copying the binary to a host that lacks the repo at that path means
+setting `GUARDIAN_DB_FILE`, or rebuilding on the target.
+
+Boot order is database first, token second: `db::init()` and the seed
+migrations run before the token check, so even a bad token leaves you with a
+correctly initialized `guardian.db`. A missing token exits 1 with
+`❌ DISCORD_TOKEN is not set.`; a rejected one reports `401: Unauthorized`.
+Ctrl-C shuts the shards down cleanly.
+
+Run only **one** process against a given database at a time - it keeps an
+authoritative in-memory copy, so two would overwrite each other's writes.
 
 ## Layout
-
-Mirrors the JS module split one-to-one:
 
 - `src/common/` - low-level shared pieces: `config` (env + constants), `db`
   (SQLite + forensic log), `client`, `embeds` (colors, builders, `sec_log`,
@@ -49,31 +60,30 @@ that cannot be held across an `.await`; anything needing role positions or
 permissions *and* making API calls copies what it needs out of the cache
 first via `GuildInfo`.
 
-## Notable differences from the JS version
+## Implementation notes
 
-These are consequences of the runtime, not behaviour changes:
-
-- **Timers.** JS `setTimeout` silently overflows past ~24.8 days, so the JS
-  bot chunked long delays. `tokio::time::sleep` takes a real `Duration`, so a
-  long mute just sleeps the whole span in one task.
-- **Debounced chain-of-command refresh.** JS cleared and reset a timer
-  handle; here each scheduled refresh carries a generation number and only
-  the newest one renders. Same effect, no handle juggling.
-- **Deleted-message content.** Both versions depend on a message cache to
-  show what a deleted message said, and both fall back to
+- **Timers.** `tokio::time::sleep` takes a real `Duration`, so even a
+  month-long mute just sleeps the whole span in one task. No chunking.
+- **Debounced chain-of-command refresh.** Each scheduled refresh carries a
+  generation number and only the newest one renders, so a burst of role
+  changes collapses into a single re-render without juggling timer handles.
+- **Deleted-message content.** Showing what a deleted message said depends on
+  the message cache, so anything sent before the last restart falls back to
   *"content not cached (sent before restart)"*.
 - **`/status`** reports RSS from `/proc/self/statm` and gateway latency from
-  the shard runner, rather than `process.memoryUsage()` / `client.ws.ping`.
+  the shard runner via a `SHARD_MANAGER` handle stashed at boot.
 
 ## Development
 
 ```bash
-cargo check     # type check
-cargo clippy    # lints (currently clean)
-cargo test      # unit tests
+cargo check --all-targets   # type check
+cargo clippy --all-targets  # lints (currently clean)
+cargo test                  # unit tests
 cargo build --release
 ```
 
-`cargo test` covers the police-manual text, which is asserted to be exactly
-3667 UTF-16 units - identical to what the JS implementation produced, and
-under Discord's 4096 embed-description limit.
+The tests cover two things. The anti-nuke counters: that an attack rotating
+through categories trips the shared aggregate counter rather than slipping
+under every per-category limit, and that a single-category burst still trips
+its own. And the police-manual text, asserted at exactly 3667 UTF-16 units,
+which is the unit Discord's 4096 embed-description limit counts in.

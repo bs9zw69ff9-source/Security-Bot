@@ -7,23 +7,32 @@ system, and per-server configuration - all backed by SQLite.
 
 ## Requirements
 
-- Node.js **18+**
+- Rust **1.75+**
 - A Discord application + bot token
+
+No system SQLite needed: `rusqlite` is built with the `bundled` feature, so
+the database engine compiles in.
 
 ## Setup
 
 ```bash
-npm install
-cp .env.example .env      # then fill in DISCORD_TOKEN, CLIENT_ID, etc.
-npm start
+cp .env.example .env      # DISCORD_TOKEN is the only required value
+cd rust
+cargo build --release
+./target/release/guardian-bot
 ```
 
-Slash commands are registered **globally** on startup (available in every
-server the bot is in; propagation to brand-new servers can take up to ~1h).
+Enable both privileged intents on the bot in the Discord Developer Portal -
+**Server Members** and **Message Content**. The bot requests `GUILD_MEMBERS`
+and `MESSAGE_CONTENT`, and the gateway refuses the connection without them.
 
-For very large deployments (~2500+ servers, where Discord requires
-sharding), run `npm run start:sharded` instead - this spawns `shard.js`,
-a `discord.js` `ShardingManager` wrapping `index.js`.
+Slash commands are registered **globally** at startup, from the bot's own
+`ready` handler - there's no separate registration step. They're available in
+every server the bot is in; propagation to brand-new servers can take up to
+~1h.
+
+Sharding is automatic (`start_autosharded`), so there's nothing extra to run
+as the bot grows; every shard lives in the one process.
 
 ### Per-server setup
 
@@ -62,7 +71,8 @@ seconds long, so losing them on a restart is fine by design. Mod rate
 limits and active lockdown state (raid/panic) are also per guild **and**
 persisted to SQLite, so a restart mid-lockdown or mid-rate-limit-window
 doesn't silently drop protection or reset a mod's daily limits - see
-`recoverLockdowns()`/`recoverMutes()` in `index.js`.
+`recover_lockdowns()`/`recover_mutes()`, called from the `ready` handler in
+`rust/src/main.rs`.
 
 ### Owner override
 
@@ -303,8 +313,8 @@ never overwrite a later manual change.
 
 Runtime state (guild settings, anti-ping config, warnings, muted-role
 stashes, snapshots, failsafe backups, ticket config, open-ticket tracking,
-application config) lives in `guardian.db`, a
-`better-sqlite3` database created automatically on first boot. Legacy
+application config) lives in `guardian.db`, a SQLite database (via
+`rusqlite`, WAL mode) created automatically on first boot. Legacy
 JSON files (`antiping.json`, `mutedroles.json`, `warnings.json`, etc.) are
 imported into it once if present, then no longer used. All of these are
 git-ignored - they're state, not source. A `security_log.jsonl` forensic
@@ -313,60 +323,60 @@ wiped log channel.
 
 ## Code layout
 
-`index.js` is just the entry point/orchestrator now (boot sequence, the
-`messageCreate` anti-spam/anti-ping dispatch, the periodic sweep, and the
-test-suite exports) - the actual bot lives in:
+The crate lives in [`rust/`](rust/) (serenity + tokio + rusqlite), with
+`src/main.rs` as the entry point: the `EventHandler`, boot sequence, and
+background timers. The rest is split by responsibility:
 
-- `lib/` - low-level shared pieces: SQLite persistence (`db.js`), env config
-  and constants (`config.js`), the Discord client instance (`client.js`),
-  embed/logging helpers (`embeds.js`), permission checks (`permissions.js`)
-- `state/` - per-guild config get/set (and home-guild seed migrations) for
-  each persisted table: guild settings, mod rate limits, lockdown, anti-ping,
-  muted-role stash, warnings, tickets, applications, chain of command
-- `systems/` - feature logic: mute/unmute, anti-spam, anti-ping, anti-raid,
-  anti-nuke, snapshot/rollback, failsafe, message logging, hidden owner
-  commands, `/setup` helpers, the ticket system, the application system, the
-  police manual, and the chain-of-command boards - each attaches its own
-  Discord event listeners as a side effect of being required
-- `commands/` - slash-command definitions (`definitions.js`), registration
-  (`register.js`), and the `/`-command switch (`handler.js`)
+- `src/common/` - low-level shared pieces: env config and constants
+  (`config`), SQLite persistence and the forensic log (`db`), the client
+  (`client`), embed/logging helpers (`embeds`), permission checks
+  (`permissions`), and cached-guild snapshots (`guildinfo`)
+- `src/state/` - per-guild config get/set (and the one-time home-guild seed
+  migrations) for each persisted table: guild settings, mod rate limits,
+  lockdown, anti-ping, muted-role stash, warnings, tickets, applications,
+  chain of command
+- `src/systems/` - feature logic: mute/unmute, anti-spam, anti-ping,
+  anti-raid, anti-nuke, snapshot/rollback, failsafe, message logging, hidden
+  owner commands, `/setup` helpers, the ticket system, the application
+  system, the police manual, and the chain-of-command boards
+- `src/commands/` - slash-command definitions (`definitions`) and the
+  `/`-command dispatch (`handler`)
 
-`shard.js` is unaffected - it still just spawns `index.js` per shard.
+`src/common/guildinfo.rs` exists because serenity's cache hands back a guard
+that cannot be held across an `.await`; anything that needs role positions or
+permissions *and* makes API calls copies what it needs out of the cache first
+via `GuildInfo`.
 
-## Rust port
-
-A feature-for-feature Rust port lives in [`rust/`](rust/) (serenity + tokio +
-rusqlite). It speaks the same `guardian.db` schema as this bot - byte-identical
-rows - so the two are drop-in swappable without migrating state. See
-[`rust/README.md`](rust/README.md) for how to build and run it, and for the
-handful of runtime-level differences. Run only one implementation against a
-given database at a time.
+State files resolve relative to the crate's parent directory (the repo root),
+so `guardian.db` and friends sit alongside this README rather than inside
+`rust/`. Those paths are baked in at compile time, which means the binary
+writes to the same place no matter which directory you launch it from. If you
+copy the binary to a machine that doesn't have the repo at the same path, set
+`GUARDIAN_DB_FILE` explicitly, or just rebuild on the target.
 
 ## Development
 
 ```bash
-npm run check   # syntax check (node --check) for index.js, shard.js, and every lib/state/systems/commands file
-npm run lint    # eslint .
-npm test        # node --test - unit tests for config merging, per-guild rate
-                 # limits/lockdown isolation (incl. surviving a simulated
-                 # restart), ticket + application config isolation, permission
-                 # checks, and formatting helpers
+cd rust
+cargo check --all-targets   # type check
+cargo clippy --all-targets  # lints - currently clean
+cargo test                  # unit tests
+cargo build --release
 ```
 
-`index.js` exports its pure/state-only logic (guarded behind
-`require.main === module` so `client.login()` never fires when the file is
-`require()`d by the test suite) - see the bottom of the file and
-`test/*.test.js`. GitHub Actions (`.github/workflows/ci.yml`) runs all
-three on every push/PR against Node 20 and 22.
+GitHub Actions (`.github/workflows/ci.yml`) runs check, clippy (with warnings
+denied), tests, and a release build on every push/PR.
 
-**What's covered by automated tests vs. only by manual testing:** the
-per-guild isolation of rate limits/lockdown/config/ticket/application
-state (including that it survives a restart), and the permission-hierarchy
-logic, are covered by real regression tests. Anything that requires a live
-gateway connection - the actual anti-nuke/anti-raid/anti-spam detection
+**What's covered by automated tests vs. only by manual testing:** the tests
+cover the anti-nuke counter logic (that a category-rotating attack trips the
+shared aggregate counter, and that a single-category burst still trips its
+own) and the police-manual text, which is asserted to be exactly 3667 UTF-16
+units and therefore under Discord's 4096 embed-description limit.
+
+Anything requiring a live gateway connection is not covered, and has only
+been exercised by hand: the actual anti-nuke/anti-raid/anti-spam detection
 firing against real Discord events, role/channel snapshot-and-restore,
 mute-role stashing, the whole ticket flow, and the whole application flow
-(Apply button, DM interview, staff accept/deny, role granting) - is not,
-and has only been exercised by hand. Treat this
+(Apply button, DM interview, staff accept/deny, role granting). Treat this
 bot as reviewed-and-tested-where-practical, not as verified against live
 abuse scenarios at scale.
