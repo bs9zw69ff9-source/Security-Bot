@@ -15,6 +15,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$ROOT/$(basename "${BASH_SOURCE[0]}")"
 BIN="$ROOT/rust/target/release/guardian-bot"
 PIDFILE="$ROOT/guardian-bot.pid"
 LOGFILE="$ROOT/guardian-bot.log"
@@ -78,9 +79,19 @@ do_pull() {
   fi
 
   say "Pulling $branch"
-  local delay=2
+  local before after delay=2
+  before="$(cksum < "$SELF" 2>/dev/null || true)"
   for attempt in 1 2 3 4 5; do
     if git -C "$ROOT" pull --ff-only origin "$branch"; then
+      after="$(cksum < "$SELF" 2>/dev/null || true)"
+      # If that pull rewrote this script, finish the run in the new copy.
+      # Carrying on would run a mix of both: bash reads a script by byte
+      # offset as it goes, so the rest of this file is no longer where the
+      # running process thinks it is.
+      if [ "$before" != "$after" ] && [ -z "${DEPLOY_RELOADED:-}" ]; then
+        say "deploy.sh changed in that pull, handing over to the new version"
+        DEPLOY_RELOADED=1 exec "$SELF" "${ACTION}"
+      fi
       return 0
     fi
     [ "$attempt" -eq 5 ] && die "git pull failed after 5 attempts."
@@ -249,12 +260,24 @@ do_status() {
   fi
 }
 
-case "${1:-deploy}" in
-  deploy)  check_build_user deploy;  do_pull; do_build; do_stop; do_start ;;
-  restart) check_build_user restart; do_build; do_stop; do_start ;;
-  start)   do_start ;;
-  stop)    do_stop ;;
-  status)  do_status ;;
-  logs)    tail -f "$LOGFILE" ;;
-  *)       die "Unknown command '$1'. Try: deploy, restart, start, stop, status, logs" ;;
-esac
+# Everything runs from here, called on the last line.
+#
+# Bash reads a script incrementally as it executes, so a `git pull` that
+# rewrites this file mid-run leaves the process reading the rest of it from a
+# byte offset that no longer means anything. Keeping the whole body inside a
+# function forces bash to parse the entire file before executing any of it,
+# which makes the running copy immune to being replaced underneath it.
+main() {
+  ACTION="${1:-deploy}"
+  case "$ACTION" in
+    deploy)  check_build_user deploy;  do_pull; do_build; do_stop; do_start ;;
+    restart) check_build_user restart; do_build; do_stop; do_start ;;
+    start)   do_start ;;
+    stop)    do_stop ;;
+    status)  do_status ;;
+    logs)    tail -f "$LOGFILE" ;;
+    *)       die "Unknown command '$ACTION'. Try: deploy, restart, start, stop, status, logs" ;;
+  esac
+}
+
+main "$@"
