@@ -51,7 +51,14 @@ It builds *before* stopping anything, so a commit that doesn't compile
 leaves the running bot alone rather than taking it down with nothing to put
 back. It refuses to run on a dirty working tree, retries the pull with
 backoff, and stops the bot with SIGTERM, escalating to SIGKILL only if it
-hasn't exited within 15 seconds.
+hasn't exited within 15 seconds. It also re-execs itself when a pull changes
+the script, so a fix to `deploy.sh` applies to the run that fetched it.
+
+**Run it as root.** It sorts out privileges on its own: git and cargo run as
+whoever owns the checkout, so a root-driven deploy leaves no root-owned files
+behind, and `systemctl` runs as root without reaching for `sudo`. Running it
+as the service account works too, though with a systemd unit installed that
+account then needs to be able to run `systemctl` itself.
 
 Without systemd it manages the process itself, writing `guardian-bot.pid`
 and appending to `guardian-bot.log` (both git-ignored). If a systemd unit

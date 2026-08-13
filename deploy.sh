@@ -72,9 +72,9 @@ running_pid() {
 
 do_pull() {
   local branch
-  branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+  branch="$(as_owner git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
 
-  if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
+  if [ -n "$(as_owner git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
     die "Working tree has uncommitted changes. Commit or stash them, then re-run."
   fi
 
@@ -82,7 +82,7 @@ do_pull() {
   local before after delay=2
   before="$(cksum < "$SELF" 2>/dev/null || true)"
   for attempt in 1 2 3 4 5; do
-    if git -C "$ROOT" pull --ff-only origin "$branch"; then
+    if as_owner git -C "$ROOT" pull --ff-only origin "$branch"; then
       after="$(cksum < "$SELF" 2>/dev/null || true)"
       # If that pull rewrote this script, finish the run in the new copy.
       # Carrying on would run a mix of both: bash reads a script by byte
@@ -106,21 +106,28 @@ do_pull() {
 # rustup installs per user, into ~/.cargo/bin, and adds that to PATH from the
 # shell profile. Anything that does not load a profile - sudo, cron, systemd, a
 # root shell when rustup was installed as someone else - sees no cargo at all.
-# So look where it actually lives, starting with the home of whoever owns the
-# checkout, since that is the account the build is meant to run as.
+#
+# When the build is going to run as the checkout's owner, it is *their* cargo
+# that matters. Ours might be on PATH and still be unusable: root's copy under
+# /root is not even readable by a service account.
 find_cargo() {
+  local owner me_home owner_home candidate
+  owner="$(repo_owner)"
+  owner_home=""
+  [ -n "$owner" ] && owner_home="$(getent passwd "$owner" 2>/dev/null | cut -d: -f6 || true)"
+  me_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+
+  if [ -n "$owner" ] && [ "$(id -un)" != "$owner" ] && [ -n "$owner_home" ] \
+     && [ -x "$owner_home/.cargo/bin/cargo" ]; then
+    echo "$owner_home/.cargo/bin/cargo"
+    return 0
+  fi
+
   if command -v cargo >/dev/null 2>&1; then
     command -v cargo
     return 0
   fi
-  local me_home owner owner_home candidate
-  # Home of whoever is running this, looked up rather than taken from $HOME,
-  # which sudo may or may not have reset.
-  me_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
-  # Home of whoever owns the checkout, for the case where this is run as root.
-  owner="$(stat -c '%U' "$ROOT" 2>/dev/null || true)"
-  owner_home=""
-  [ -n "$owner" ] && owner_home="$(getent passwd "$owner" 2>/dev/null | cut -d: -f6 || true)"
+
   for candidate in \
     "${CARGO_HOME:-}/bin/cargo" \
     "$me_home/.cargo/bin/cargo" \
@@ -139,15 +146,49 @@ find_cargo() {
   return 1
 }
 
-# Building as root inside a checkout owned by someone else leaves root-owned
-# files in target/ and .git, which then break the service account on its next
-# run. Cheaper to refuse than to debug later.
-check_build_user() {
+# Who owns the checkout. Everything that writes into it runs as them, so a
+# root-driven deploy never leaves root-owned files behind for the service
+# account to trip over.
+repo_owner() {
+  stat -c '%U' "$ROOT" 2>/dev/null || true
+}
+
+# Run a command as the checkout's owner. A no-op when we already are them.
+#
+# runuser is preferred over sudo: root using sudo to become a passwordless
+# system account still goes through PAM, and on some configurations that
+# prompts for a password the account does not have. runuser is built for
+# exactly this transition and never prompts. -H / -l style home handling
+# matters too, since cargo writes to $HOME/.cargo and would otherwise try to
+# use root's.
+as_owner() {
   local owner
-  owner="$(stat -c '%U' "$ROOT" 2>/dev/null || true)"
-  if [ "$(id -u)" -eq 0 ] && [ -n "$owner" ] && [ "$owner" != "root" ]; then
-    die "This checkout belongs to '$owner' but you're running as root, which would leave root-owned files behind. Run it as that user instead:
-    sudo -u $owner $0 ${1:-deploy}"
+  owner="$(repo_owner)"
+  if [ -z "$owner" ] || [ "$(id -un)" = "$owner" ]; then
+    "$@"
+    return
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    die "This checkout belongs to '$owner'. Re-run as root or as $owner."
+  fi
+  local home
+  home="$(getent passwd "$owner" 2>/dev/null | cut -d: -f6 || true)"
+  if command -v runuser >/dev/null 2>&1; then
+    HOME="${home:-$HOME}" runuser -u "$owner" -- "$@"
+  else
+    sudo -H -u "$owner" -- "$@"
+  fi
+}
+
+# systemctl needs root. Only reach for sudo when we are not already root,
+# because a passwordless service account cannot answer a sudo prompt.
+systemctl_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    systemctl "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo systemctl "$@"
+  else
+    die "Need root to run 'systemctl $*'. Re-run this as root."
   fi
 }
 
@@ -159,13 +200,13 @@ do_build() {
   # Deliberately built before anything is stopped: a broken commit should
   # leave the running bot untouched rather than take it down with nothing to
   # put back.
-  ( cd "$ROOT/rust" && "$cargo" build --release ) || die "Build failed. The running bot was left alone."
+  ( cd "$ROOT/rust" && as_owner "$cargo" build --release ) || die "Build failed. The running bot was left alone."
 }
 
 do_stop() {
   if use_systemd; then
     say "Stopping $UNIT via systemd"
-    sudo systemctl stop "$UNIT"
+    systemctl_root stop "$UNIT"
     return
   fi
 
@@ -198,9 +239,9 @@ do_stop() {
 do_start() {
   if use_systemd; then
     say "Starting $UNIT via systemd"
-    sudo systemctl start "$UNIT"
+    systemctl_root start "$UNIT"
     sleep 2
-    systemctl status "$UNIT" --no-pager --lines=10 || true
+    systemctl_root status "$UNIT" --no-pager --lines=10 || true
     return
   fi
 
@@ -214,6 +255,10 @@ do_start() {
   [ -x "$BIN" ] || die "No binary at $BIN. Run './deploy.sh' or 'cargo build --release' first."
 
   say "Starting"
+  # Created up front as the owner: the redirect below is opened by this shell,
+  # so a root-driven run would otherwise leave a root-owned log and pidfile
+  # that the service account cannot write on its next start.
+  as_owner touch "$LOGFILE" "$PIDFILE" 2>/dev/null || true
   # Launched from the repo root so dotenvy finds .env sitting right there.
   #
   # stdin comes from /dev/null on purpose: a daemon that inherits the calling
@@ -243,10 +288,10 @@ do_start() {
 }
 
 do_status() {
-  say "Commit: $(git -C "$ROOT" log --oneline -1)"
+  say "Commit: $(as_owner git -C "$ROOT" log --oneline -1)"
 
   if use_systemd; then
-    systemctl status "$UNIT" --no-pager --lines=10 || true
+    systemctl_root status "$UNIT" --no-pager --lines=10 || true
     return
   fi
 
@@ -267,11 +312,37 @@ do_status() {
 # byte offset that no longer means anything. Keeping the whole body inside a
 # function forces bash to parse the entire file before executing any of it,
 # which makes the running copy immune to being replaced underneath it.
+# Hand the whole run to the checkout's owner when root is not needed.
+#
+# Without a systemd unit this script supervises the bot itself, and that only
+# works while it *is* the service account: the pidfile has to hold the bot's
+# own pid, and a root-launched daemon would run as root. With a unit installed
+# we stay root, because systemctl needs it, and hand the git and cargo work
+# over individually instead.
+maybe_drop_privileges() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  [ -z "${DEPLOY_DROPPED:-}" ] || return 0
+  local owner home
+  owner="$(repo_owner)"
+  [ -n "$owner" ] && [ "$owner" != "root" ] || return 0
+  use_systemd && return 0
+
+  home="$(getent passwd "$owner" 2>/dev/null | cut -d: -f6 || true)"
+  say "No systemd unit here, so running the whole thing as $owner"
+  export DEPLOY_DROPPED=1
+  if command -v runuser >/dev/null 2>&1; then
+    HOME="${home:-$HOME}" exec runuser -u "$owner" -- "$SELF" "$ACTION"
+  else
+    exec sudo -H -u "$owner" -- "$SELF" "$ACTION"
+  fi
+}
+
 main() {
   ACTION="${1:-deploy}"
+  maybe_drop_privileges
   case "$ACTION" in
-    deploy)  check_build_user deploy;  do_pull; do_build; do_stop; do_start ;;
-    restart) check_build_user restart; do_build; do_stop; do_start ;;
+    deploy)  do_pull; do_build; do_stop; do_start ;;
+    restart) do_build; do_stop; do_start ;;
     start)   do_start ;;
     stop)    do_stop ;;
     status)  do_status ;;
