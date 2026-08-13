@@ -49,6 +49,8 @@ pub struct AppConfig {
     pub family_questions_v2: bool,
     pub nypd_questions_v2: bool,
     pub nypd_questions_v3: bool,
+    /// Guards the one-time NYPD review-channel correction below.
+    pub nypd_review_v2: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, AppConfig>>> = Lazy::new(|| Mutex::new(db::load_all("applications")));
@@ -206,7 +208,7 @@ pub fn migrate_applications_to_home_guild() {
             emoji: "👮".into(),
             panel_channel_id: "1528754445968740472".into(),
             panel_message_id: String::new(),
-            review_channel_id: "1528754488339464192".into(),
+            review_channel_id: "1537589602456699031".into(),
             accepted_role_ids: strings(&["1528754363726827572", "1528754358697853050", "1528754369019777034"]),
             questions: strings(&[
                 "How old are you?",
@@ -330,4 +332,32 @@ pub fn migrate_nypd_questions_v3() {
     }
     save(home);
     println!("📝 Applied expanded NYPD application questions for home guild ({home})");
+}
+
+/// Correct the NYPD review channel on an already-seeded home guild.
+///
+/// The original seed pointed at 1528754488339464192; submitted police
+/// applications are meant to land in 1537589602456699031. Questions, roles and
+/// panel channel are untouched - this moves the review destination only.
+///
+/// Runs once, guarded by nypdReviewV2, and only rewrites the channel if it is
+/// still the old seeded value, so a channel an admin has since set with
+/// `/applications setreview` is left alone.
+pub fn migrate_nypd_review_channel_v2() {
+    let Some(home) = GUILD_ID.as_ref() else { return };
+    {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(home) else { return };
+        if cfg.nypd_review_v2 || cfg.apps.is_empty() {
+            return;
+        }
+        if let Some(app) = cfg.apps.get_mut("nypd") {
+            if app.review_channel_id == "1528754488339464192" {
+                app.review_channel_id = "1537589602456699031".to_string();
+            }
+        }
+        cfg.nypd_review_v2 = true;
+    }
+    save(home);
+    println!("📝 Pointed NYPD application reviews at the police review channel for home guild ({home})");
 }

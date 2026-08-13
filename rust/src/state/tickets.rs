@@ -24,6 +24,8 @@ pub struct TicketConfig {
     pub panel_message_id: String,
     pub category_id: String,
     pub types: Vec<TicketType>,
+    /// Guards the one-time category backfill below.
+    pub category_seed_v1: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, TicketConfig>>> = Lazy::new(|| Mutex::new(db::load_all("tickets")));
@@ -124,6 +126,7 @@ pub fn migrate_tickets_to_home_guild() {
     ];
     update_ticket_config(home, |c| {
         c.panel_channel_id = "1528754448002711592".to_string();
+        c.category_id = "1534402515557417161".to_string();
         c.types = types
             .into_iter()
             .map(|(key, label, emoji, log)| TicketType {
@@ -135,4 +138,24 @@ pub fn migrate_tickets_to_home_guild() {
             .collect();
     });
     println!("🎫 Seeded default ticket types + panel channel for home guild ({home})");
+}
+
+/// Backfill the open-ticket category onto the home guild's already-seeded
+/// ticket config. The original seed never set one, so guilds seeded before
+/// this ran fell back to auto-creating a "Tickets" category on first use.
+/// Runs once, guarded by categorySeedV1, and never overwrites a category an
+/// admin has already chosen.
+pub fn migrate_ticket_category() {
+    let Some(home) = GUILD_ID.as_ref() else { return };
+    let cfg = get_ticket_config(home);
+    if cfg.category_seed_v1 || cfg.types.is_empty() {
+        return;
+    }
+    update_ticket_config(home, |c| {
+        if c.category_id.is_empty() {
+            c.category_id = "1534402515557417161".to_string();
+        }
+        c.category_seed_v1 = true;
+    });
+    println!("🎫 Set the open-ticket category for home guild ({home})");
 }
