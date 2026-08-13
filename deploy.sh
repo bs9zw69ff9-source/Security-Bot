@@ -90,12 +90,65 @@ do_pull() {
   done
 }
 
+# Locate cargo without relying on the caller's PATH.
+#
+# rustup installs per user, into ~/.cargo/bin, and adds that to PATH from the
+# shell profile. Anything that does not load a profile - sudo, cron, systemd, a
+# root shell when rustup was installed as someone else - sees no cargo at all.
+# So look where it actually lives, starting with the home of whoever owns the
+# checkout, since that is the account the build is meant to run as.
+find_cargo() {
+  if command -v cargo >/dev/null 2>&1; then
+    command -v cargo
+    return 0
+  fi
+  local me_home owner owner_home candidate
+  # Home of whoever is running this, looked up rather than taken from $HOME,
+  # which sudo may or may not have reset.
+  me_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+  # Home of whoever owns the checkout, for the case where this is run as root.
+  owner="$(stat -c '%U' "$ROOT" 2>/dev/null || true)"
+  owner_home=""
+  [ -n "$owner" ] && owner_home="$(getent passwd "$owner" 2>/dev/null | cut -d: -f6 || true)"
+  for candidate in \
+    "${CARGO_HOME:-}/bin/cargo" \
+    "$me_home/.cargo/bin/cargo" \
+    "$owner_home/.cargo/bin/cargo" \
+    "${HOME:-}/.cargo/bin/cargo" \
+    /root/.cargo/bin/cargo \
+    /usr/local/cargo/bin/cargo \
+    /usr/local/bin/cargo
+  do
+    case "$candidate" in /bin/cargo|"/.cargo/bin/cargo") continue ;; esac
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Building as root inside a checkout owned by someone else leaves root-owned
+# files in target/ and .git, which then break the service account on its next
+# run. Cheaper to refuse than to debug later.
+check_build_user() {
+  local owner
+  owner="$(stat -c '%U' "$ROOT" 2>/dev/null || true)"
+  if [ "$(id -u)" -eq 0 ] && [ -n "$owner" ] && [ "$owner" != "root" ]; then
+    die "This checkout belongs to '$owner' but you're running as root, which would leave root-owned files behind. Run it as that user instead:
+    sudo -u $owner $0 ${1:-deploy}"
+  fi
+}
+
 do_build() {
-  say "Building release"
+  local cargo
+  cargo="$(find_cargo)" || die "Couldn't find cargo. Install Rust for this account (https://rustup.rs), or set CARGO_HOME if it lives somewhere unusual."
+
+  say "Building release (${cargo})"
   # Deliberately built before anything is stopped: a broken commit should
   # leave the running bot untouched rather than take it down with nothing to
   # put back.
-  ( cd "$ROOT/rust" && cargo build --release ) || die "Build failed. The running bot was left alone."
+  ( cd "$ROOT/rust" && "$cargo" build --release ) || die "Build failed. The running bot was left alone."
 }
 
 do_stop() {
@@ -197,8 +250,8 @@ do_status() {
 }
 
 case "${1:-deploy}" in
-  deploy)  do_pull; do_build; do_stop; do_start ;;
-  restart) do_build; do_stop; do_start ;;
+  deploy)  check_build_user deploy;  do_pull; do_build; do_stop; do_start ;;
+  restart) check_build_user restart; do_build; do_stop; do_start ;;
   start)   do_start ;;
   stop)    do_stop ;;
   status)  do_status ;;
