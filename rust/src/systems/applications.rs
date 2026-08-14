@@ -229,13 +229,27 @@ pub async fn ensure_application_panels(ctx: &Context, guild_id: GuildId) {
                 ids.push(a.panel_message_id.clone());
             }
         }
+        // Split the recorded panels into ones Discord still has and ones it
+        // confirms are gone. A lookup that merely failed counts as neither: it
+        // leaves the channel alone rather than posting a duplicate on top of a
+        // panel that is almost certainly still sitting there.
         let mut live = Vec::new();
+        let mut unresolved = false;
         for id in &ids {
-            if let Ok(mid) = id.parse::<u64>() {
-                if let Ok(m) = channel.message(&ctx.http, MessageId::new(mid)).await {
-                    live.push(m);
+            let Ok(raw_mid) = id.parse::<u64>() else { continue };
+            let mid = MessageId::new(raw_mid);
+            match channel.message(&ctx.http, mid).await {
+                Ok(m) => live.push(m),
+                Err(e) => {
+                    if !crate::common::embeds::is_unknown_message(&e) {
+                        eprintln!("⚠️ couldn't check application panel {mid} ({e}); leaving the channel as it is");
+                        unresolved = true;
+                    }
                 }
             }
+        }
+        if unresolved {
+            continue;
         }
 
         let (name, icon) = super::tickets::guild_meta(ctx, guild_id);

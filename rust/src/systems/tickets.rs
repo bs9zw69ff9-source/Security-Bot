@@ -12,7 +12,7 @@ use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use serenity::model::{Permissions, Timestamp};
 
 use crate::common::config::now_ms;
-use crate::common::embeds::{colors, embed, format_uptime, sec_log};
+use crate::common::embeds::{colors, embed, format_uptime, message_still_exists, sec_log};
 use crate::common::permissions::is_mod;
 use crate::common::guildinfo::fetch_member;
 use crate::state::guild_settings::gc;
@@ -73,9 +73,12 @@ pub async fn ensure_ticket_panel(ctx: &Context, guild_id: GuildId) {
     let Ok(raw) = cfg.panel_channel_id.parse::<u64>() else { return };
     let channel = ChannelId::new(raw);
 
+    // Only post a replacement when Discord confirms the old panel is gone. An
+    // error that is not a 404 means we could not tell, and posting anyway is
+    // how a channel ends up with a stack of identical panels.
     if !cfg.panel_message_id.is_empty() {
         if let Ok(mid) = cfg.panel_message_id.parse::<u64>() {
-            if channel.message(&ctx.http, MessageId::new(mid)).await.is_ok() {
+            if message_still_exists(ctx, channel, MessageId::new(mid)).await {
                 return;
             }
         }

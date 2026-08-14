@@ -163,11 +163,24 @@ async fn render_chain_of_command_with(ctx: &Context, guild_id: GuildId, key: &st
 
     let embed = build_chain_of_command_embed(ctx, guild_id, &cfg.groups, &cfg.title, members);
 
+    // A board is posted once and edited in place from then on. Only post a
+    // fresh one when Discord confirms the old message is gone: boards
+    // re-render on every tracked role change, so treating a failed lookup as
+    // deletion would leave a trail of duplicate boards down the channel.
     if !cfg.message_id.is_empty() {
-        if let Ok(mid) = cfg.message_id.parse::<u64>() {
-            if let Ok(mut existing) = channel.message(&ctx.http, MessageId::new(mid)).await {
-                let _ = existing.edit(&ctx.http, EditMessage::new().embed(embed)).await;
-                return;
+        if let Ok(raw_mid) = cfg.message_id.parse::<u64>() {
+            let mid = MessageId::new(raw_mid);
+            match channel.message(&ctx.http, mid).await {
+                Ok(mut existing) => {
+                    let _ = existing.edit(&ctx.http, EditMessage::new().embed(embed)).await;
+                    return;
+                }
+                Err(e) if !crate::common::embeds::is_unknown_message(&e) => {
+                    eprintln!("⚠️ couldn't check chain-of-command board {mid} ({e}); leaving it alone rather than posting another");
+                    return;
+                }
+                // Genuinely deleted, so fall through and post a replacement.
+                Err(_) => {}
             }
         }
     }

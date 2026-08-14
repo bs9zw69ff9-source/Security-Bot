@@ -153,3 +153,45 @@ pub fn format_uptime(ms: i64) -> String {
         format!("{m}m {}s", s % 60)
     }
 }
+
+/// Whether a panel message posted earlier is still there.
+///
+/// The distinction that matters is "Discord says this message does not exist"
+/// versus "I could not find out". Only the first justifies posting a
+/// replacement. Treating every error as deletion means a missing Read Message
+/// History permission, a rate limit, or a brief Discord hiccup all produce a
+/// duplicate panel on boot, and because the new id is then saved over the old
+/// one, every restart adds another.
+///
+/// Anything other than a 404 is reported as still present, so the worst case
+/// is a panel that does not get refreshed until the next restart, rather than
+/// a channel filling up with copies.
+pub async fn message_still_exists(
+    ctx: &Context,
+    channel_id: serenity::model::id::ChannelId,
+    message_id: serenity::model::id::MessageId,
+) -> bool {
+    match channel_id.message(&ctx.http, message_id).await {
+        Ok(_) => true,
+        Err(e) if is_unknown_message(&e) => false,
+        Err(e) => {
+            eprintln!("⚠️ couldn't check whether message {message_id} still exists ({e}); assuming it does, so as not to post a duplicate");
+            true
+        }
+    }
+}
+
+/// True only when Discord itself answered "no such message" (404).
+///
+/// Every other failure - a missing Read Message History permission, a rate
+/// limit, an outage, a dropped connection - means the answer is unknown, not
+/// that the message is gone.
+pub fn is_unknown_message(err: &serenity::prelude::SerenityError) -> bool {
+    use serenity::http::HttpError;
+    use serenity::prelude::SerenityError;
+    matches!(
+        err,
+        SerenityError::Http(HttpError::UnsuccessfulRequest(res))
+            if res.status_code == serenity::http::StatusCode::NOT_FOUND
+    )
+}
