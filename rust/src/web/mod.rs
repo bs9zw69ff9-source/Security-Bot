@@ -27,7 +27,15 @@ pub async fn serve() {
     }
 
     let app = routes::router();
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], WEB.port));
+    // Loopback by default. The dashboard is meant to sit behind a
+    // TLS-terminating proxy, and binding every interface would publish the
+    // plaintext port straight to the internet alongside it, letting anyone
+    // skip TLS entirely. WEB_BIND overrides it for setups without a proxy.
+    let bind: std::net::IpAddr = WEB
+        .bind
+        .parse()
+        .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
+    let addr = std::net::SocketAddr::new(bind, WEB.port);
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {

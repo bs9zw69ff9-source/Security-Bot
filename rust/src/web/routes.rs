@@ -24,12 +24,50 @@ use crate::state::tickets::get_ticket_config;
 use crate::web::auth::{self, Session};
 use crate::web::views::{empty, esc, note_err, page};
 
+/// Response headers applied to every page.
+///
+/// The CSP is the load-bearing one: this app builds HTML by hand, so if an
+/// escaping bug ever slips through, `script-src 'self'` is what stops it
+/// becoming code execution. Styles are inline by design, hence 'unsafe-inline'
+/// there and nowhere else. frame-ancestors 'none' blocks a hostile page from
+/// framing the review queue and tricking a reviewer into clicking Accept.
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; \
+         script-src 'self'; \
+         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+         font-src https://fonts.gstatic.com; \
+         img-src 'self' https://cdn.discordapp.com data:; \
+         form-action 'self'; \
+         base-uri 'none'; \
+         frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    h.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    h.insert(header::REFERRER_POLICY, "same-origin".parse().unwrap());
+    // Only meaningful over https, and only honest to send there.
+    if crate::common::config::WEB.base_url.starts_with("https://") {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            "max-age=31536000; includeSubDomains".parse().unwrap(),
+        );
+    }
+    res
+}
+
 pub fn router() -> Router {
     Router::new()
         .route("/", get(landing))
         .route("/auth/login", get(login))
         .route("/auth/callback", get(callback))
-        .route("/auth/logout", get(logout))
+        // POST, not GET: a GET that destroys the session can be fired by any
+        // page that can make the browser load a URL.
+        .route("/auth/logout", post(logout))
         .route("/servers", get(servers))
         .route("/g/{guild}", get(guild_home))
         .route("/g/{guild}/apply/{key}", get(apply_form).post(apply_submit))
@@ -37,6 +75,7 @@ pub fn router() -> Router {
         .route("/g/{guild}/review", get(review_list))
         .route("/g/{guild}/review/{key}/{user}", post(review_decide))
         .fallback(not_found)
+        .layer(axum::middleware::from_fn(security_headers))
 }
 
 // ── helpers ───────────────────────────────────────────────────
@@ -73,6 +112,10 @@ pub fn guild_access(session: &Session, guild: &str) -> Result<GuildId, Box<Respo
         return Err(deny("Not found", "That server id doesn't look right."));
     };
     let gid = GuildId::new(raw);
+    // The session's server list is a snapshot from login and can be up to a
+    // week old, so it decides what to *show*, never what to allow. Membership
+    // is confirmed against Discord here, so someone who left or was kicked
+    // loses access immediately rather than when their session expires.
     if !session.guilds.iter().any(|g| g.id == guild) {
         return Err(deny("No access", "You're not in that server, so there's nothing here for you."));
     }
@@ -192,7 +235,13 @@ async fn callback(Query(q): Query<CallbackQuery>) -> Response {
     }
 }
 
-async fn logout(h: HeaderMap) -> Response {
+async fn logout(h: HeaderMap, form: FormBody) -> Response {
+    // Signing out is a state change, so it carries the same token as the rest.
+    if let Some(s) = auth::session_for(cookie(&h)) {
+        if !auth::csrf_ok(&s, form.0.get("csrf")) {
+            return Redirect::to("/").into_response();
+        }
+    }
     auth::destroy(cookie(&h));
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, auth::clear_cookie().parse().unwrap());
@@ -345,6 +394,14 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    async fn head_of(path: &str, name: header::HeaderName) -> String {
+        let res = router()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        res.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string()
+    }
+
     async fn get(path: &str) -> (StatusCode, String) {
         let res = router()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -404,5 +461,35 @@ mod tests {
         let (_, location) = get("/auth/login?next=https://evil.example/steal").await;
         let decoded = urlencoding::decode(&location).unwrap_or_default().to_string();
         assert!(!decoded.contains("evil.example"), "off-site next must be dropped: {decoded}");
+    }
+
+    /// The CSP is what keeps an escaping slip from becoming code execution, so
+    /// it has to be on every response, not just the ones we remembered.
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers() {
+        for path in ["/", "/no/such/page", "/servers"] {
+            let csp = head_of(path, header::CONTENT_SECURITY_POLICY).await;
+            assert!(csp.contains("script-src 'self'"), "{path} must forbid inline script: {csp}");
+            assert!(csp.contains("frame-ancestors 'none'"), "{path} must refuse being framed: {csp}");
+            assert!(csp.contains("default-src 'none'"), "{path} should default-deny: {csp}");
+            assert_eq!(head_of(path, header::X_CONTENT_TYPE_OPTIONS).await, "nosniff");
+            assert_eq!(head_of(path, header::X_FRAME_OPTIONS).await, "DENY");
+        }
+    }
+
+    /// Sign-out changes state, so it must not be reachable by making a browser
+    /// load a URL.
+    #[tokio::test]
+    async fn logout_is_not_reachable_by_get() {
+        let (status, _) = get("/auth/logout").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "GET logout would be CSRF-able");
+    }
+
+    /// The pages themselves must not rely on inline script, or the CSP above
+    /// would break the site rather than protect it.
+    #[tokio::test]
+    async fn pages_contain_no_inline_script() {
+        let (_, body) = get("/").await;
+        assert!(!body.contains("<script"), "inline script would be blocked by our own CSP");
     }
 }

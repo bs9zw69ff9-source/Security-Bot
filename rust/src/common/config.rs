@@ -52,6 +52,10 @@ pub static GUILD_ID: Lazy<Option<String>> = Lazy::new(|| env_str("GUILD_ID"));
 pub struct WebConfig {
     pub enabled: bool,
     pub port: u16,
+    /// Interface to listen on. Loopback by default so the plaintext port is
+    /// not reachable from outside the box; set 0.0.0.0 only when nothing is
+    /// proxying in front.
+    pub bind: String,
     /// Public origin, e.g. https://guardian.duckdns.org. Discord matches the
     /// OAuth redirect exactly, so this has to be what users actually browse to.
     pub base_url: String,
@@ -77,6 +81,7 @@ impl WebConfig {
 pub static WEB: Lazy<WebConfig> = Lazy::new(|| WebConfig {
     enabled: env_bool_default_false("WEB_ENABLED"),
     port: env_int("WEB_PORT", 8080) as u16,
+    bind: env_str("WEB_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
     base_url: env_str("WEB_BASE_URL").unwrap_or_default(),
     // CLIENT_ID is accepted as a fallback: it is the same application id, and
     // older .env files already carry it.

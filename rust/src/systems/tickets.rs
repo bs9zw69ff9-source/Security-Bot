@@ -201,7 +201,7 @@ async fn build_transcript(
 }
 
 /// `YYYY-MM-DD HH:MM:SS UTC`, matching the JS transcript's timestamp format.
-fn format_utc(secs: i64) -> String {
+pub fn format_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
     let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);

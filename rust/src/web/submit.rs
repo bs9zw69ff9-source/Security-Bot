@@ -15,7 +15,7 @@ use crate::state::tickets::get_ticket_config;
 use crate::systems::applications::{build_requirements, finalize_application};
 use crate::systems::tickets::open_ticket;
 use crate::web::routes::{collect_answers, find_app, FormBody};
-use crate::web::views::{empty, esc, note_err, note_ok, page};
+use crate::web::views::{csrf_field, empty, esc, note_err, note_ok, page};
 
 use crate::web::routes::{guild_access, is_staff, may_review, require_session};
 
@@ -66,12 +66,13 @@ pub async fn apply_form(h: HeaderMap, Path((guild, key)): Path<(String, String)>
         r#"<h1 style="margin:34px 0 4px;font-size:26px">{emoji} {label}</h1>
            <p class="muted" style="margin:0 0 22px">Your answers go straight to the server's review channel.</p>
            {req}
-           <form method="post" class="card">{fields}
+           <form method="post" class="card">{csrf}{fields}
              <button class="btn" type="submit">Submit application</button>
            </form>"#,
         emoji = esc(&app.emoji),
         label = esc(&app.label),
         req = req_block,
+        csrf = csrf_field(&session),
         fields = fields
     );
     html(page(&app.label, Some(&session), &body))
@@ -91,6 +92,12 @@ pub async fn apply_submit(
         Ok(g) => g,
         Err(r) => return *r,
     };
+    if !crate::web::auth::csrf_ok(&session, form.0.get("csrf")) {
+        return html(page("Expired", Some(&session), &note_err("That form expired. Reload the page and try again.")));
+    }
+    if !crate::web::auth::allow_action(&session.user.id, "apply", 5, 10 * 60 * 1000) {
+        return html(page("Slow down", Some(&session), &note_err("That's a lot of applications in a short time. Try again in a few minutes.")));
+    }
     // Re-read now, not from the rendered page: it may have closed in between.
     let Some(app) = find_app(&guild, &key) else {
         return html(page("Not found", Some(&session), &empty("That application doesn't exist.")));
@@ -158,13 +165,14 @@ pub async fn ticket_form(h: HeaderMap, Path((guild, key)): Path<(String, String)
     let body = format!(
         r#"<h1 style="margin:34px 0 4px;font-size:26px">{emoji} {label}</h1>
            <p class="muted" style="margin:0 0 22px">This opens a private channel with the staff team.</p>
-           <form method="post" class="card">
+           <form method="post" class="card">{csrf}
              <div class="q"><label for="reason">Briefly describe your issue</label>
                <textarea id="reason" name="reason" rows="4" required></textarea></div>
              <button class="btn" type="submit">Open ticket</button>
            </form>"#,
         emoji = if t.emoji.is_empty() { "🎫".to_string() } else { esc(&t.emoji) },
-        label = esc(&t.label)
+        label = esc(&t.label),
+        csrf = csrf_field(&session)
     );
     html(page(&t.label, Some(&session), &body))
 }
@@ -183,6 +191,12 @@ pub async fn ticket_submit(
         Ok(g) => g,
         Err(r) => return *r,
     };
+    if !crate::web::auth::csrf_ok(&session, form.0.get("csrf")) {
+        return html(page("Expired", Some(&session), &note_err("That form expired. Reload the page and try again.")));
+    }
+    if !crate::web::auth::allow_action(&session.user.id, "ticket", 3, 10 * 60 * 1000) {
+        return html(page("Slow down", Some(&session), &note_err("You've opened several tickets just now. Give it a few minutes.")));
+    }
     let reason = form.0.get("reason").map(|s| s.trim().to_string()).unwrap_or_default();
     if reason.is_empty() {
         return html(page("Open a ticket", Some(&session), &note_err("Please say a little about the issue first.")));
@@ -233,14 +247,14 @@ pub async fn review_list(h: HeaderMap, Path(guild): Path<String>) -> Response {
     for p in &pending {
         let label = apps.get(&p.app_key).map(|a| a.label.clone()).unwrap_or_else(|| p.app_key.clone());
         let emoji = apps.get(&p.app_key).map(|a| a.emoji.clone()).unwrap_or_default();
-        let when = p.submitted_at / 1000;
         cards.push_str(&format!(
             r#"<div class="card">
   <div class="row"><h3>{emoji} {label}</h3><span class="pill pending">Awaiting review</span></div>
   <p style="margin:6px 0 2px">{who} <span class="muted">({uid})</span></p>
-  <p class="muted" style="margin:0 0 14px">Submitted <span data-ts="{when}">a moment ago</span> ·
+  <p class="muted" style="margin:0 0 14px">Submitted {when} ·
      <a style="text-decoration:underline" href="https://discord.com/channels/{g}/{ch}/{msg}">open in Discord</a></p>
   <form method="post" action="/g/{g}/review/{key}/{uid}">
+    {csrf}
     <div class="q"><label for="r-{key}-{uid}">Reason (optional, shared with the applicant)</label>
       <input id="r-{key}-{uid}" type="text" name="reason" placeholder="Leave blank for no reason"></div>
     <div class="row">
@@ -253,11 +267,12 @@ pub async fn review_list(h: HeaderMap, Path(guild): Path<String>) -> Response {
             label = esc(&label),
             who = esc(&p.user_name),
             uid = esc(&p.user_id),
-            when = when,
+            when = esc(&crate::systems::tickets::format_utc(p.submitted_at / 1000)),
             g = esc(&guild),
             ch = esc(&p.channel_id),
             msg = esc(&p.message_id),
             key = esc(&p.app_key),
+            csrf = csrf_field(&session),
         ));
     }
 
@@ -265,13 +280,7 @@ pub async fn review_list(h: HeaderMap, Path(guild): Path<String>) -> Response {
         r#"<h1 style="margin:34px 0 4px;font-size:26px">Review queue</h1>
            <p class="muted" style="margin:0 0 22px">{n} waiting. Deciding here does exactly what the buttons in
            Discord do: grants the roles, DMs the applicant, and marks the embed.</p>
-           {cards}
-           <script>
-             for (const el of document.querySelectorAll('[data-ts]')) {{
-               const d = new Date(Number(el.dataset.ts) * 1000);
-               el.textContent = d.toLocaleString();
-             }}
-           </script>"#,
+           {cards}"#,
         n = pending.len(),
         cards = if cards.is_empty() {
             empty("Nothing waiting. Submissions made from Discord DMs show up here too.")
@@ -298,6 +307,9 @@ pub async fn review_decide(
         Ok(g) => g,
         Err(r) => return *r,
     };
+    if !crate::web::auth::csrf_ok(&session, form.0.get("csrf")) {
+        return html(page("Expired", Some(&session), &note_err("That form expired. Reload the page and try again.")));
+    }
     let Some(app) = find_app(&guild, &key) else {
         return html(page("Review", Some(&session), &empty("That application doesn't exist.")));
     };

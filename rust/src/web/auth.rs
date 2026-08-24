@@ -61,6 +61,13 @@ pub struct Session {
     pub user: DiscordUser,
     pub guilds: Vec<UserGuild>,
     pub expires_at: i64,
+    /// Per-session CSRF token, embedded in every form that changes something.
+    ///
+    /// SameSite=Lax already stops a cross-site POST carrying the cookie, so
+    /// this is the second lock rather than the only one: it still holds if the
+    /// cookie policy is ever loosened, and it covers browsers that treat Lax
+    /// inconsistently.
+    pub csrf: String,
 }
 
 static SESSIONS: Lazy<Mutex<HashMap<String, Session>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -130,9 +137,12 @@ pub async fn complete_login(code: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("couldn't reach Discord to exchange the login code: {e}"))?;
     if !res.status().is_success() {
+        // Logged in full, shown to the user only as a status: the body can
+        // echo back request details and is not the visitor's business.
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(format!("Discord rejected the login code ({status}): {body}"));
+        eprintln!("⚠️ OAuth token exchange failed ({status}): {body}");
+        return Err(format!("Discord rejected that sign-in ({status}). Please try again."));
     }
     let token_res: TokenResponse =
         res.json().await.map_err(|e| format!("couldn't read Discord's token response: {e}"))?;
@@ -166,7 +176,10 @@ pub async fn complete_login(code: &str) -> Result<String, String> {
     let id = token();
     let mut s = sessions();
     s.retain(|_, sess| sess.expires_at > now_ms());
-    s.insert(id.clone(), Session { user, guilds, expires_at: now_ms() + SESSION_TTL_MS });
+    s.insert(
+        id.clone(),
+        Session { user, guilds, expires_at: now_ms() + SESSION_TTL_MS, csrf: token() },
+    );
     Ok(id)
 }
 
@@ -198,4 +211,36 @@ pub fn set_cookie(id: &str) -> String {
 
 pub fn clear_cookie() -> String {
     format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
+/// Constant-time-ish comparison for the CSRF token. Length is not secret and
+/// the token is single-purpose, but there is no reason to leak position.
+pub fn csrf_ok(session: &Session, supplied: Option<&String>) -> bool {
+    let Some(given) = supplied else { return false };
+    if given.len() != session.csrf.len() {
+        return false;
+    }
+    given.bytes().zip(session.csrf.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+// ── abuse limits ──────────────────────────────────────────────
+//
+// Submitting posts an embed to a review channel and opening a ticket creates a
+// Discord channel, so an unthrottled endpoint is a way to flood a server using
+// the bot's own permissions. Keyed per user per action.
+
+static ACTIONS: Lazy<Mutex<HashMap<String, Vec<i64>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Returns false when the caller has run out of allowance for `what`.
+pub fn allow_action(user_id: &str, what: &str, limit: usize, window_ms: i64) -> bool {
+    let now = now_ms();
+    let mut map = match ACTIONS.lock() { Ok(g) => g, Err(e) => e.into_inner() };
+    let key = format!("{user_id}:{what}");
+    let hits = map.entry(key).or_default();
+    hits.retain(|t| now - *t < window_ms);
+    if hits.len() >= limit {
+        return false;
+    }
+    hits.push(now);
+    true
 }

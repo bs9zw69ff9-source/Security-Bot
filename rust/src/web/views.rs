@@ -98,9 +98,12 @@ pub fn page(title: &str, session: Option<&Session>, body: &str) -> String {
     let right = match session {
         Some(s) => format!(
             r#"<span class="me"><img src="{}" alt=""> {}</span>
-               <a class="btn ghost sm" href="/auth/logout">Sign out</a>"#,
+               <form method="post" action="/auth/logout" style="margin:0">
+                 {}<button class="btn ghost sm" type="submit">Sign out</button>
+               </form>"#,
             esc(&s.user.avatar_url()),
-            esc(&s.user.display_name())
+            esc(&s.user.display_name()),
+            csrf_field(s)
         ),
         None => r#"<a class="btn sm" href="/auth/login">Sign in with Discord</a>"#.to_string(),
     };
@@ -124,6 +127,11 @@ pub fn page(title: &str, session: Option<&Session>, body: &str) -> String {
         right = right,
         body = body
     )
+}
+
+/// Hidden CSRF input, included in every form that changes something.
+pub fn csrf_field(session: &Session) -> String {
+    format!(r#"<input type="hidden" name="csrf" value="{}">"#, esc(&session.csrf))
 }
 
 pub fn note_err(msg: &str) -> String {
