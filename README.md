@@ -83,59 +83,6 @@ WantedBy=multi-user.target
 No `KillSignal` override is needed: the bot handles SIGTERM (systemd's
 default) as well as SIGINT, and disconnects its shards cleanly on either.
 
-## Web dashboard
-
-Optional, off by default. Serves the same applications and tickets over the
-web: people sign in with Discord, pick one of their servers, and fill a form in
-one pass instead of answering a DM question by question. Staff get a review
-queue with Accept and Deny.
-
-Everything still lands in Discord. A web submission produces the same review
-embed with the same buttons, and a web ticket produces the same private channel
-and welcome embed, because both paths call the same functions
-(`finalize_application`, `open_ticket`) rather than reimplementing them. A
-decision made on the site grants roles, DMs the applicant and marks the embed
-exactly as the buttons do.
-
-It runs **inside the bot process**. Guild settings, applications and tickets are
-held in memory and only mirrored to SQLite, so a separate web service would keep
-its own copy of all of it and the two would overwrite each other's writes.
-
-### Setting it up
-
-1. In the [Discord developer portal](https://discord.com/developers), open your
-   application → **OAuth2**. Copy the client id and secret, and add a redirect
-   URL of `https://your-domain/auth/callback`. Discord matches it exactly, and
-   requires https for anything that isn't localhost.
-2. Fill in the `WEB_*` values in `.env` (see [`.env.example`](.env.example)) and
-   set `WEB_ENABLED=true`.
-3. Put a TLS-terminating proxy in front of it. With Caddy that is two lines:
-
-   ```
-   your-domain {
-       reverse_proxy 127.0.0.1:8080
-   }
-   ```
-
-4. Restart. The log prints the address it bound and the exact redirect URL to
-   register, so a mismatch is easy to spot.
-
-Sessions are in memory, so a restart signs everyone out and no access token is
-ever written to disk. A misconfigured dashboard never takes the bot down: if
-`WEB_ENABLED` is on but credentials are missing, it says which ones and the bot
-carries on normally.
-
-### Access rules
-
-- Every page except the landing page and the OAuth endpoints needs a session.
-- A server page additionally requires that the visitor is in that server **and**
-  the bot is too.
-- The review queue additionally requires staff, re-checked against Discord on
-  every request rather than trusted from the session, so losing a role takes
-  effect immediately. Peer review works as it does in Discord: on the police and
-  crime-family applications, holders of that application's own accepted roles
-  can review it.
-
 ### Per-server setup
 
 In each server, a bot/server owner runs:

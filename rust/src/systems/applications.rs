@@ -515,10 +515,7 @@ impl Drop for ActiveGuard {
 }
 
 /// Post a completed application to its review channel. Returns true on success.
-///
-/// Shared by the Discord DM interview and the web dashboard, so a submission
-/// looks identical however it was made.
-pub async fn finalize_application(
+async fn finalize_application(
     ctx: &Context,
     guild_id: GuildId,
     user: &User,
@@ -570,22 +567,9 @@ pub async fn finalize_application(
     let posted = review_channel
         .send_message(&ctx.http, CreateMessage::new().embed(e).components(vec![row1, row2]))
         .await;
-    let posted = match posted {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    // Index it so the dashboard's review queue can find this exact message.
-    crate::state::applications::add_pending(
-        &guild_id.to_string(),
-        crate::state::applications::PendingSubmission {
-            app_key: app.key.clone(),
-            user_id: user.id.to_string(),
-            user_name: user.name.to_string(),
-            channel_id: review_channel.to_string(),
-            message_id: posted.id.to_string(),
-            submitted_at: now_ms(),
-        },
-    );
+    if posted.is_err() {
+        return false;
+    }
     sec_log(
         ctx,
         guild_id,
@@ -642,8 +626,6 @@ async fn perform_app_accept(
     reason: Option<&str>,
     message_id: MessageId,
 ) {
-    // Decided, so it leaves the dashboard queue too.
-    crate::state::applications::remove_pending(&guild_id.to_string(), key, user_id);
     let Some(app) = get_application(&guild_id.to_string(), key) else { return };
     let Ok(uid_raw) = user_id.parse::<u64>() else { return };
     let applicant = fetch_member(ctx, guild_id, UserId::new(uid_raw)).await;
@@ -727,8 +709,6 @@ async fn perform_app_deny(
     reason: Option<&str>,
     message_id: MessageId,
 ) {
-    // Decided, so it leaves the dashboard queue too.
-    crate::state::applications::remove_pending(&guild_id.to_string(), key, user_id);
     let app = get_application(&guild_id.to_string(), key);
     let label = app.as_ref().map(|a| a.label.clone()).unwrap_or_else(|| "that role".to_string());
 
@@ -905,47 +885,5 @@ pub async fn handle_app_reason_modal(ctx: &Context, i: &ModalInteraction, accept
         perform_app_accept(ctx, guild_id, i.channel_id, &i.user, &key, &user_id, reason.as_deref(), message_id).await;
     } else {
         perform_app_deny(ctx, guild_id, i.channel_id, &i.user, &key, &user_id, reason.as_deref(), message_id).await;
-    }
-}
-
-/// Accept or deny from the dashboard.
-///
-/// Routes straight into the same functions the Discord buttons use, so roles,
-/// DMs, the edited embed and the log entry are identical either way. The
-/// caller has already checked that this reviewer is allowed to decide.
-pub async fn decide_from_web(
-    ctx: &Context,
-    guild_id: GuildId,
-    app: &Application,
-    applicant: UserId,
-    accept: bool,
-    reason: Option<String>,
-    reviewer_id: &str,
-) -> Result<String, String> {
-    let gid = guild_id.to_string();
-    let Some(pending) =
-        crate::state::applications::find_pending(&gid, &app.key, &applicant.to_string())
-    else {
-        return Err("That application has already been decided, or it was submitted before the dashboard existed. Use the buttons on the embed in Discord.".to_string());
-    };
-    let (Ok(chan), Ok(msg)) = (pending.channel_id.parse::<u64>(), pending.message_id.parse::<u64>()) else {
-        return Err("The stored review message looks wrong, so I can't update it.".to_string());
-    };
-    let Ok(reviewer_raw) = reviewer_id.parse::<u64>() else {
-        return Err("Couldn't read your Discord id.".to_string());
-    };
-    let Ok(actor) = UserId::new(reviewer_raw).to_user(&ctx.http).await else {
-        return Err("Couldn't load your Discord profile.".to_string());
-    };
-
-    let channel_id = ChannelId::new(chan);
-    let message_id = MessageId::new(msg);
-    let reason_ref = reason.as_deref();
-    if accept {
-        perform_app_accept(ctx, guild_id, channel_id, &actor, &app.key, &applicant.to_string(), reason_ref, message_id).await;
-        Ok(format!("Accepted {}'s {} application. Roles granted and they've been DMed.", pending.user_name, app.label))
-    } else {
-        perform_app_deny(ctx, guild_id, channel_id, &actor, &app.key, &applicant.to_string(), reason_ref, message_id).await;
-        Ok(format!("Denied {}'s {} application. They've been DMed.", pending.user_name, app.label))
     }
 }
