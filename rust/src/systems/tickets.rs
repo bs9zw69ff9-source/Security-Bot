@@ -257,43 +257,26 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Modal submit → actually create the private channel.
-pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &str, reason: &str) {
-    let Some(guild_id) = i.guild_id else { return };
+/// Open a ticket for a user. Shared by the Discord modal and the web
+/// dashboard, so both produce an identical channel, welcome embed and log
+/// entry rather than drifting apart.
+///
+/// Returns the new channel on success, or a message safe to show the user.
+pub async fn open_ticket(
+    ctx: &Context,
+    guild_id: GuildId,
+    user: &serenity::model::user::User,
+    key: &str,
+    reason: &str,
+) -> Result<ChannelId, String> {
     let cfg = get_ticket_config(&guild_id.to_string());
     let Some(t) = cfg.types.iter().find(|t| t.key == key).cloned() else {
-        let _ = i
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content("Sorry, that ticket option isn't available anymore.")
-                        .ephemeral(true),
-                ),
-            )
-            .await;
-        return;
+        return Err("Sorry, that ticket option isn't available anymore.".to_string());
     };
 
-    if let Some(existing) = find_open_ticket_by_user(&guild_id.to_string(), &i.user.id.to_string(), key) {
-        let _ = i
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(format!("You've already got one open over here: <#{existing}>"))
-                        .ephemeral(true),
-                ),
-            )
-            .await;
-        return;
+    if let Some(existing) = find_open_ticket_by_user(&guild_id.to_string(), &user.id.to_string(), key) {
+        return Err(format!("You've already got one open over here: <#{existing}>"));
     }
-
-    let _ = i
-        .create_response(
-            &ctx.http,
-            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true)),
-        )
-        .await;
 
     // Resolve (or create) the category tickets live under.
     let mut category: Option<ChannelId> = cfg.category_id.parse::<u64>().ok().map(ChannelId::new);
@@ -332,7 +315,7 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
                 | Permissions::READ_MESSAGE_HISTORY
                 | Permissions::ATTACH_FILES,
             deny: Permissions::empty(),
-            kind: PermissionOverwriteType::Member(i.user.id),
+            kind: PermissionOverwriteType::Member(user.id),
         },
     ];
     if let Ok(mr) = g.mod_role_id.parse::<u64>() {
@@ -346,8 +329,7 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         });
     }
 
-    let safe_name: String = i
-        .user
+    let safe_name: String = user
         .name
         .to_lowercase()
         .chars()
@@ -356,9 +338,9 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         .collect();
     let safe_name = if safe_name.is_empty() { "user".to_string() } else { safe_name };
     let channel_name = truncate(&format!("{}-{safe_name}", t.key.replace('_', "-")), 90);
-    let topic = format!("{} ticket for {} ({})", t.label, i.user.tag(), i.user.id);
+    let topic = format!("{} ticket for {} ({})", t.label, user.tag(), user.id);
 
-    let audit_reason = format!("Ticket opened by {}", i.user.tag());
+    let audit_reason = format!("Ticket opened by {}", user.tag());
     let mut builder = CreateChannel::new(channel_name.clone())
         .kind(ChannelType::Text)
         .permissions(overwrites.clone())
@@ -386,15 +368,9 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
     let ticket_channel = match created {
         Ok(c) => c,
         Err(e) => {
-            let _ = i
-                .edit_response(
-                    &ctx.http,
-                    serenity::builder::EditInteractionResponse::new().content(format!(
-                        "Hmm, I couldn't open a ticket channel: `{e}`. Please double-check I have the Manage Channels permission."
-                    )),
-                )
-                .await;
-            return;
+            return Err(format!(
+                "Hmm, I couldn't open a ticket channel: `{e}`. Please double-check I have the Manage Channels permission."
+            ));
         }
     };
 
@@ -403,7 +379,7 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         &ticket_channel.id.to_string(),
         OpenTicket {
             type_key: key.to_string(),
-            opener_id: i.user.id.to_string(),
+            opener_id: user.id.to_string(),
             opened_at: now_ms(),
             claimed_by: None,
             reason: reason.to_string(),
@@ -415,9 +391,9 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         .title(format!("{} {}", if t.emoji.is_empty() { "🎫" } else { &t.emoji }, t.label))
         .description(format!(
             "Thanks for reaching out, <@{}> - someone from the team will be with you shortly. Here's what you told us:\n\n{reason}",
-            i.user.id
+            user.id
         ))
-        .field("Opened by", format!("<@{}>", i.user.id), true)
+        .field("Opened by", format!("<@{}>", user.id), true)
         .field("Category", t.label.clone(), true)
         .field("Status", "🟢 Open, waiting for staff", true)
         .footer(CreateEmbedFooter::new(format!("Ticket ID: {}", ticket_channel.id)))
@@ -432,7 +408,7 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         .send_message(
             &ctx.http,
             CreateMessage::new()
-                .content(format!("{ping}<@{}>", i.user.id))
+                .content(format!("{ping}<@{}>", user.id))
                 .embed(welcome)
                 .components(vec![controls]),
         )
@@ -442,16 +418,30 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         ctx,
         guild_id,
         "Ticket Opened",
-        &format!("<@{}> opened a **{}** ticket over in <#{}>.", i.user.id, t.label, ticket_channel.id),
+        &format!("<@{}> opened a **{}** ticket over in <#{}>.", user.id, t.label, ticket_channel.id),
         colors::INFO,
     )
     .await;
+    Ok(ticket_channel.id)
+}
+
+
+/// Discord modal path: open the ticket, then report the outcome in the
+/// ephemeral reply.
+pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &str, reason: &str) {
+    let Some(guild_id) = i.guild_id else { return };
     let _ = i
-        .edit_response(
+        .create_response(
             &ctx.http,
-            serenity::builder::EditInteractionResponse::new()
-                .content(format!("You're all set - your ticket's open here: <#{}>", ticket_channel.id)),
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true)),
         )
+        .await;
+    let msg = match open_ticket(ctx, guild_id, &i.user, key, reason).await {
+        Ok(id) => format!("You're all set - your ticket's open here: <#{id}>"),
+        Err(why) => why,
+    };
+    let _ = i
+        .edit_response(&ctx.http, serenity::builder::EditInteractionResponse::new().content(msg))
         .await;
 }
 

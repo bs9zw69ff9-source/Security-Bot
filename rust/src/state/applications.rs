@@ -39,6 +39,22 @@ pub struct Application {
     pub closed: bool,
 }
 
+/// A submitted application still waiting on a decision.
+///
+/// The review embed in Discord remains the record; this is the index that
+/// makes the same queue reachable from the dashboard, and it is what lets a
+/// web decision edit the right message.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSubmission {
+    pub app_key: String,
+    pub user_id: String,
+    pub user_name: String,
+    pub channel_id: String,
+    pub message_id: String,
+    pub submitted_at: i64,
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
@@ -51,6 +67,9 @@ pub struct AppConfig {
     pub nypd_questions_v3: bool,
     /// Guards the one-time NYPD review-channel correction below.
     pub nypd_review_v2: bool,
+    /// Submissions awaiting a decision, newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<PendingSubmission>,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, AppConfig>>> = Lazy::new(|| Mutex::new(db::load_all("applications")));
@@ -360,4 +379,41 @@ pub fn migrate_nypd_review_channel_v2() {
     }
     save(home);
     println!("📝 Pointed NYPD application reviews at the police review channel for home guild ({home})");
+}
+
+/// Record a submission as awaiting review.
+pub fn add_pending(guild_id: &str, p: PendingSubmission) {
+    {
+        let mut map = lock();
+        let cfg = map.entry(guild_id.to_string()).or_default();
+        // One live submission per user per application: a resubmission
+        // replaces the old row rather than stacking up.
+        cfg.pending.retain(|x| !(x.app_key == p.app_key && x.user_id == p.user_id));
+        cfg.pending.push(p);
+    }
+    save(guild_id);
+}
+
+/// Drop a submission once it has been decided, however that happened.
+pub fn remove_pending(guild_id: &str, app_key: &str, user_id: &str) {
+    let changed = {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(guild_id) else { return };
+        let before = cfg.pending.len();
+        cfg.pending.retain(|x| !(x.app_key == app_key && x.user_id == user_id));
+        cfg.pending.len() != before
+    };
+    if changed {
+        save(guild_id);
+    }
+}
+
+pub fn list_pending(guild_id: &str) -> Vec<PendingSubmission> {
+    lock().get(guild_id).map(|c| c.pending.clone()).unwrap_or_default()
+}
+
+pub fn find_pending(guild_id: &str, app_key: &str, user_id: &str) -> Option<PendingSubmission> {
+    lock()
+        .get(guild_id)
+        .and_then(|c| c.pending.iter().find(|x| x.app_key == app_key && x.user_id == user_id).cloned())
 }

@@ -45,6 +45,45 @@ pub fn root_file(name: &str) -> PathBuf {
 pub static TOKEN: Lazy<String> = Lazy::new(|| env_str("DISCORD_TOKEN").unwrap_or_default());
 pub static GUILD_ID: Lazy<Option<String>> = Lazy::new(|| env_str("GUILD_ID"));
 
+/// Web dashboard settings. The site runs inside this process rather than as a
+/// separate service: guild settings, applications and tickets are held in
+/// memory here and only mirrored to SQLite, so a second process would keep its
+/// own copy and the two would overwrite each other.
+pub struct WebConfig {
+    pub enabled: bool,
+    pub port: u16,
+    /// Public origin, e.g. https://guardian.duckdns.org. Discord matches the
+    /// OAuth redirect exactly, so this has to be what users actually browse to.
+    pub base_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+impl WebConfig {
+    pub fn redirect_uri(&self) -> String {
+        format!("{}/auth/callback", self.base_url.trim_end_matches('/'))
+    }
+    /// Everything needed to actually serve. Missing credentials are the usual
+    /// reason a deployment has the flag on but no working login.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.client_id.is_empty() { out.push("WEB_CLIENT_ID"); }
+        if self.client_secret.is_empty() { out.push("WEB_CLIENT_SECRET"); }
+        if self.base_url.is_empty() { out.push("WEB_BASE_URL"); }
+        out
+    }
+}
+
+pub static WEB: Lazy<WebConfig> = Lazy::new(|| WebConfig {
+    enabled: env_bool_default_false("WEB_ENABLED"),
+    port: env_int("WEB_PORT", 8080) as u16,
+    base_url: env_str("WEB_BASE_URL").unwrap_or_default(),
+    // CLIENT_ID is accepted as a fallback: it is the same application id, and
+    // older .env files already carry it.
+    client_id: env_str("WEB_CLIENT_ID").or_else(|| env_str("CLIENT_ID")).unwrap_or_default(),
+    client_secret: env_str("WEB_CLIENT_SECRET").unwrap_or_default(),
+});
+
 /// Always fully trusted: immune to anti-nuke, rate limits, and all guards.
 /// Also unlocks the hidden, non-slash owner commands (!failsafe, !restore, etc).
 /// BOT_OWNER_IDS (comma-separated) and/or BOT_OWNER_ID (singular, kept for

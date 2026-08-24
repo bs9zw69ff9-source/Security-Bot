@@ -8,6 +8,7 @@
 // ============================================================
 
 mod commands;
+mod web;
 mod common;
 mod state;
 mod systems;
@@ -36,6 +37,13 @@ pub static START_TIME: OnceCell<i64> = OnceCell::new();
 /// on the shard runners rather than on `Context`.
 pub static SHARD_MANAGER: OnceCell<std::sync::Arc<serenity::gateway::ShardManager>> = OnceCell::new();
 
+/// A live gateway context, so the web dashboard can post to Discord.
+///
+/// Set once the bot is ready. Web requests that need Discord (submitting an
+/// application, opening a ticket) wait for this rather than assuming it, since
+/// the HTTP listener comes up before the gateway connects.
+pub static DISCORD: OnceCell<Context> = OnceCell::new();
+
 /// Gateway heartbeat latency for one shard, formatted for display.
 pub async fn shard_latency(shard_id: serenity::model::id::ShardId) -> String {
     let Some(manager) = SHARD_MANAGER.get() else { return "n/a".to_string() };
@@ -53,6 +61,7 @@ struct Handler;
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ Guardian Bot online as {}", ready.user.tag());
+        let _ = DISCORD.set(ctx.clone());
         println!("👑 Owner(s): {}", common::config::BOT_OWNER_IDS.iter().cloned().collect::<Vec<_>>().join(", "));
         ctx.set_activity(Some(serenity::gateway::ActivityData::watching("Protecting the server 🛡️")));
 
@@ -415,6 +424,10 @@ async fn main() {
         println!("\n{signal} received - shutting down…");
         shard_manager.shutdown_all().await;
     });
+
+    // The dashboard shares this process because guild state lives in memory
+    // here; a separate service would keep its own copy and they would fight.
+    tokio::spawn(web::serve());
 
     if let Err(e) = client.start_autosharded().await {
         eprintln!("❌ Client error: {e}");
