@@ -385,17 +385,15 @@ pub fn migrate_nypd_review_channel_v2() {
 /// that guild and nowhere else, so the id is the condition rather than a
 /// home-guild check. Runs once, guarded by wastelandSeedV1, and never touches
 /// a guild that already has these configured.
-/// Set this to the server the faction applications belong to, then they are
-/// seeded there on the next boot.
+/// The server the faction applications belong to.
 ///
-/// Empty on purpose. 1528753753186898071 was used first and turned out to be
-/// the Little Italy server rather than the one the faction channels live in,
-/// which put the applications under the wrong guild: the panel still posted,
-/// because Discord posts by channel id without checking which server the
-/// channel is in, but it wore the wrong server's name and every button was
-/// dead, since the click arrived from a guild with no such application.
-/// Seeding nowhere is better than seeding somewhere wrong.
-const WASTELAND_GUILD: &str = "";
+/// 1528753753186898071 was used first and turned out to be the Little Italy
+/// server rather than this one, which put the applications under the wrong
+/// guild: the panel still posted, because Discord posts by channel id without
+/// checking which server the channel is in, but it wore the wrong server's
+/// name and every button was dead, since the click arrived from a guild with
+/// no such application. render_channel_panel now refuses that mismatch.
+const WASTELAND_GUILD: &str = "1541171641218764850";
 
 /// Where the faction applications were seeded by mistake, cleaned up below.
 const WASTELAND_WRONG_GUILD: &str = "1528753753186898071";
