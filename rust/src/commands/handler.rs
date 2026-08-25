@@ -36,7 +36,7 @@ use crate::systems::tickets::post_or_edit_panel;
 const STAFF_ONLY: &str = "This one is staff only - you need the mod role.";
 const OWNER_ONLY: &str = "This one's owner only.";
 const NO_MUTE_ROLE: &str =
-    "There is no mute role set up yet. Run `/setup quick`, or set one with `/setup roles mute_role:@Role`.";
+    "There's no mute role yet. Run `/setup quick`, or point me at one with `/setup roles mute_role:@Role`.";
 
 // ── Option helpers ────────────────────────────────────────────
 struct Opts<'a>(Vec<ResolvedOption<'a>>);
@@ -914,7 +914,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     }
                     if let Some(r) = opts.role("mute_role") {
                         update_guild(&gid, |s| s.mute_role_id = r.to_string());
-                        changes.push(format!("Mute role → <@&{r}> _(ensure it denies Send Messages)_"));
+                        changes.push(format!("Mute role → <@&{r}> _(make sure it denies Send Messages)_"));
                     }
                     if changes.is_empty() {
                         return reply_text(ctx, i, "Give me at least one role to set.").await;
@@ -1035,7 +1035,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .field("⚠️ Warns", CONFIG.mod_warn_limit.to_string(), true)
                 .field("🗑️ Purges", CONFIG.mod_purge_limit.to_string(), true)
                 .field("🔒 Lockdowns", CONFIG.mod_lockdown_limit.to_string(), true)
-                .footer(CreateEmbedFooter::new("Edit values in .env and restart to apply changes."))
+                .footer(CreateEmbedFooter::new("These live in .env. Change them there and restart to pick them up."))
                 .timestamp(Timestamp::now());
             reply_embed(ctx, i, e, true).await;
         }
@@ -1070,7 +1070,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 CreateEmbed::new()
                     .color(colors::SUCCESS)
                     .title("✅ Anti-Nuke Active")
-                    .description(format!("The unified audit-log anti-nuke engine is **online**.\n\n**My permissions:**\n{status}"))
+                    .description(format!("Anti-nuke is up and watching the audit log.\n\n**My permissions:**\n{status}"))
                     .timestamp(Timestamp::now()),
                 true,
             )
@@ -1122,7 +1122,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         .take(32)
                         .collect();
                     if key.is_empty() {
-                        return reply_text(ctx, i, "That key is not valid.").await;
+                        return reply_text(ctx, i, "I don't recognise that key.").await;
                     }
                     let label = truncate(opts.str("label").unwrap_or("").trim(), 80);
                     let emoji = opts.str("emoji").unwrap_or("").trim().to_string();
@@ -1146,7 +1146,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 }
                 "listtypes" => {
                     if cfg.types.is_empty() {
-                        return reply_text(ctx, i, "No ticket types configured yet. Use `/tickets addtype`.").await;
+                        return reply_text(ctx, i, "No ticket types yet. Add one with `/tickets addtype`.").await;
                     }
                     let lines = cfg
                         .types
@@ -1160,7 +1160,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let Some(category) = opts.channel("category") else { return };
                     update_ticket_config(&gid, |c| c.category_id = category.to_string());
                     let name = ctx.cache.guild(guild_id).and_then(|g| g.channels.get(&category).map(|c| c.name.to_string())).unwrap_or_default();
-                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("New tickets will be created under **{name}**."), Some("Ticket Category Set")), true).await;
+                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("New tickets will open under **{name}** from now on."), Some("Ticket Category Set")), true).await;
                 }
                 "panel" => {
                     if cfg.types.is_empty() {
@@ -1170,7 +1170,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         .channel("channel")
                         .or_else(|| cfg.panel_channel_id.parse::<u64>().ok().map(ChannelId::new));
                     let Some(channel) = channel else {
-                        return reply_text(ctx, i, "Pick a channel - there is not one set yet.").await;
+                        return reply_text(ctx, i, "Pick a channel, there isn't one set yet.").await;
                     };
                     defer(ctx, i).await;
                     if post_or_edit_panel(ctx, guild_id, channel, &cfg).await {
@@ -1193,7 +1193,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if sub == "list" {
                 let apps = get_applications(&gid);
                 if apps.is_empty() {
-                    return reply_text(ctx, i, "No applications configured. They're seeded automatically when `GUILD_ID` is set.").await;
+                    return reply_text(ctx, i, "No applications set up yet. They get seeded on first boot when `GUILD_ID` is set.").await;
                 }
                 let mut e = CreateEmbed::new().color(colors::INFO).title("📝 Applications").timestamp(Timestamp::now());
                 for a in apps.values() {
@@ -1223,7 +1223,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     get_application(&gid, &raw_key).into_iter().collect()
                 };
                 if targets.is_empty() {
-                    return edit_text(ctx, i, format!("There is no application with the key `{raw_key}`. Run `/applications list` to see the valid keys (or use `all`).")).await;
+                    return edit_text(ctx, i, format!("I don't have an application called `{raw_key}`. `/applications list` shows what there is, or use `all`.")).await;
                 }
                 let mut changed = Vec::new();
                 for a in &targets {
@@ -1250,7 +1250,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
             let key = opts.str("key").unwrap_or("").trim().to_lowercase();
             let Some(app) = get_application(&gid, &key) else {
-                return reply_text(ctx, i, &format!("There is no application with the key `{key}`. Run `/applications list` to see the valid keys.")).await;
+                return reply_text(ctx, i, &format!("I don't have an application called `{key}`. `/applications list` shows what there is.")).await;
             };
 
             match sub {
@@ -1267,7 +1267,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     }
                     let channel_id = channel_opt.map(|c| c.to_string()).unwrap_or(app.panel_channel_id.clone());
                     if channel_id.is_empty() {
-                        return edit_text(ctx, i, "Pick a channel - there is not one set for this application yet.").await;
+                        return edit_text(ctx, i, "Pick a channel, this application hasn't got one yet.").await;
                     }
                     // Render the whole channel group, so a shared channel posts
                     // one combined panel rather than one per app.
@@ -1355,7 +1355,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if sub == "list" {
                 let keys = get_chain_keys(&gid);
                 if keys.is_empty() {
-                    return reply_text(ctx, i, "No chain-of-command boards configured yet.").await;
+                    return reply_text(ctx, i, "No chain-of-command boards set up yet.").await;
                 }
                 let body = keys
                     .iter()
@@ -1483,7 +1483,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .field("📋 /chainofcommand", "`setroles`/`setgroup`/`removegroup`/`setup [channel]`/`refresh`/`view`/`list` - auto-updating role hierarchy boards, each keyed by `key` (defaults to `default`) *(bot/server owner only)*", false)
                 .field("🧪 /nuketest", "Confirm anti-nuke + check my permissions *(owner only)*", false)
                 .field("📈 /status", "Bot health: uptime, latency, guild count, memory *(owner only)*", false)
-                .field("⏱️ Rate Limits", format!("Mod actions are rate-limited over a **{window_hours}h** window. Use `/limits`."), false)
+                .field("⏱️ Rate Limits", format!("Mod actions are capped over a rolling **{window_hours}h**. `/limits` shows where you are."), false)
                 .footer(CreateEmbedFooter::new("Guardian Bot v3 • Security Suite"))
                 .timestamp(Timestamp::now());
             reply_embed(ctx, i, e, true).await;

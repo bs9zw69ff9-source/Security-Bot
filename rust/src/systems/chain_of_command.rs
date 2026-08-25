@@ -119,7 +119,7 @@ fn chain_description(groups: &[ChainGroup], members: &[Holder], existing_roles: 
     }
 
     if group_blocks.is_empty() {
-        return "None of the configured roles exist in this server anymore.".to_string();
+        return "None of the roles on this board exist in the server any more.".to_string();
     }
     let joined = group_blocks.join("\n\n");
     // Discord counts the 4096 description limit in UTF-16 units.

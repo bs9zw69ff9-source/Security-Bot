@@ -68,7 +68,7 @@ pub async fn run_failsafe(ctx: &Context, msg: &Message) {
     let failsafe_role_ids = gc(&guild_id.to_string()).failsafe_role_ids;
     if failsafe_role_ids.is_empty() {
         let _ = msg
-            .reply(&ctx.http, "There are no failsafe roles set up for this server yet. Add some with `/setup failsafe action:add role:@Role` first.")
+            .reply(&ctx.http, "You haven't picked any failsafe roles for this server yet. Add some with `/setup failsafe action:add role:@Role` first.")
             .await;
         return;
     }
@@ -165,7 +165,7 @@ pub async fn run_restore(ctx: &Context, msg: &Message) {
     let Some(guild_id) = msg.guild_id else { return };
     let backup = lock().get(&guild_id.to_string()).cloned();
     let Some(backup) = backup.filter(|b| !b.roles.is_empty()) else {
-        let _ = msg.reply(&ctx.http, "I do not have a failsafe backup saved for this server.").await;
+        let _ = msg.reply(&ctx.http, "I haven't got a failsafe backup for this server.").await;
         return;
     };
 

@@ -185,7 +185,7 @@ pub async fn snapshot_guild(ctx: &Context, guild_id: GuildId) -> Option<(usize, 
 pub async fn rollback_guild(ctx: &Context, guild_id: GuildId, msg: &Message) {
     let snap = lock().get(&guild_id.to_string()).and_then(|v| v.last().cloned());
     let Some(snap) = snap else {
-        let _ = msg.reply(&ctx.http, "There is no snapshot saved yet. Take one with `!snapshot` first.").await;
+        let _ = msg.reply(&ctx.http, "I haven't got a snapshot saved yet. Take one with `!snapshot` first.").await;
         return;
     };
 
@@ -235,7 +235,7 @@ pub async fn rollback_guild(ctx: &Context, guild_id: GuildId, msg: &Message) {
         .await
         .is_some();
     if !confirmed {
-        let _ = msg.reply(&ctx.http, "Rollback cancelled - I did not get a confirmation in time.").await;
+        let _ = msg.reply(&ctx.http, "Rollback cancelled, I didn't hear back in time.").await;
         return;
     }
 

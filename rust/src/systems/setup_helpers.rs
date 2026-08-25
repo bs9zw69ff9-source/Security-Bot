@@ -60,7 +60,7 @@ pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]
             false,
         )
         .footer(serenity::builder::CreateEmbedFooter::new(
-            "Behavioral thresholds are global (.env); these identity settings are per-server.",
+            "Spam, raid and nuke thresholds are the same everywhere (they come from .env). What you set here is per server.",
         ))
         .timestamp(Timestamp::now())
 }
