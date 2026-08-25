@@ -195,3 +195,49 @@ pub fn is_unknown_message(err: &serenity::prelude::SerenityError) -> bool {
             if res.status_code == serenity::http::StatusCode::NOT_FOUND
     )
 }
+
+/// Delete the bot's own duplicate panels in a channel, keeping `keep`.
+///
+/// A panel is recognised by the custom id on its own buttons, so this can only
+/// ever match something this bot posted as a panel. Anything else in the
+/// channel, from anyone including this bot, is left alone: wiping the channel
+/// outright would take staff conversation and pins with it, on every restart,
+/// with no way back.
+///
+/// Scans the most recent 100 messages, which is where a panel lives in
+/// practice, and returns how many it removed.
+pub async fn remove_duplicate_panels(
+    ctx: &Context,
+    channel_id: serenity::model::id::ChannelId,
+    keep: Option<serenity::model::id::MessageId>,
+    marker: &str,
+    what: &str,
+) -> usize {
+    use serenity::builder::GetMessages;
+
+    let me = ctx.cache.current_user().id;
+    let Ok(messages) = channel_id.messages(&ctx.http, GetMessages::new().limit(100)).await else {
+        return 0;
+    };
+
+    let mut removed = 0;
+    for msg in messages {
+        if msg.author.id != me || Some(msg.id) == keep {
+            continue;
+        }
+        // Only our panels carry these custom ids on their components.
+        let is_panel = msg.components.iter().any(|row| {
+            serde_json::to_string(row).map(|j| j.contains(marker)).unwrap_or(false)
+        });
+        if !is_panel {
+            continue;
+        }
+        if msg.delete(&ctx.http).await.is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        println!("🧹 Cleared {removed} stale {what} panel(s) in #{channel_id}");
+    }
+    removed
+}

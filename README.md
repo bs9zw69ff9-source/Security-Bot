@@ -83,6 +83,18 @@ WantedBy=multi-user.target
 No `KillSignal` override is needed: the bot handles SIGTERM (systemd's
 default) as well as SIGINT, and disconnects its shards cleanly on either.
 
+### Duplicate cleanup on restart
+
+After posting its panels and boards at boot, the bot clears any earlier copies
+of them it left behind, so each channel ends up with exactly one.
+
+It removes **only its own panels and boards**, identified by the custom ids on
+their own buttons (or, for chain-of-command boards, which carry no buttons, by
+the board's title in a message the bot posted in that board's channel).
+Everything else in those channels is left alone. The channels are not wiped:
+doing that on every restart would take staff conversation and pins with it,
+irreversibly, to solve a problem that only concerns the bot's own messages.
+
 ### Per-server setup
 
 In each server, a bot/server owner runs:

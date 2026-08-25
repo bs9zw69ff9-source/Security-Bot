@@ -189,6 +189,40 @@ async fn render_chain_of_command_with(ctx: &Context, guild_id: GuildId, key: &st
     }
 }
 
+/// Clear earlier copies of a board in its channel, keeping the tracked one.
+///
+/// Boards carry no buttons, so unlike the ticket and application panels there
+/// is no custom id to match on. The title is used instead, and only against
+/// messages this bot posted in that board's own channel, which keeps it from
+/// reaching anything else that happens to be there.
+pub async fn sweep_duplicate_boards(ctx: &Context, guild_id: GuildId) {
+    use serenity::builder::GetMessages;
+
+    let me = ctx.cache.current_user().id;
+    for key in get_chain_keys(&guild_id.to_string()) {
+        let cfg = get_chain(&guild_id.to_string(), &key);
+        let Ok(raw) = cfg.channel_id.parse::<u64>() else { continue };
+        let channel = ChannelId::new(raw);
+        let keep = cfg.message_id.parse::<u64>().ok().map(MessageId::new);
+        let title = if cfg.title.is_empty() { "📋 Chain of Command".to_string() } else { cfg.title.clone() };
+
+        let Ok(messages) = channel.messages(&ctx.http, GetMessages::new().limit(100)).await else { continue };
+        let mut removed = 0;
+        for msg in messages {
+            if msg.author.id != me || Some(msg.id) == keep {
+                continue;
+            }
+            let matches = msg.embeds.iter().any(|e| e.title.as_deref() == Some(title.as_str()));
+            if matches && msg.delete(&ctx.http).await.is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            println!("🧹 Cleared {removed} stale chain-of-command board(s) in #{channel}");
+        }
+    }
+}
+
 /// Render every board configured for a guild - used on boot/join and after a
 /// tracked role change, since either could touch any one of them.
 pub async fn render_all_chains_of_command(ctx: &Context, guild_id: GuildId) {

@@ -76,6 +76,15 @@ impl EventHandler for Handler {
             systems::chain_of_command::render_all_chains_of_command(&ctx, *guild_id).await;
         }
 
+        // Then clear any earlier copies the bot left behind, so a channel ends
+        // up with exactly one of each. Only its own panels and boards are
+        // touched; everything else in those channels is left alone.
+        for guild_id in &guilds {
+            systems::tickets::sweep_duplicate_ticket_panels(&ctx, *guild_id).await;
+            systems::applications::sweep_duplicate_application_panels(&ctx, *guild_id).await;
+            systems::chain_of_command::sweep_duplicate_boards(&ctx, *guild_id).await;
+        }
+
         // Permission self-audit
         for guild_id in &guilds {
             let Some(perms) = my_permissions(&ctx, *guild_id) else { continue };

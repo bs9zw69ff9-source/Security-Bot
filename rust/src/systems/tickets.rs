@@ -94,6 +94,15 @@ pub async fn ensure_ticket_panel(ctx: &Context, guild_id: GuildId) {
     }
 }
 
+/// Clear any earlier ticket panels left in the panel channel, keeping the one
+/// currently tracked. Run at boot, after the panel is up.
+pub async fn sweep_duplicate_ticket_panels(ctx: &Context, guild_id: GuildId) {
+    let cfg = get_ticket_config(&guild_id.to_string());
+    let Ok(raw) = cfg.panel_channel_id.parse::<u64>() else { return };
+    let keep = cfg.panel_message_id.parse::<u64>().ok().map(MessageId::new);
+    crate::common::embeds::remove_duplicate_panels(ctx, ChannelId::new(raw), keep, "ticket_open_", "ticket").await;
+}
+
 pub fn guild_meta(ctx: &Context, guild_id: GuildId) -> (String, Option<String>) {
     ctx.cache
         .guild(guild_id)

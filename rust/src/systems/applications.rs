@@ -232,6 +232,24 @@ pub async fn refresh_app_panel(ctx: &Context, guild_id: GuildId, app: &Applicati
     render_channel_panel(ctx, guild_id, &app.panel_channel_id, &apps).await;
 }
 
+/// Clear earlier application panels in each panel channel, keeping the one
+/// currently tracked for that channel. Run at boot, after panels are up.
+pub async fn sweep_duplicate_application_panels(ctx: &Context, guild_id: GuildId) {
+    for (channel_id, apps) in apps_by_panel_channel(&guild_id.to_string()) {
+        let Ok(raw) = channel_id.parse::<u64>() else { continue };
+        let keep = apps
+            .iter()
+            .find(|a| !a.panel_message_id.is_empty())
+            .and_then(|a| a.panel_message_id.parse::<u64>().ok())
+            .map(MessageId::new);
+        // Covers both the current buttons and any panel still on the old
+        // dropdown, since either is ours and either would be a duplicate.
+        for marker in ["app_apply_", "app_pick"] {
+            crate::common::embeds::remove_duplicate_panels(ctx, ChannelId::new(raw), keep, marker, "application").await;
+        }
+    }
+}
+
 /// Delete panel messages in every channel except `keep`.
 ///
 /// Used when applications are gathered onto a single panel: the panels they
