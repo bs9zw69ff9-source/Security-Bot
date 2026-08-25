@@ -334,7 +334,22 @@ async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
     let Some(guild_id) = i.guild_id else { return };
     let key = key.to_string();
     let Some(app) = get_application(&guild_id.to_string(), &key) else {
-        return reply_ephemeral(ctx, i, "Sorry, that application isn't around anymore.").await;
+        // Naming the key matters: this fires when a panel is still up but the
+        // application behind it is not in config, which usually means a write
+        // to guardian.db failed and the seed was lost on the next restart.
+        // Without the key in the message there is nothing to go on.
+        eprintln!(
+            "⚠️ apply clicked for `{key}` in guild {guild_id}, but no such application is configured. \
+             Known keys: [{}]. If that list is missing something it should have, check for earlier \
+             'db write applications' errors and that guardian.db is writable by the bot's user.",
+            get_applications(&guild_id.to_string()).keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+        return reply_ephemeral(
+            ctx,
+            i,
+            &format!("I can't find the **{key}** application any more. This panel is out of date, so give a staff member a nudge."),
+        )
+        .await;
     };
     // Re-check even though the button is disabled when closed - the panel
     // message could be stale, so never let a closed application start.
