@@ -26,6 +26,13 @@ pub struct Application {
     pub panel_channel_id: String,
     pub panel_message_id: String,
     pub review_channel_id: String,
+    /// Where a decided application is filed afterwards. Optional: leave either
+    /// empty and that outcome simply isn't copied anywhere, which is how every
+    /// application behaved before these existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub accepted_channel_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub denied_channel_id: String,
     pub accepted_role_ids: Vec<String>,
     pub questions: Vec<String>,
     // Absent rather than `null`/`false` when unset, so the on-disk JSON matches
@@ -51,6 +58,8 @@ pub struct AppConfig {
     pub nypd_questions_v3: bool,
     /// Guards the one-time NYPD review-channel correction below.
     pub nypd_review_v2: bool,
+    /// Guards the one-time wasteland-faction seed below.
+    pub wasteland_seed_v1: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, AppConfig>>> = Lazy::new(|| Mutex::new(db::load_all("applications")));
@@ -161,6 +170,8 @@ pub fn migrate_applications_to_home_guild() {
             panel_channel_id: "1528798524660252814".into(),
             panel_message_id: String::new(),
             review_channel_id: "1529100361720266803".into(),
+            accepted_channel_id: String::new(),
+            denied_channel_id: String::new(),
             accepted_role_ids: strings(&["1528801101003096295", "1528801216518426866", "1528802048131338330"]),
             questions: family_questions(),
             min_age: Some(14),
@@ -177,6 +188,8 @@ pub fn migrate_applications_to_home_guild() {
             panel_channel_id: "1528798524660252814".into(),
             panel_message_id: String::new(),
             review_channel_id: "1528805634995261520".into(),
+            accepted_channel_id: String::new(),
+            denied_channel_id: String::new(),
             accepted_role_ids: strings(&["1528801101003096295", "1528802048131338330", "1528801296411394148"]),
             questions: family_questions(),
             min_age: Some(14),
@@ -193,6 +206,8 @@ pub fn migrate_applications_to_home_guild() {
             panel_channel_id: "1528754443129196747".into(),
             panel_message_id: String::new(),
             review_channel_id: "1528754486678392875".into(),
+            accepted_channel_id: String::new(),
+            denied_channel_id: String::new(),
             accepted_role_ids: strings(&["1528754350963556466"]),
             questions: staff_questions_v2(),
             min_age: Some(15),
@@ -209,6 +224,8 @@ pub fn migrate_applications_to_home_guild() {
             panel_channel_id: "1528754445968740472".into(),
             panel_message_id: String::new(),
             review_channel_id: "1537589602456699031".into(),
+            accepted_channel_id: String::new(),
+            denied_channel_id: String::new(),
             accepted_role_ids: strings(&["1528754363726827572", "1528754358697853050", "1528754369019777034"]),
             questions: strings(&[
                 "How old are you?",
@@ -360,4 +377,146 @@ pub fn migrate_nypd_review_channel_v2() {
     }
     save(home);
     println!("📝 Pointed NYPD application reviews at the police review channel for home guild ({home})");
+}
+
+/// The wasteland factions, for one specific server.
+///
+/// Unlike the other seeds this is not tied to GUILD_ID: these four belong to
+/// that guild and nowhere else, so the id is the condition rather than a
+/// home-guild check. Runs once, guarded by wastelandSeedV1, and never touches
+/// a guild that already has these configured.
+const WASTELAND_GUILD: &str = "1528753753186898071";
+const WASTELAND_PANEL: &str = "1541861563487494236";
+
+/// Six of the seven questions are shared; only the faction-specific one and the
+/// wording of "why" and "responsibilities" differ.
+pub fn faction_questions(full_name: &str, short_name: &str, soldier: &str, situational: &str) -> Vec<String> {
+    vec![
+        "How old are you along with your DOB?".to_string(),
+        "What is your in-game name (gamer tag)?".to_string(),
+        format!("Why do you want to join {full_name}? (1 paragraph minimum)"),
+        "Three enemy faction members are roaming the wasteland and you\u{2019}re by yourself. What will you do?".to_string(),
+        format!("What do you think the main responsibilities of {soldier} are?"),
+        situational.to_string(),
+        // Short name here, not the full one: "a higher-ranking the NCR member"
+        // is what happens when the article comes along for the ride.
+        format!("You are ordered by a higher-ranking {short_name} member to do something you disagree with. What would you do?"),
+    ]
+}
+
+pub fn migrate_wasteland_applications() {
+    {
+        let map = lock();
+        if map.get(WASTELAND_GUILD).map(|c| c.wasteland_seed_v1).unwrap_or(false) {
+            return;
+        }
+    }
+
+    struct Faction {
+        key: &'static str,
+        label: &'static str,
+        emoji: &'static str,
+        /// How the faction is named where the sentence takes an article
+        /// ("join the NCR", "join Caesar's Legion").
+        full_name: &'static str,
+        /// Bare name, for where an article would be wrong
+        /// ("a higher-ranking NCR member").
+        short_name: &'static str,
+        /// "an NCR soldier", "a Legion soldier", and so on.
+        soldier: &'static str,
+        /// The one question that differs between factions.
+        situational: &'static str,
+        pending: &'static str,
+        accepted: &'static str,
+        denied: &'static str,
+        roles: &'static [&'static str],
+    }
+
+    let factions = [
+        Faction {
+            key: "ncr",
+            short_name: "NCR",
+            label: "NCR",
+            emoji: "\u{2b50}",
+            full_name: "the NCR",
+            soldier: "an NCR soldier",
+            situational: "You come across a civilian being threatened by an enemy faction member. How would you handle the situation?",
+            pending: "1541862720540770324",
+            accepted: "1541862746977472592",
+            denied: "1541862770923016273",
+            roles: &["1541755579108950117", "1541837160062390272", "1541841923554148432", "1541861000418959441"],
+        },
+        Faction {
+            key: "legion",
+            short_name: "Legion",
+            label: "Caesar\u{2019}s Legion",
+            emoji: "\u{1f402}",
+            full_name: "Caesar\u{2019}s Legion",
+            soldier: "a Legion soldier",
+            situational: "You encounter a settlement that refuses to submit to the Legion. How would you handle the situation?",
+            pending: "1541862581730549820",
+            accepted: "1541862629533024416",
+            denied: "1541862677964390580",
+            roles: &["1541842189636608060", "1541837268531028088", "1541755581998833716"],
+        },
+        Faction {
+            key: "bos",
+            short_name: "Brotherhood",
+            label: "Brotherhood of Steel",
+            emoji: "\u{2699}\u{fe0f}",
+            full_name: "the Brotherhood of Steel",
+            soldier: "a Brotherhood soldier",
+            situational: "You come across a civilian carrying technology that the Brotherhood considers valuable. How would you handle the situation?",
+            pending: "1541863321400115240",
+            accepted: "1541863365175935026",
+            denied: "1541863407341281402",
+            roles: &["1541755583596859392", "1541837198121242714", "1541841860472078497"],
+        },
+        Faction {
+            key: "enclave",
+            short_name: "Enclave",
+            label: "Enclave",
+            emoji: "\u{1f985}",
+            full_name: "the Enclave",
+            soldier: "an Enclave soldier",
+            situational: "You come across a civilian who refuses to cooperate with the Enclave. How would you handle the situation?",
+            pending: "1541863487779901530",
+            accepted: "1541863532272812103",
+            denied: "1541863566376960060",
+            roles: &["1541755584322474035", "1541837123718615142", "1541842063555956807"],
+        },
+    ];
+
+    {
+        let mut map = lock();
+        let cfg = map.entry(WASTELAND_GUILD.to_string()).or_default();
+        for f in factions {
+            if cfg.apps.contains_key(f.key) {
+                continue;
+            }
+            cfg.apps.insert(
+                f.key.to_string(),
+                Application {
+                    key: f.key.to_string(),
+                    label: f.label.to_string(),
+                    emoji: f.emoji.to_string(),
+                    // All four share one panel channel, so they render as a
+                    // single embed with a dropdown to choose between them.
+                    panel_channel_id: WASTELAND_PANEL.to_string(),
+                    panel_message_id: String::new(),
+                    review_channel_id: f.pending.to_string(),
+                    accepted_channel_id: f.accepted.to_string(),
+                    denied_channel_id: f.denied.to_string(),
+                    accepted_role_ids: f.roles.iter().map(|s| s.to_string()).collect(),
+                    questions: faction_questions(f.full_name, f.short_name, f.soldier, f.situational),
+                    min_age: None,
+                    min_member_time: None,
+                    closed: false,
+                },
+            );
+        }
+        cfg.wasteland_seed_v1 = true;
+    }
+    save(WASTELAND_GUILD);
+    println!("\u{1f4dd} Seeded the wasteland faction applications (NCR, Legion, BOS, Enclave) for {WASTELAND_GUILD}");
 }

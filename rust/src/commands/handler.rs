@@ -1319,6 +1319,29 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     update_application(&gid, &key, |a| a.review_channel_id = c.to_string());
                     reply_embed(ctx, i, embed(colors::SUCCESS, format!("**{}** applications will be sent to <#{c}> for review.", app.label), Some("Applications")), true).await;
                 }
+                "setoutcome" => {
+                    let accepted = opts.channel("accepted");
+                    let denied = opts.channel("denied");
+                    if accepted.is_none() && denied.is_none() {
+                        return reply_text(ctx, i, "Give me an accepted channel, a denied channel, or both.").await;
+                    }
+                    update_application(&gid, &key, |a| {
+                        if let Some(c) = accepted {
+                            a.accepted_channel_id = c.to_string();
+                        }
+                        if let Some(c) = denied {
+                            a.denied_channel_id = c.to_string();
+                        }
+                    });
+                    let mut lines = Vec::new();
+                    if let Some(c) = accepted {
+                        lines.push(format!("Accepted **{}** applications get filed in <#{c}>.", app.label));
+                    }
+                    if let Some(c) = denied {
+                        lines.push(format!("Denied **{}** applications get filed in <#{c}>.", app.label));
+                    }
+                    reply_embed(ctx, i, embed(colors::SUCCESS, lines.join("\n"), Some("Applications")), true).await;
+                }
                 "setpanelchannel" => {
                     let Some(c) = opts.channel("channel") else { return };
                     update_application(&gid, &key, |a| {

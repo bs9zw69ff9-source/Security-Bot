@@ -21,6 +21,7 @@ pub fn run_migrations() {
     applications::migrate_nypd_questions_v2();
     applications::migrate_nypd_questions_v3();
     applications::migrate_nypd_review_channel_v2();
+    applications::migrate_wasteland_applications();
     chain_of_command::migrate_chain_of_command_to_home_guild();
     chain_of_command::migrate_police_chain_of_command_to_home_guild();
 }

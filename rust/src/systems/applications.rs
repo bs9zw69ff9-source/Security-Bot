@@ -688,6 +688,11 @@ fn parse_review_custom_id(custom_id: &str, prefix: &str) -> (String, String) {
 /// staff applications still require the mod role.
 const PEER_REVIEW_APP_KEYS: [&str; 3] = ["nypd", "gambino", "colombo"];
 
+/// A configured channel id, or nothing when it was left blank.
+fn channel_from(raw: &str) -> Option<ChannelId> {
+    raw.parse::<u64>().ok().map(ChannelId::new)
+}
+
 fn can_review_app(member: &serenity::model::guild::Member, owner_id: UserId, app: &Application) -> bool {
     if is_mod(member, owner_id) {
         return true;
@@ -748,7 +753,7 @@ async fn perform_app_accept(
         }
     }
 
-    repaint_review(ctx, channel_id, message_id, APPY_GREEN, None, "app_done_accept", &format!("Accepted by {}", actor.name), ButtonStyle::Success, '✅').await;
+    repaint_review(ctx, channel_id, message_id, APPY_GREEN, None, "app_done_accept", &format!("Accepted by {}", actor.name), ButtonStyle::Success, '✅', channel_from(&app.accepted_channel_id)).await;
 
     if let Some(m) = &applicant {
         let _ = m
@@ -801,7 +806,7 @@ async fn perform_app_deny(
     let app = get_application(&guild_id.to_string(), key);
     let label = app.as_ref().map(|a| a.label.clone()).unwrap_or_else(|| "that role".to_string());
 
-    repaint_review(ctx, channel_id, message_id, APPY_RED, reason, "app_done_deny", &format!("Denied by {}", actor.name), ButtonStyle::Danger, '⛔').await;
+    repaint_review(ctx, channel_id, message_id, APPY_RED, reason, "app_done_deny", &format!("Denied by {}", actor.name), ButtonStyle::Danger, '⛔', app.as_ref().and_then(|a| channel_from(&a.denied_channel_id))).await;
 
     if let Ok(uid_raw) = user_id.parse::<u64>() {
         if let Some(m) = fetch_member(ctx, guild_id, UserId::new(uid_raw)).await {
@@ -839,6 +844,12 @@ async fn perform_app_deny(
 /// Recolour the review embed, optionally append a Reason field, and replace
 /// every control with a single disabled "done" button.
 #[allow(clippy::too_many_arguments)]
+/// Recolour the review message and retire its buttons, and optionally file a
+/// copy of the finished application in an outcome channel.
+///
+/// The copy is built from the same rebuilt embed, so what lands in the
+/// accepted or denied channel is exactly what the reviewer saw, minus the
+/// buttons, rather than a summary that could drift from it.
 async fn repaint_review(
     ctx: &Context,
     channel_id: ChannelId,
@@ -849,6 +860,7 @@ async fn repaint_review(
     done_label: &str,
     style: ButtonStyle,
     emoji: char,
+    file_to: Option<ChannelId>,
 ) {
     let Ok(mut msg) = channel_id.message(&ctx.http, message_id).await else { return };
     let Some(old) = msg.embeds.first().cloned() else { return };
@@ -870,6 +882,10 @@ async fn repaint_review(
         e = e.field("Reason", truncate(r, 1024), false);
     }
     e = e.timestamp(Timestamp::now());
+
+    if let Some(dest) = file_to {
+        let _ = dest.send_message(&ctx.http, CreateMessage::new().embed(e.clone())).await;
+    }
 
     let done = CreateActionRow::Buttons(vec![CreateButton::new(done_id)
         .label(truncate(done_label, 80))
@@ -1053,5 +1069,22 @@ mod tests {
             (0..40).map(|n| app(&format!("k{n}"), &format!("App {n}"), false, 3)).collect();
         let json = row_json(&apps);
         assert_eq!(json.matches("\"value\":").count(), 25, "must cap at 25 options");
+    }
+
+    /// Question 7 names the faction without an article. Building it from the
+    /// same string as "join the NCR" produced "a higher-ranking the NCR
+    /// member", which is the sort of thing only reading the output catches.
+    #[test]
+    fn faction_questions_read_correctly_in_both_positions() {
+        use crate::state::applications::faction_questions;
+        let q = faction_questions("the NCR", "NCR", "an NCR soldier", "Situational?");
+        assert_eq!(q.len(), 7);
+        assert!(q[2].contains("join the NCR"), "q3 takes the article: {}", q[2]);
+        assert!(
+            q[6].contains("higher-ranking NCR member"),
+            "q7 must not carry the article: {}",
+            q[6]
+        );
+        assert!(!q[6].contains("the NCR member"), "article leaked into q7: {}", q[6]);
     }
 }
