@@ -181,6 +181,24 @@ fn set_group_panel_message(guild_id: &str, apps: &[Application], message_id: &st
 pub async fn render_channel_panel(ctx: &Context, guild_id: GuildId, channel_id: &str, apps: &[Application]) {
     let Ok(raw) = channel_id.parse::<u64>() else { return };
     let channel = ChannelId::new(raw);
+
+    // The panel channel has to belong to the guild whose applications these
+    // are. Discord posts by channel id and does not check, so a channel id
+    // from another server posts there quite happily: the panel appears in the
+    // wrong place, wears the wrong server's name in its footer, and every
+    // button is dead, because the click arrives from a guild that has no such
+    // application configured. Refusing here is what turns that into one clear
+    // log line instead of a panel that looks fine and does nothing.
+    let belongs = ctx.cache.guild(guild_id).map(|g| g.channels.contains_key(&channel)).unwrap_or(false);
+    if !belongs {
+        eprintln!(
+            "⚠️ not posting the {} panel: channel {channel} is not in guild {guild_id}. \
+             The application is configured under the wrong server, so the buttons would not work.",
+            apps.iter().map(|a| a.key.clone()).collect::<Vec<_>>().join(", ")
+        );
+        return;
+    }
+
     let (name, icon) = super::tickets::guild_meta(ctx, guild_id);
     let (e, rows) = panel_payload(&name, icon, apps);
 

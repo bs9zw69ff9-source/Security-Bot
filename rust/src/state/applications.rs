@@ -385,7 +385,21 @@ pub fn migrate_nypd_review_channel_v2() {
 /// that guild and nowhere else, so the id is the condition rather than a
 /// home-guild check. Runs once, guarded by wastelandSeedV1, and never touches
 /// a guild that already has these configured.
-const WASTELAND_GUILD: &str = "1528753753186898071";
+/// Set this to the server the faction applications belong to, then they are
+/// seeded there on the next boot.
+///
+/// Empty on purpose. 1528753753186898071 was used first and turned out to be
+/// the Little Italy server rather than the one the faction channels live in,
+/// which put the applications under the wrong guild: the panel still posted,
+/// because Discord posts by channel id without checking which server the
+/// channel is in, but it wore the wrong server's name and every button was
+/// dead, since the click arrived from a guild with no such application.
+/// Seeding nowhere is better than seeding somewhere wrong.
+const WASTELAND_GUILD: &str = "";
+
+/// Where the faction applications were seeded by mistake, cleaned up below.
+const WASTELAND_WRONG_GUILD: &str = "1528753753186898071";
+const WASTELAND_KEYS: [&str; 4] = ["ncr", "legion", "bos", "enclave"];
 const WASTELAND_PANEL: &str = "1541861563487494236";
 
 /// Six of the seven questions are shared; only the faction-specific one and the
@@ -404,7 +418,29 @@ pub fn faction_questions(full_name: &str, short_name: &str, soldier: &str, situa
     ]
 }
 
+/// Take the faction applications back out of the server they were filed under
+/// by mistake, leaving that server's own applications untouched.
+pub fn migrate_unseed_wasteland_from_wrong_guild() {
+    let changed = {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(WASTELAND_WRONG_GUILD) else { return };
+        let before = cfg.apps.len();
+        cfg.apps.retain(|k, _| !WASTELAND_KEYS.contains(&k.as_str()));
+        // Clear the flag too, so the seed can run properly once it has a home.
+        cfg.wasteland_seed_v1 = false;
+        before != cfg.apps.len()
+    };
+    if changed {
+        save(WASTELAND_WRONG_GUILD);
+        println!("📝 Removed the faction applications from {WASTELAND_WRONG_GUILD}, which was the wrong server for them");
+    }
+}
+
 pub fn migrate_wasteland_applications() {
+    // No home yet, so nothing to seed. See WASTELAND_GUILD.
+    if WASTELAND_GUILD.is_empty() {
+        return;
+    }
     {
         let map = lock();
         if map.get(WASTELAND_GUILD).map(|c| c.wasteland_seed_v1).unwrap_or(false) {
