@@ -3,7 +3,7 @@
 use once_cell::sync::Lazy;
 use serenity::builder::{
     CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter, CreateInputText, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, CreateModal, EditMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption};
+    CreateInteractionResponseMessage, CreateMessage, CreateModal, EditMessage};
 use serenity::client::Context;
 use serenity::collector::{ComponentInteractionCollector, MessageCollector};
 use serenity::model::application::{ButtonStyle, ComponentInteraction, InputTextStyle, ModalInteraction};
@@ -91,21 +91,18 @@ pub fn build_app_panel_embed(guild_name: &str, icon: Option<String>, app: &Appli
 
 /// A single Apply button reflecting one app's open/closed state.
 pub fn build_apply_button(app: &Application) -> CreateButton {
-    let closed = app.closed;
-    let label = if closed {
-        truncate(&format!("{} closed", app.label), 80)
+    // Deliberately plain: label only, matching the ticket panel's buttons.
+    // A closed application stays on the panel, greyed out and labelled, so
+    // people can see it exists rather than assuming it was removed.
+    let label = if app.closed {
+        truncate(&format!("{} (closed)", app.label), 80)
     } else {
-        truncate(&format!("Apply for {}", app.label), 80)
+        truncate(&app.label, 80)
     };
-    let mut b = CreateButton::new(format!("app_apply_{}", app.key))
+    CreateButton::new(format!("app_apply_{}", app.key))
         .label(label)
-        .style(if closed { ButtonStyle::Secondary } else { ButtonStyle::Primary })
-        .disabled(closed);
-    let emoji = if closed { "🔒" } else { emoji_or_default(&app.emoji) };
-    if let Ok(parsed) = emoji.parse::<serenity::model::channel::ReactionType>() {
-        b = b.emoji(parsed);
-    }
-    b
+        .style(ButtonStyle::Secondary)
+        .disabled(app.closed)
 }
 
 /// Combined panel embed for a channel that hosts 2+ applications - one embed,
@@ -156,53 +153,6 @@ pub fn apps_by_panel_channel(guild_id: &str) -> Vec<(String, Vec<Application>)> 
     groups
 }
 
-/// The chooser on a panel hosting more than one application.
-///
-/// A dropdown rather than a row of buttons: it stays one line however many
-/// applications there are, each option gets a description rather than just a
-/// label, and it does not run out of room at five the way a button row does.
-/// A closed application still appears, marked closed, so people can see it
-/// exists rather than wondering where it went.
-fn build_apply_select(apps: &[Application]) -> CreateActionRow {
-    let options: Vec<CreateSelectMenuOption> = apps
-        .iter()
-        .take(25)
-        .map(|a| {
-            let label = if a.closed {
-                truncate(&format!("{} (closed)", a.label), 100)
-            } else {
-                truncate(&a.label, 100)
-            };
-            let desc = if a.closed {
-                "Not accepting applications right now".to_string()
-            } else {
-                let n = a.questions.len();
-                format!("{n} question{}", if n == 1 { "" } else { "s" })
-            };
-            let mut opt = CreateSelectMenuOption::new(label, a.key.clone()).description(truncate(&desc, 100));
-            let emoji = if a.closed { "🔒" } else { emoji_or_default(&a.emoji) };
-            if let Ok(parsed) = emoji.parse::<serenity::model::channel::ReactionType>() {
-                opt = opt.emoji(parsed);
-            }
-            opt
-        })
-        .collect();
-
-    // Every option disabled would leave a menu that does nothing, so say so on
-    // the placeholder instead.
-    let all_closed = apps.iter().all(|a| a.closed);
-    let placeholder = if all_closed {
-        "Applications are closed right now"
-    } else {
-        "Choose what you'd like to apply for"
-    };
-    CreateActionRow::SelectMenu(
-        CreateSelectMenu::new("app_pick", CreateSelectMenuKind::String { options })
-            .placeholder(placeholder)
-            .disabled(all_closed),
-    )
-}
-
 fn panel_payload(guild_name: &str, icon: Option<String>, apps: &[Application]) -> (CreateEmbed, Vec<CreateActionRow>) {
     if apps.len() == 1 {
         return (
@@ -210,7 +160,11 @@ fn panel_payload(guild_name: &str, icon: Option<String>, apps: &[Application]) -
             vec![CreateActionRow::Buttons(vec![build_apply_button(&apps[0])])],
         );
     }
-    (build_combined_panel_embed(guild_name, icon, apps), vec![build_apply_select(apps)])
+    // Same layout as the ticket panel: one button per application, wrapped
+    // into rows of five, which is Discord's limit per row.
+    let buttons: Vec<CreateButton> = apps.iter().take(25).map(build_apply_button).collect();
+    let rows = buttons.chunks(5).map(|c| CreateActionRow::Buttons(c.to_vec())).collect();
+    (build_combined_panel_embed(guild_name, icon, apps), rows)
 }
 
 /// Point every app in a channel group at the same panel message id.
@@ -356,10 +310,11 @@ async fn reply_ephemeral(ctx: &Context, i: &ComponentInteraction, content: &str)
         .await;
 }
 
-/// Someone picked an application from the panel dropdown.
+/// Fallback for a panel that still carries the old dropdown.
 ///
-/// Hands straight to the same flow the single-application button uses, so a
-/// panel with one app and a panel with six behave identically from here on.
+/// Panels are edited in place on boot, so they become buttons on the next
+/// restart. If that edit ever fails, this keeps the stale dropdown working
+/// instead of leaving a dead control on the panel.
 pub async fn handle_app_pick(ctx: &Context, i: &ComponentInteraction) {
     use serenity::model::application::ComponentInteractionDataKind;
     let ComponentInteractionDataKind::StringSelect { values } = &i.data.kind else { return };
@@ -1015,60 +970,59 @@ mod tests {
         serde_json::to_string(&rows).unwrap()
     }
 
-    /// One application keeps its single Apply button: a dropdown to choose
-    /// between one thing would be worse, not better.
+    /// One application, one button.
     #[test]
-    fn a_lone_application_still_gets_a_button() {
+    fn a_lone_application_gets_a_button() {
         let json = row_json(&[app("staff", "Staff", false, 6)]);
         assert!(json.contains("app_apply_staff"), "expected an apply button: {json}");
-        assert!(!json.contains("app_pick"), "one application should not get a chooser");
     }
 
-    /// Several applications on one panel collapse into a single chooser rather
-    /// than a row of buttons.
+    /// Several applications get a button each, laid out like the ticket panel
+    /// rather than collapsed behind a chooser.
     #[test]
-    fn several_applications_share_one_chooser() {
+    fn several_applications_each_get_their_own_button() {
         let apps = [
-            app("staff", "Staff", false, 6),
-            app("nypd", "NYPD", false, 14),
-            app("gambino", "Gambino", false, 7),
-            app("colombo", "Colombo", false, 7),
+            app("ncr", "NCR", false, 7),
+            app("legion", "Caesar's Legion", false, 7),
+            app("bos", "Brotherhood of Steel", false, 7),
+            app("enclave", "Enclave", false, 7),
         ];
         let json = row_json(&apps);
-        assert!(json.contains("app_pick"), "expected one chooser: {json}");
-        for key in ["staff", "nypd", "gambino", "colombo"] {
-            assert!(json.contains(key), "{key} should be an option: {json}");
+        for key in ["ncr", "legion", "bos", "enclave"] {
+            assert!(json.contains(&format!("app_apply_{key}")), "{key} needs a button: {json}");
         }
-        assert!(!json.contains("app_apply_"), "the chooser replaces the per-app buttons");
+        assert!(!json.contains("app_pick"), "no dropdown should be built");
     }
 
-    /// A closed application stays visible and labelled, so people can see it
-    /// exists rather than assuming it was removed.
+    /// The label is the application name and nothing else: no emoji, no
+    /// question count, no "Apply for" prefix.
     #[test]
-    fn a_closed_application_is_shown_as_closed_not_hidden() {
-        let apps = [app("staff", "Staff", true, 6), app("nypd", "NYPD", false, 14)];
-        let json = row_json(&apps);
+    fn button_labels_carry_nothing_but_the_name() {
+        let json = row_json(&[app("ncr", "NCR", false, 7), app("bos", "Brotherhood of Steel", false, 7)]);
+        assert!(json.contains(r#""label":"NCR""#), "plain label expected: {json}");
+        assert!(json.contains(r#""label":"Brotherhood of Steel""#), "plain label expected: {json}");
+        assert!(!json.contains("Apply for"), "no prefix on the label: {json}");
+        assert!(!json.contains("question"), "question counts must not appear: {json}");
+        assert!(!json.contains("emoji"), "no emoji on application buttons: {json}");
+    }
+
+    /// A closed application stays on the panel, greyed out and labelled, so
+    /// people can see it exists rather than assuming it was removed.
+    #[test]
+    fn a_closed_application_is_shown_disabled_not_hidden() {
+        let json = row_json(&[app("staff", "Staff", true, 6), app("nypd", "NYPD", false, 14)]);
         assert!(json.contains("Staff (closed)"), "closed apps stay listed: {json}");
+        assert!(json.contains(r#""disabled":true"#), "and cannot be clicked: {json}");
         assert!(json.contains("NYPD"));
     }
 
-    /// With nothing open there is nothing to choose, so the menu says so
-    /// instead of opening onto a list that cannot be used.
+    /// Discord allows five buttons per row, so more than that has to wrap.
     #[test]
-    fn a_panel_with_everything_closed_disables_the_chooser() {
-        let apps = [app("staff", "Staff", true, 6), app("nypd", "NYPD", true, 14)];
-        let json = row_json(&apps);
-        assert!(json.contains("\"disabled\":true"), "chooser should be disabled: {json}");
-        assert!(json.contains("closed right now"), "and should say why: {json}");
-    }
-
-    /// Discord refuses a select menu with more than 25 options.
-    #[test]
-    fn the_chooser_stays_within_discords_option_limit() {
+    fn buttons_wrap_into_rows_of_five() {
         let apps: Vec<Application> =
-            (0..40).map(|n| app(&format!("k{n}"), &format!("App {n}"), false, 3)).collect();
-        let json = row_json(&apps);
-        assert_eq!(json.matches("\"value\":").count(), 25, "must cap at 25 options");
+            (0..12).map(|n| app(&format!("k{n}"), &format!("App {n}"), false, 3)).collect();
+        let (_, rows) = panel_payload("Test Server", None, &apps);
+        assert_eq!(rows.len(), 3, "12 buttons should be 5 + 5 + 2");
     }
 
     /// Question 7 names the faction without an article. Building it from the
@@ -1086,5 +1040,24 @@ mod tests {
             q[6]
         );
         assert!(!q[6].contains("the NCR member"), "article leaked into q7: {}", q[6]);
+    }
+
+    /// When every application on a panel has the same requirements, the block
+    /// is shown once rather than repeated under each name. That is what the
+    /// four faction applications do, so their panel is one requirements block
+    /// and a row of buttons.
+    #[test]
+    fn a_panel_with_matching_requirements_shows_the_block_once() {
+        let apps = [
+            app("ncr", "NCR", false, 7),
+            app("legion", "Caesar's Legion", false, 7),
+            app("bos", "Brotherhood of Steel", false, 7),
+            app("enclave", "Enclave", false, 7),
+        ];
+        let (embed, _) = panel_payload("New Vegas", None, &apps);
+        let json = serde_json::to_string(&embed).unwrap();
+        assert_eq!(json.matches("REQUIREMENTS").count(), 1, "one block, not four: {json}");
+        // Names live on the buttons, so they are not repeated in the body.
+        assert!(!json.contains("Caesar"), "app names belong on the buttons: {json}");
     }
 }
