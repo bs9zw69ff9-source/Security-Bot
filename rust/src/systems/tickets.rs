@@ -621,7 +621,19 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
 }
 
 /// Re-render an existing panel message in place, or post a fresh one.
-pub async fn post_or_edit_panel(ctx: &Context, guild_id: GuildId, channel: ChannelId, cfg: &TicketConfig) -> bool {
+/// Post the panel, or edit the existing one. `Err` carries something worth
+/// showing the person who ran the command.
+pub async fn post_or_edit_panel(
+    ctx: &Context,
+    guild_id: GuildId,
+    channel: ChannelId,
+    cfg: &TicketConfig,
+) -> Result<(), String> {
+    let missing = crate::common::embeds::missing_panel_permissions(ctx, guild_id, channel);
+    if !missing.is_empty() {
+        return Err(format!("I need {} in <#{channel}> before I can put the panel there.", missing.join(", ")));
+    }
+
     let (name, icon) = guild_meta(ctx, guild_id);
     let e = build_ticket_panel_embed(&name, icon, cfg);
     let rows = build_ticket_panel_rows(cfg);
@@ -634,7 +646,7 @@ pub async fn post_or_edit_panel(ctx: &Context, guild_id: GuildId, channel: Chann
                         c.panel_channel_id = channel.to_string();
                         c.panel_message_id = msg.id.to_string();
                     });
-                    return true;
+                    return Ok(());
                 }
             }
         }
@@ -645,8 +657,9 @@ pub async fn post_or_edit_panel(ctx: &Context, guild_id: GuildId, channel: Chann
                 c.panel_channel_id = channel.to_string();
                 c.panel_message_id = posted.id.to_string();
             });
-            true
+            Ok(())
         }
-        Err(_) => false,
+        // Discord's own words: far more use than a guess at what went wrong.
+        Err(e) => Err(format!("Discord wouldn't let me post there: {e}")),
     }
 }

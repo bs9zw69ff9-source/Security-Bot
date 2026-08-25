@@ -241,3 +241,34 @@ pub async fn remove_duplicate_panels(
     }
     removed
 }
+
+/// Which of the permissions needed to post a panel the bot is missing in a
+/// channel, as human-readable names.
+///
+/// Checked before posting so the failure can name the problem. "Check my
+/// permissions" is not much help when the whole question is which one.
+pub fn missing_panel_permissions(
+    ctx: &Context,
+    guild_id: serenity::model::id::GuildId,
+    channel_id: serenity::model::id::ChannelId,
+) -> Vec<&'static str> {
+    use serenity::model::Permissions;
+
+    let me = ctx.cache.current_user().id;
+    let Some(guild) = ctx.cache.guild(guild_id) else { return Vec::new() };
+    let Some(channel) = guild.channels.get(&channel_id) else {
+        return vec!["a channel in this server (that one isn't in it)"];
+    };
+    let Some(member) = guild.members.get(&me) else { return Vec::new() };
+    let perms = guild.user_permissions_in(channel, member);
+
+    [
+        (Permissions::VIEW_CHANNEL, "View Channel"),
+        (Permissions::SEND_MESSAGES, "Send Messages"),
+        (Permissions::EMBED_LINKS, "Embed Links"),
+    ]
+    .into_iter()
+    .filter(|(p, _)| !perms.contains(*p))
+    .map(|(_, name)| name)
+    .collect()
+}

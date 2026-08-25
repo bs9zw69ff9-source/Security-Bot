@@ -199,6 +199,18 @@ pub async fn render_channel_panel(ctx: &Context, guild_id: GuildId, channel_id: 
         return;
     }
 
+    // Same check the ticket panel does, so a permissions problem says which
+    // permission rather than leaving a panel quietly missing.
+    let missing = crate::common::embeds::missing_panel_permissions(ctx, guild_id, channel);
+    if !missing.is_empty() {
+        eprintln!(
+            "⚠️ can't post the {} panel in {channel}: I'm missing {}.",
+            apps.iter().map(|a| a.key.clone()).collect::<Vec<_>>().join(", "),
+            missing.join(", ")
+        );
+        return;
+    }
+
     let (name, icon) = super::tickets::guild_meta(ctx, guild_id);
     let (e, rows) = panel_payload(&name, icon, apps);
 
@@ -212,8 +224,9 @@ pub async fn render_channel_panel(ctx: &Context, guild_id: GuildId, channel_id: 
             }
         }
     }
-    if let Ok(posted) = channel.send_message(&ctx.http, CreateMessage::new().embed(e).components(rows)).await {
-        set_group_panel_message(&guild_id.to_string(), apps, &posted.id.to_string());
+    match channel.send_message(&ctx.http, CreateMessage::new().embed(e).components(rows)).await {
+        Ok(posted) => set_group_panel_message(&guild_id.to_string(), apps, &posted.id.to_string()),
+        Err(e) => eprintln!("⚠️ couldn't post the application panel in {channel}: {e}"),
     }
 }
 

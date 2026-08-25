@@ -1173,10 +1173,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         return reply_text(ctx, i, "Pick a channel, there isn't one set yet.").await;
                     };
                     defer(ctx, i).await;
-                    if post_or_edit_panel(ctx, guild_id, channel, &cfg).await {
-                        edit_text(ctx, i, format!("Done - the ticket panel is up in <#{channel}>.")).await;
-                    } else {
-                        edit_text(ctx, i, "I could not post the panel there. Please check my permissions in that channel.").await;
+                    match post_or_edit_panel(ctx, guild_id, channel, &cfg).await {
+                        Ok(()) => edit_text(ctx, i, format!("Done - the ticket panel is up in <#{channel}>.")).await,
+                        Err(why) => edit_text(ctx, i, why).await,
                     }
                 }
                 _ => {}
@@ -1276,7 +1275,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return edit_embed(ctx, i, embed(
                     colors::SUCCESS,
                     format!(
-                        "All **{}** applications are on one panel in <#{c}> now: {}.\nPeople pick what they want from the dropdown.",
+                        "All **{}** applications are on one panel in <#{c}> now: {}.\nThere's a button for each.",
                         moved.len(),
                         moved.join(", ")
                     ),
