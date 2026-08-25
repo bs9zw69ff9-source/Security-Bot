@@ -3,8 +3,7 @@
 use once_cell::sync::Lazy;
 use serenity::builder::{
     CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter, CreateInputText, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, CreateModal, EditMessage,
-};
+    CreateInteractionResponseMessage, CreateMessage, CreateModal, EditMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption};
 use serenity::client::Context;
 use serenity::collector::{ComponentInteractionCollector, MessageCollector};
 use serenity::model::application::{ButtonStyle, ComponentInteraction, InputTextStyle, ModalInteraction};
@@ -157,6 +156,53 @@ pub fn apps_by_panel_channel(guild_id: &str) -> Vec<(String, Vec<Application>)> 
     groups
 }
 
+/// The chooser on a panel hosting more than one application.
+///
+/// A dropdown rather than a row of buttons: it stays one line however many
+/// applications there are, each option gets a description rather than just a
+/// label, and it does not run out of room at five the way a button row does.
+/// A closed application still appears, marked closed, so people can see it
+/// exists rather than wondering where it went.
+fn build_apply_select(apps: &[Application]) -> CreateActionRow {
+    let options: Vec<CreateSelectMenuOption> = apps
+        .iter()
+        .take(25)
+        .map(|a| {
+            let label = if a.closed {
+                truncate(&format!("{} (closed)", a.label), 100)
+            } else {
+                truncate(&a.label, 100)
+            };
+            let desc = if a.closed {
+                "Not accepting applications right now".to_string()
+            } else {
+                let n = a.questions.len();
+                format!("{n} question{}", if n == 1 { "" } else { "s" })
+            };
+            let mut opt = CreateSelectMenuOption::new(label, a.key.clone()).description(truncate(&desc, 100));
+            let emoji = if a.closed { "🔒" } else { emoji_or_default(&a.emoji) };
+            if let Ok(parsed) = emoji.parse::<serenity::model::channel::ReactionType>() {
+                opt = opt.emoji(parsed);
+            }
+            opt
+        })
+        .collect();
+
+    // Every option disabled would leave a menu that does nothing, so say so on
+    // the placeholder instead.
+    let all_closed = apps.iter().all(|a| a.closed);
+    let placeholder = if all_closed {
+        "Applications are closed right now"
+    } else {
+        "Choose what you'd like to apply for"
+    };
+    CreateActionRow::SelectMenu(
+        CreateSelectMenu::new("app_pick", CreateSelectMenuKind::String { options })
+            .placeholder(placeholder)
+            .disabled(all_closed),
+    )
+}
+
 fn panel_payload(guild_name: &str, icon: Option<String>, apps: &[Application]) -> (CreateEmbed, Vec<CreateActionRow>) {
     if apps.len() == 1 {
         return (
@@ -164,9 +210,7 @@ fn panel_payload(guild_name: &str, icon: Option<String>, apps: &[Application]) -
             vec![CreateActionRow::Buttons(vec![build_apply_button(&apps[0])])],
         );
     }
-    let buttons: Vec<CreateButton> = apps.iter().take(25).map(build_apply_button).collect();
-    let rows = buttons.chunks(5).map(|c| CreateActionRow::Buttons(c.to_vec())).collect();
-    (build_combined_panel_embed(guild_name, icon, apps), rows)
+    (build_combined_panel_embed(guild_name, icon, apps), vec![build_apply_select(apps)])
 }
 
 /// Point every app in a channel group at the same panel message id.
@@ -214,6 +258,32 @@ pub async fn refresh_app_panel(ctx: &Context, guild_id: GuildId, app: &Applicati
         .map(|(_, a)| a)
         .unwrap_or_else(|| vec![app.clone()]);
     render_channel_panel(ctx, guild_id, &app.panel_channel_id, &apps).await;
+}
+
+/// Delete panel messages in every channel except `keep`.
+///
+/// Used when applications are gathered onto a single panel: the panels they
+/// leave behind are still live messages with a working chooser on them, so
+/// without this people would keep applying through a panel that no longer
+/// reflects the configuration.
+pub async fn retire_panels_outside(ctx: &Context, guild_id: GuildId, keep: &str) {
+    for (channel_id, apps) in apps_by_panel_channel(&guild_id.to_string()) {
+        if channel_id == keep {
+            continue;
+        }
+        let Ok(raw) = channel_id.parse::<u64>() else { continue };
+        let channel = ChannelId::new(raw);
+        let mut seen: Vec<String> = Vec::new();
+        for a in &apps {
+            if a.panel_message_id.is_empty() || seen.contains(&a.panel_message_id) {
+                continue;
+            }
+            seen.push(a.panel_message_id.clone());
+            if let Ok(mid) = a.panel_message_id.parse::<u64>() {
+                let _ = channel.delete_message(&ctx.http, MessageId::new(mid)).await;
+            }
+        }
+    }
 }
 
 /// Post each channel's panel if it isn't already up. For a shared channel this
@@ -286,9 +356,28 @@ async fn reply_ephemeral(ctx: &Context, i: &ComponentInteraction, content: &str)
         .await;
 }
 
+/// Someone picked an application from the panel dropdown.
+///
+/// Hands straight to the same flow the single-application button uses, so a
+/// panel with one app and a panel with six behave identically from here on.
+pub async fn handle_app_pick(ctx: &Context, i: &ComponentInteraction) {
+    use serenity::model::application::ComponentInteractionDataKind;
+    let ComponentInteractionDataKind::StringSelect { values } = &i.data.kind else { return };
+    let Some(key) = values.first() else { return };
+    let key = key.to_string();
+    start_application(ctx, i, &key).await;
+}
+
 pub async fn handle_app_apply(ctx: &Context, i: &ComponentInteraction) {
-    let Some(guild_id) = i.guild_id else { return };
     let key = i.data.custom_id.trim_start_matches("app_apply_").to_string();
+    start_application(ctx, i, &key).await;
+}
+
+/// The apply flow, entered either from a single application's button or from
+/// the dropdown on a combined panel.
+async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
+    let Some(guild_id) = i.guild_id else { return };
+    let key = key.to_string();
     let Some(app) = get_application(&guild_id.to_string(), &key) else {
         return reply_ephemeral(ctx, i, "Sorry, that application isn't around anymore.").await;
     };
@@ -885,5 +974,84 @@ pub async fn handle_app_reason_modal(ctx: &Context, i: &ModalInteraction, accept
         perform_app_accept(ctx, guild_id, i.channel_id, &i.user, &key, &user_id, reason.as_deref(), message_id).await;
     } else {
         perform_app_deny(ctx, guild_id, i.channel_id, &i.user, &key, &user_id, reason.as_deref(), message_id).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(key: &str, label: &str, closed: bool, questions: usize) -> Application {
+        Application {
+            key: key.into(),
+            label: label.into(),
+            emoji: "📝".into(),
+            questions: (0..questions).map(|n| format!("Question {n}")).collect(),
+            closed,
+            ..Default::default()
+        }
+    }
+
+    /// Serialising the row is the only way to see what a serenity builder
+    /// actually produces without a live gateway.
+    fn row_json(apps: &[Application]) -> String {
+        let (_, rows) = panel_payload("Test Server", None, apps);
+        serde_json::to_string(&rows).unwrap()
+    }
+
+    /// One application keeps its single Apply button: a dropdown to choose
+    /// between one thing would be worse, not better.
+    #[test]
+    fn a_lone_application_still_gets_a_button() {
+        let json = row_json(&[app("staff", "Staff", false, 6)]);
+        assert!(json.contains("app_apply_staff"), "expected an apply button: {json}");
+        assert!(!json.contains("app_pick"), "one application should not get a chooser");
+    }
+
+    /// Several applications on one panel collapse into a single chooser rather
+    /// than a row of buttons.
+    #[test]
+    fn several_applications_share_one_chooser() {
+        let apps = [
+            app("staff", "Staff", false, 6),
+            app("nypd", "NYPD", false, 14),
+            app("gambino", "Gambino", false, 7),
+            app("colombo", "Colombo", false, 7),
+        ];
+        let json = row_json(&apps);
+        assert!(json.contains("app_pick"), "expected one chooser: {json}");
+        for key in ["staff", "nypd", "gambino", "colombo"] {
+            assert!(json.contains(key), "{key} should be an option: {json}");
+        }
+        assert!(!json.contains("app_apply_"), "the chooser replaces the per-app buttons");
+    }
+
+    /// A closed application stays visible and labelled, so people can see it
+    /// exists rather than assuming it was removed.
+    #[test]
+    fn a_closed_application_is_shown_as_closed_not_hidden() {
+        let apps = [app("staff", "Staff", true, 6), app("nypd", "NYPD", false, 14)];
+        let json = row_json(&apps);
+        assert!(json.contains("Staff (closed)"), "closed apps stay listed: {json}");
+        assert!(json.contains("NYPD"));
+    }
+
+    /// With nothing open there is nothing to choose, so the menu says so
+    /// instead of opening onto a list that cannot be used.
+    #[test]
+    fn a_panel_with_everything_closed_disables_the_chooser() {
+        let apps = [app("staff", "Staff", true, 6), app("nypd", "NYPD", true, 14)];
+        let json = row_json(&apps);
+        assert!(json.contains("\"disabled\":true"), "chooser should be disabled: {json}");
+        assert!(json.contains("closed right now"), "and should say why: {json}");
+    }
+
+    /// Discord refuses a select menu with more than 25 options.
+    #[test]
+    fn the_chooser_stays_within_discords_option_limit() {
+        let apps: Vec<Application> =
+            (0..40).map(|n| app(&format!("k{n}"), &format!("App {n}"), false, 3)).collect();
+        let json = row_json(&apps);
+        assert_eq!(json.matches("\"value\":").count(), 25, "must cap at 25 options");
     }
 }

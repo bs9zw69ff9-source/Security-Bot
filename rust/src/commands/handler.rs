@@ -1249,6 +1249,41 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
 
             let key = opts.str("key").unwrap_or("").trim().to_lowercase();
+
+            // `setpanelchannel key:all` collects every application onto one
+            // panel. Applications sharing a channel already render as a single
+            // embed with a chooser, so pointing them all at one channel is the
+            // whole of it.
+            if sub == "setpanelchannel" && key == "all" {
+                let Some(c) = opts.channel("channel") else { return };
+                defer(ctx, i).await;
+                let target = c.to_string();
+                let apps = get_applications(&gid);
+                if apps.is_empty() {
+                    return edit_text(ctx, i, "There are no applications to gather up.").await;
+                }
+                // Old panels in the channels they are leaving would otherwise
+                // sit there for ever, still showing buttons.
+                crate::systems::applications::retire_panels_outside(ctx, guild_id, &target).await;
+                let moved: Vec<String> = apps.values().map(|a| a.label.clone()).collect();
+                for k in apps.keys().cloned().collect::<Vec<_>>() {
+                    update_application(&gid, &k, |a| {
+                        a.panel_channel_id = target.clone();
+                        a.panel_message_id.clear();
+                    });
+                }
+                crate::systems::applications::ensure_application_panels(ctx, guild_id).await;
+                return edit_embed(ctx, i, embed(
+                    colors::SUCCESS,
+                    format!(
+                        "All **{}** applications are on one panel in <#{c}> now: {}.\nPeople pick what they want from the dropdown.",
+                        moved.len(),
+                        moved.join(", ")
+                    ),
+                    Some("Applications"),
+                )).await;
+            }
+
             let Some(app) = get_application(&gid, &key) else {
                 return reply_text(ctx, i, &format!("I don't have an application called `{key}`. `/applications list` shows what there is.")).await;
             };

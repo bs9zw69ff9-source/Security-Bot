@@ -264,8 +264,15 @@ application type, a DM interview the applicant fills in, and a staff review
 step with **Accept**/**Deny** that grants roles on acceptance.
 
 **Panels group by channel:** applications that share a panel channel are
-rendered as **one embed with a button per application** rather than one
-embed each. So the two family applications (Gambino + Colombo, which share
+rendered as **one embed** rather than one embed each. A single application
+keeps its Apply button; two or more get a dropdown to pick from, which stays
+one line however many there are and shows each one's question count. Closed
+applications stay listed and marked closed rather than vanishing.
+
+To put every application on one panel, run
+`/applications setpanelchannel key:all channel:#your-channel`. It moves them
+all, deletes the panels left behind in the channels they came from, and posts
+the combined one. So the two family applications (Gambino + Colombo, which share
 a channel) appear as a single panel with two buttons, while Staff and NYPD
 each get their own single-button panel. `/applications panel key:<key>`
 posts/refreshes the whole panel for that application's channel.

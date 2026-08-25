@@ -217,6 +217,8 @@ impl EventHandler for Handler {
                     systems::tickets::handle_ticket_claim(&ctx, &i).await;
                 } else if id == "ticket_close" {
                     systems::tickets::handle_ticket_close(&ctx, &i).await;
+                } else if id == "app_pick" {
+                    systems::applications::handle_app_pick(&ctx, &i).await;
                 } else if id.starts_with("app_apply_") {
                     systems::applications::handle_app_apply(&ctx, &i).await;
                 } else if id.starts_with("app_acceptwithreason_") {
