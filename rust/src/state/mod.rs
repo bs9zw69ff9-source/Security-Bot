@@ -23,6 +23,7 @@ pub fn run_migrations() {
     applications::migrate_nypd_review_channel_v2();
     applications::migrate_unseed_wasteland_from_wrong_guild();
     applications::migrate_wasteland_applications();
+    applications::migrate_wasteland_roles_v2();
     chain_of_command::migrate_chain_of_command_to_home_guild();
     chain_of_command::migrate_police_chain_of_command_to_home_guild();
 }

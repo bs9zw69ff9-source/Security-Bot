@@ -60,6 +60,8 @@ pub struct AppConfig {
     pub nypd_review_v2: bool,
     /// Guards the one-time wasteland-faction seed below.
     pub wasteland_seed_v1: bool,
+    /// Guards the one-time addition of the second set of faction roles.
+    pub wasteland_roles_v2: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, AppConfig>>> = Lazy::new(|| Mutex::new(db::load_all("applications")));
@@ -478,7 +480,7 @@ pub fn migrate_wasteland_applications() {
             pending: "1541862720540770324",
             accepted: "1541862746977472592",
             denied: "1541862770923016273",
-            roles: &["1541755579108950117", "1541837160062390272", "1541841923554148432", "1541861000418959441"],
+            roles: &["1541755579108950117", "1541837160062390272", "1541841923554148432", "1541861000418959441", "1542143305259683931"],
         },
         Faction {
             key: "legion",
@@ -491,7 +493,7 @@ pub fn migrate_wasteland_applications() {
             pending: "1541862581730549820",
             accepted: "1541862629533024416",
             denied: "1541862677964390580",
-            roles: &["1541842189636608060", "1541837268531028088", "1541755581998833716"],
+            roles: &["1541842189636608060", "1541837268531028088", "1541755581998833716", "1542149461390794893", "1542143541512245308"],
         },
         Faction {
             key: "bos",
@@ -504,7 +506,7 @@ pub fn migrate_wasteland_applications() {
             pending: "1541863321400115240",
             accepted: "1541863365175935026",
             denied: "1541863407341281402",
-            roles: &["1541755583596859392", "1541837198121242714", "1541841860472078497"],
+            roles: &["1541755583596859392", "1541837198121242714", "1541841860472078497", "1542149928061509733", "1542143416123662447"],
         },
         Faction {
             key: "enclave",
@@ -517,7 +519,7 @@ pub fn migrate_wasteland_applications() {
             pending: "1541863487779901530",
             accepted: "1541863532272812103",
             denied: "1541863566376960060",
-            roles: &["1541755584322474035", "1541837123718615142", "1541842063555956807"],
+            roles: &["1541755584322474035", "1541837123718615142", "1541842063555956807", "1542143467637964850", "1542150289274970173"],
         },
     ];
 
@@ -553,4 +555,43 @@ pub fn migrate_wasteland_applications() {
     }
     save(WASTELAND_GUILD);
     println!("\u{1f4dd} Seeded the wasteland faction applications (NCR, Legion, BOS, Enclave) for {WASTELAND_GUILD}");
+}
+
+/// Extra roles granted on accept, added after the factions were first seeded.
+///
+/// Appended rather than replacing, so anything set with `/applications addrole`
+/// since then survives, and each is skipped if it is already on the list.
+pub fn migrate_wasteland_roles_v2() {
+    const EXTRA: [(&str, &[&str]); 4] = [
+        ("ncr", &["1542143305259683931"]),
+        ("legion", &["1542149461390794893", "1542143541512245308"]),
+        ("bos", &["1542149928061509733", "1542143416123662447"]),
+        ("enclave", &["1542143467637964850", "1542150289274970173"]),
+    ];
+
+    if WASTELAND_GUILD.is_empty() {
+        return;
+    }
+    let mut added = 0;
+    {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(WASTELAND_GUILD) else { return };
+        if cfg.wasteland_roles_v2 || cfg.apps.is_empty() {
+            return;
+        }
+        for (key, roles) in EXTRA {
+            let Some(app) = cfg.apps.get_mut(key) else { continue };
+            for r in roles {
+                if !app.accepted_role_ids.iter().any(|existing| existing == r) {
+                    app.accepted_role_ids.push((*r).to_string());
+                    added += 1;
+                }
+            }
+        }
+        cfg.wasteland_roles_v2 = true;
+    }
+    save(WASTELAND_GUILD);
+    if added > 0 {
+        println!("📝 Added {added} more roles granted on accept across the faction applications");
+    }
 }
