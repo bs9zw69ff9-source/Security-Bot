@@ -900,10 +900,33 @@ async fn repaint_review(
     if let Some(r) = reason {
         e = e.field("Reason", truncate(r, 1024), false);
     }
-    e = e.timestamp(Timestamp::now());
+    // The outcome lived on the retired button, which is not copied anywhere.
+    // Now that a filed application leaves the pending channel entirely, it has
+    // to be in the embed or it is lost.
+    e = e.field("Outcome", truncate(done_label, 1024), false).timestamp(Timestamp::now());
 
+    // File it, then take it out of pending, so the pending channel only ever
+    // holds what still needs a decision.
+    //
+    // Only ever delete once the copy is safely posted. If there is no outcome
+    // channel set, or posting to it fails, the application stays where it is,
+    // marked and with its buttons retired: a decided application sitting in
+    // the wrong channel is a great deal better than one that is simply gone.
     if let Some(dest) = file_to {
-        let _ = dest.send_message(&ctx.http, CreateMessage::new().embed(e.clone())).await;
+        match dest.send_message(&ctx.http, CreateMessage::new().embed(e.clone())).await {
+            Ok(_) => {
+                if msg.delete(&ctx.http).await.is_ok() {
+                    return;
+                }
+                eprintln!(
+                    "⚠️ filed the application to {dest} but couldn't remove it from {channel_id}; \
+                     it will be marked in place instead so it isn't there twice unmarked."
+                );
+            }
+            Err(err) => eprintln!(
+                "⚠️ couldn't file the decided application in {dest} ({err}); leaving it in {channel_id} instead of deleting it."
+            ),
+        }
     }
 
     let done = CreateActionRow::Buttons(vec![CreateButton::new(done_id)

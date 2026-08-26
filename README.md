@@ -324,7 +324,14 @@ posts/refreshes the whole panel for that application's channel.
    retires the buttons, and DMs the applicant. **Accept with reason** does
    the same after a short modal for an optional note shared with the
    applicant.
-4. **Deny** (same reviewers as Accept) denies right away with no reason,
+4. Once decided, the application **leaves the review channel** and is filed in
+   that application's accepted or denied channel, carrying the reason and who
+   decided it. So the review channel only ever holds what still needs a
+   decision. Set those with `/applications setoutcome key:<k> accepted:#x
+   denied:#y`; without them, or if filing fails, the application stays put and
+   is simply marked, since a decided application in the wrong channel beats one
+   that has vanished.
+5. **Deny** (same reviewers as Accept) denies right away with no reason,
    marks the embed red, retires the buttons, and DMs the applicant.
    **Deny with reason** opens a short modal for an optional reason first,
    then DMs the applicant with it.
