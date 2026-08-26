@@ -1125,7 +1125,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         return reply_text(ctx, i, "I don't recognise that key.").await;
                     }
                     let label = truncate(opts.str("label").unwrap_or("").trim(), 80);
-                    let emoji = opts.str("emoji").unwrap_or("").trim().to_string();
+                    let raw_emoji = opts.str("emoji").unwrap_or("").trim().to_string();
+                    // Store only what Discord will actually accept on a button.
+                    // Keeping an unusable one would break the whole panel later,
+                    // a long way from the command that introduced it.
+                    let emoji_ok = crate::common::embeds::parse_button_emoji(&raw_emoji).is_some();
+                    let emoji = if emoji_ok { raw_emoji.clone() } else { String::new() };
                     let Some(log_channel) = opts.channel("log_channel") else { return };
                     update_ticket_config(&gid, |c| {
                         c.types.retain(|t| t.key != key);
@@ -1136,7 +1141,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             log_channel_id: log_channel.to_string(),
                         });
                     });
-                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("Ticket type **{label}** (`{key}`) → logs to <#{log_channel}>.\nRun `/tickets panel` to refresh the panel with this type."), Some("Ticket Type Saved")), true).await;
+                    let emoji_note = if raw_emoji.is_empty() || emoji_ok {
+                        String::new()
+                    } else {
+                        format!("\n\n⚠️ I left the emoji off: Discord won't take `{}` on a button. Use an actual emoji, or a custom one from this server as `<:name:id>`.", truncate(&raw_emoji, 40))
+                    };
+                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("Ticket type **{label}** (`{key}`) → logs to <#{log_channel}>.\nRun `/tickets panel` to refresh the panel with this type.{emoji_note}"), Some("Ticket Type Saved")), true).await;
                 }
                 "removetype" => {
                     let key = opts.str("key").unwrap_or("").trim().to_lowercase();

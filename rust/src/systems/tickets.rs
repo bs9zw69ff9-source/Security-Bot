@@ -25,7 +25,12 @@ pub fn build_ticket_panel_embed(guild_name: &str, icon_url: Option<String>, cfg:
     let list = cfg
         .types
         .iter()
-        .map(|t| format!("{}  **{}**", if t.emoji.is_empty() { "🎫" } else { &t.emoji }, t.label))
+        // Same test as the buttons use, so an emoji Discord would refuse does
+        // not show up as literal text like ":police:" in the body either.
+        .map(|t| {
+            let icon = if crate::common::embeds::parse_button_emoji(&t.emoji).is_some() { t.emoji.as_str() } else { "🎫" };
+            format!("{icon}  **{}**", t.label)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let mut e = CreateEmbed::new()
@@ -50,10 +55,10 @@ pub fn build_ticket_panel_rows(cfg: &TicketConfig) -> Vec<CreateActionRow> {
             let mut b = CreateButton::new(format!("ticket_open_{}", t.key))
                 .label(t.label.clone())
                 .style(ButtonStyle::Secondary);
-            if !t.emoji.is_empty() {
-                if let Ok(emoji) = t.emoji.parse::<serenity::model::channel::ReactionType>() {
-                    b = b.emoji(emoji);
-                }
+            // Anything Discord would refuse is dropped rather than sent: a
+            // panel with one plain button beats no panel at all.
+            if let Some(emoji) = crate::common::embeds::parse_button_emoji(&t.emoji) {
+                b = b.emoji(emoji);
             }
             b
         })

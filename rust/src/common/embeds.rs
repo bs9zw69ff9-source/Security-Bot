@@ -272,3 +272,76 @@ pub fn missing_panel_permissions(
     .map(|(_, name)| name)
     .collect()
 }
+
+/// Parse a configured emoji for use on a button, or `None` if Discord would
+/// refuse it.
+///
+/// Serenity's own parser accepts anything that does not start with `<` as a
+/// unicode emoji, so `:police:`, a bare word, or a typo all parse happily and
+/// are then rejected by the API with "Invalid Form Body ... Invalid emoji".
+/// Because one button takes the whole message with it, a single bad emoji on
+/// one ticket type made the entire panel unpostable.
+///
+/// Custom emoji (`<:name:id>` / `<a:name:id>`) are passed through; Discord
+/// still decides whether the bot may use that one. A unicode emoji has to
+/// contain something outside ASCII and must not look like a shortcode or a
+/// word, which is what separates `🎫` from `:ticket:`.
+pub fn parse_button_emoji(raw: &str) -> Option<serenity::model::channel::ReactionType> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('<') {
+        return raw.parse().ok();
+    }
+    let looks_like_a_word = raw.chars().any(|c| c.is_ascii_alphabetic() || c == ':');
+    let has_non_ascii = !raw.is_ascii();
+    if looks_like_a_word || !has_non_ascii {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+#[cfg(test)]
+mod emoji_tests {
+    use super::parse_button_emoji;
+
+    /// Real emoji, which is what people usually paste.
+    #[test]
+    fn plain_unicode_emoji_are_accepted() {
+        for e in ["🎫", "🚨", "⚖️", "👮", "🛡️", "1️⃣", "🇬🇧", "👨‍👩‍👧"] {
+            assert!(parse_button_emoji(e).is_some(), "{e} should be usable");
+        }
+    }
+
+    /// The case that broke a whole ticket panel: serenity accepts these as
+    /// unicode emoji, then Discord answers "Invalid Form Body ... Invalid
+    /// emoji" and refuses the entire message.
+    #[test]
+    fn shortcodes_and_words_are_rejected() {
+        for bad in [":ticket:", ":police:", "ticket", "report_player", "TICKET", "a", "::"] {
+            assert!(parse_button_emoji(bad).is_none(), "{bad} must not reach Discord");
+        }
+    }
+
+    #[test]
+    fn custom_emoji_are_passed_through() {
+        assert!(parse_button_emoji("<:guardian:1234567890>").is_some());
+        assert!(parse_button_emoji("<a:spin:1234567890>").is_some());
+    }
+
+    /// Nothing configured is not an error, it just means a plain button.
+    #[test]
+    fn an_empty_emoji_is_simply_absent() {
+        assert!(parse_button_emoji("").is_none());
+        assert!(parse_button_emoji("   ").is_none());
+    }
+
+    /// Malformed custom emoji must not slip through as unicode.
+    #[test]
+    fn a_broken_custom_emoji_is_rejected() {
+        for bad in ["<:noid:>", "<:missing", "<>", "<:name:notanumber>"] {
+            assert!(parse_button_emoji(bad).is_none(), "{bad} must not reach Discord");
+        }
+    }
+}
