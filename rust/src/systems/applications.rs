@@ -17,7 +17,6 @@ use std::time::Duration;
 use crate::common::config::now_ms;
 use crate::common::embeds::{colors, sec_log, APPY_BLURPLE, APPY_GREEN, APPY_RED, APP_PENDING};
 use crate::common::guildinfo::fetch_member;
-use crate::common::permissions::is_mod;
 use crate::state::applications::{get_application, get_applications, update_application, Application};
 
 /// Per-question DM reply window.
@@ -720,28 +719,11 @@ fn parse_review_custom_id(custom_id: &str, prefix: &str) -> (String, String) {
     }
 }
 
-/// Apps where existing members - anyone already holding one of the app's own
-/// accepted (whitelist) roles - can review pending applications for that same
-/// app, on top of staff holding the mod role. Police + crime families only;
-/// staff applications still require the mod role.
-const PEER_REVIEW_APP_KEYS: [&str; 3] = ["nypd", "gambino", "colombo"];
-
 /// A configured channel id, or nothing when it was left blank.
 fn channel_from(raw: &str) -> Option<ChannelId> {
     raw.parse::<u64>().ok().map(ChannelId::new)
 }
 
-fn can_review_app(member: &serenity::model::guild::Member, owner_id: UserId, app: &Application) -> bool {
-    if is_mod(member, owner_id) {
-        return true;
-    }
-    if !PEER_REVIEW_APP_KEYS.contains(&app.key.as_str()) {
-        return false;
-    }
-    app.accepted_role_ids.iter().any(|id| member.roles.iter().any(|r| r.to_string() == *id))
-}
-
-const NOT_ALLOWED: &str = "Only staff, or a whitelisted member of this app, can review applications.";
 const GONE: &str = "That application type doesn't exist anymore.";
 
 /// Shared accept path for both the plain "Accept" button and the "Accept with
@@ -956,7 +938,14 @@ async fn repaint_review(
     let _ = msg.edit(&ctx.http, EditMessage::new().embed(e).components(vec![done])).await;
 }
 
-/// Resolve the reviewer + app and check permission, shared by all four buttons.
+/// Resolve the reviewer + app, shared by all four buttons.
+///
+/// There is no permission check here on purpose: whoever can see the review
+/// channel can review. The channel's own permissions are the gate, which is
+/// where it belongs, since that is the thing a server actually configures. The
+/// role check that used to live here also meant a reviewer had to be resolvable
+/// through the cache or an HTTP fetch, and when that came back empty the button
+/// just did nothing at all with no message.
 async fn review_guard(
     ctx: &Context,
     i: &ComponentInteraction,
@@ -968,12 +957,6 @@ async fn review_guard(
         reply_ephemeral(ctx, i, GONE).await;
         return None;
     };
-    let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id)?;
-    let member = fetch_member(ctx, guild_id, i.user.id).await?;
-    if !can_review_app(&member, owner_id, &app) {
-        reply_ephemeral(ctx, i, NOT_ALLOWED).await;
-        return None;
-    }
     Some((guild_id, key, user_id, app))
 }
 
