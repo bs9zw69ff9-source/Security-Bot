@@ -64,6 +64,8 @@ pub struct AppConfig {
     pub wasteland_roles_v2: bool,
     /// Guards the one-time staff application seed for the wasteland server.
     pub wasteland_staff_v1: bool,
+    /// Guards the one-time addition of the staff accept role.
+    pub wasteland_staff_role_v1: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, AppConfig>>> = Lazy::new(|| Mutex::new(db::load_all("applications")));
@@ -406,6 +408,8 @@ const WASTELAND_PANEL: &str = "1541861563487494236";
 /// The staff application sits in its own channel, so it gets its own panel
 /// rather than joining the four factions on theirs.
 const WASTELAND_STAFF_PANEL: &str = "1542658442286731455";
+/// Granted when a staff application is accepted.
+const WASTELAND_STAFF_ROLE: &str = "1541171863554621584";
 
 /// Six of the seven questions are shared; only the faction-specific one and the
 /// wording of "why" and "responsibilities" differ.
@@ -653,9 +657,7 @@ pub fn migrate_wasteland_staff_application() {
                 review_channel_id: "1541862436938846350".into(),
                 accepted_channel_id: "1542696947993804840".into(),
                 denied_channel_id: "1542696989253312562".into(),
-                // No role on accept yet. Add one with
-                // `/applications addrole staff @Role` when you've picked it.
-                accepted_role_ids: Vec::new(),
+                accepted_role_ids: strings(&[WASTELAND_STAFF_ROLE]),
                 questions: wasteland_staff_questions(),
                 min_age: None,
                 min_member_time: None,
@@ -665,4 +667,34 @@ pub fn migrate_wasteland_staff_application() {
     }
     save(WASTELAND_GUILD);
     println!("\u{1f4dd} Seeded the staff application for {WASTELAND_GUILD}");
+}
+
+/// Add the accept role to the staff application, for a database that seeded it
+/// before the role had been picked.
+///
+/// Appended rather than replacing, so anything set with `/applications addrole`
+/// since then survives, and it is skipped if it is already on the list.
+pub fn migrate_wasteland_staff_role_v1() {
+    if WASTELAND_GUILD.is_empty() {
+        return;
+    }
+    let mut added = false;
+    {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(WASTELAND_GUILD) else { return };
+        if cfg.wasteland_staff_role_v1 {
+            return;
+        }
+        cfg.wasteland_staff_role_v1 = true;
+        if let Some(app) = cfg.apps.get_mut("staff") {
+            if !app.accepted_role_ids.iter().any(|r| r == WASTELAND_STAFF_ROLE) {
+                app.accepted_role_ids.push(WASTELAND_STAFF_ROLE.to_string());
+                added = true;
+            }
+        }
+    }
+    save(WASTELAND_GUILD);
+    if added {
+        println!("\u{1f4dd} Staff applications now grant <@&{WASTELAND_STAFF_ROLE}> on accept");
+    }
 }
