@@ -33,11 +33,30 @@ fn active_lock() -> std::sync::MutexGuard<'static, HashSet<u64>> {
     }
 }
 
-/// Per-answer character cap: spread a safe budget across the questions so the
-/// finished review embed stays under Discord's 6000-char total, capped at the
-/// 1024 per-field limit.
-fn app_answer_cap(question_count: usize) -> usize {
-    (5200 / question_count.max(1)).clamp(200, 1024)
+/// The review embed's fixed costs: the title and the submission-stats field.
+/// Both are truncated to these lengths where they are built, so the budget
+/// below can rely on them.
+const REVIEW_TITLE_CAP: usize = 200;
+const REVIEW_STATS_CAP: usize = 400;
+const REVIEW_OVERHEAD: usize = REVIEW_TITLE_CAP + REVIEW_STATS_CAP + 16;
+
+/// Per-answer character cap, so the finished review embed stays under
+/// Discord's 6000-character total and the 1024-per-field limit.
+///
+/// The questions count towards that total too, since each one is a field name.
+/// A flat share of the budget was fine while applications were short, but
+/// fourteen long questions carry roughly 900 characters of their own, and the
+/// answers were still being allowed the full 5200 on top. Discord rejects the
+/// whole embed when the total goes over, so the applicant answers everything
+/// and then gets told something broke. The budget is now what's left once the
+/// questions and the fixed costs are paid for.
+fn app_answer_cap(questions: &[String]) -> usize {
+    let count = questions.len().max(1);
+    // Each field name is rendered as "N. <question>".
+    let names: usize = questions.iter().map(|q| q.chars().count() + 4).sum();
+    // 5800 rather than 6000, leaving a little room for miscounts.
+    let budget = 5800usize.saturating_sub(names + REVIEW_OVERHEAD);
+    (budget / count).clamp(200, 1024)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -500,7 +519,7 @@ async fn run_dm_application(ctx: &Context, guild_id: GuildId, user: User, app: A
     // Guard so the "one interview at a time" slot is always released.
     let _guard = ActiveGuard(user.id.get());
 
-    let cap = app_answer_cap(app.questions.len());
+    let cap = app_answer_cap(&app.questions);
     let total = app.questions.len();
     let mut answers: Vec<String> = Vec::new();
 
@@ -652,14 +671,14 @@ async fn finalize_application(
 
     let mut e = CreateEmbed::new()
         .color(APP_PENDING)
-        .title(truncate(&format!("{}'s '{} Application' Application Submitted", user.name, app.label), 256))
+        .title(truncate(&format!("{}'s '{} Application' Application Submitted", user.name, app.label), REVIEW_TITLE_CAP))
         .thumbnail(user.face())
         .timestamp(Timestamp::now());
     for (idx, q) in app.questions.iter().enumerate() {
         let value = answers.get(idx).cloned().unwrap_or_else(|| "*(left blank)*".to_string());
         e = e.field(truncate(&format!("{}. {q}", idx + 1), 256), truncate(&value, 1024), false);
     }
-    e = e.field("Submission stats", truncate(&stats.join("\n"), 1024), false);
+    e = e.field("Submission stats", truncate(&stats.join("\n"), REVIEW_STATS_CAP), false);
 
     let row1 = CreateActionRow::Buttons(vec![
         CreateButton::new(format!("app_accept_{}_{}", app.key, user.id)).label("Accept").style(ButtonStyle::Success),
@@ -1055,6 +1074,36 @@ mod tests {
     fn row_json(apps: &[Application]) -> String {
         let (_, rows) = panel_payload("Test Server", None, apps);
         serde_json::to_string(&rows).unwrap()
+    }
+
+    /// Worst case for an application: every answer runs right up to the cap.
+    /// Discord counts the questions, the answers, the title and the stats
+    /// field against one 6000-character budget, and rejects the message if the
+    /// total goes over, which loses the whole application.
+    fn worst_case_embed_size(questions: &[String]) -> usize {
+        let names: usize = questions.iter().map(|q| q.chars().count() + 4).sum();
+        names + app_answer_cap(questions) * questions.len() + REVIEW_OVERHEAD
+    }
+
+    /// The staff application the wasteland server uses is the longest one the
+    /// bot carries, so it is the one that would overflow first.
+    #[test]
+    fn a_long_application_still_fits_in_one_embed() {
+        let questions = crate::state::applications::wasteland_staff_questions();
+        assert_eq!(questions.len(), 14);
+        let total = worst_case_embed_size(&questions);
+        assert!(total <= 6000, "a full staff application would be {total} characters, over Discord's 6000");
+        // Still worth answering: a cap this low would make the form useless.
+        let cap = app_answer_cap(&questions);
+        assert!(cap >= 250, "answers capped at {cap}, too short to be usable");
+    }
+
+    /// A short application should not be squeezed by the same accounting.
+    #[test]
+    fn a_short_application_keeps_a_generous_cap() {
+        let questions: Vec<String> = (0..6).map(|n| format!("Question {n}")).collect();
+        assert!(app_answer_cap(&questions) > 800);
+        assert!(worst_case_embed_size(&questions) <= 6000);
     }
 
     /// One application, one button.

@@ -62,6 +62,8 @@ pub struct AppConfig {
     pub wasteland_seed_v1: bool,
     /// Guards the one-time addition of the second set of faction roles.
     pub wasteland_roles_v2: bool,
+    /// Guards the one-time staff application seed for the wasteland server.
+    pub wasteland_staff_v1: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, AppConfig>>> = Lazy::new(|| Mutex::new(db::load_all("applications")));
@@ -401,6 +403,9 @@ const WASTELAND_GUILD: &str = "1541171641218764850";
 const WASTELAND_WRONG_GUILD: &str = "1528753753186898071";
 const WASTELAND_KEYS: [&str; 4] = ["ncr", "legion", "bos", "enclave"];
 const WASTELAND_PANEL: &str = "1541861563487494236";
+/// The staff application sits in its own channel, so it gets its own panel
+/// rather than joining the four factions on theirs.
+const WASTELAND_STAFF_PANEL: &str = "1542658442286731455";
 
 /// Six of the seven questions are shared; only the faction-specific one and the
 /// wording of "why" and "responsibilities" differ.
@@ -594,4 +599,70 @@ pub fn migrate_wasteland_roles_v2() {
     if added > 0 {
         println!("📝 Added {added} more roles granted on accept across the faction applications");
     }
+}
+
+/// The wasteland server's own staff application.
+///
+/// Separate from the home guild's `staff` app, which lives under a different
+/// guild id with its own questions. Same key, different server, no overlap.
+pub fn wasteland_staff_questions() -> Vec<String> {
+    strings(&[
+        "What is your in-game name (IGN)?",
+        "What is your age and Date of Birth?",
+        "What time zone are you in?",
+        "How many hours do you play a week (on average)?",
+        "Why do you want to become a staff member?",
+        "How do you handle stressful or high-pressure situations?",
+        "What do you believe makes you a good fit for the staff team?",
+        "How would you handle criticism from players or other staff?",
+        "If 2 players are arguing in chat or voice, how would you handle the situation?",
+        "A player accuses another of RDM or breaking rules. What steps do you take to investigate?",
+        "You see another staff member abusing their powers, what do you do?",
+        "A well-known player or friend breaks a rule, how do you respond?",
+        "How would you deal with someone being toxic or disrespectful toward staff?",
+        // Asked as yes or no rather than a dropdown: applications are answered
+        // by message in DMs, and a message can't carry a select menu.
+        "Do you understand staff can be taken at any point for any reason? (yes or no)",
+    ])
+}
+
+/// Seed the wasteland server's staff application. Runs once, guarded by
+/// wastelandStaffV1, and leaves an already-configured `staff` app alone.
+pub fn migrate_wasteland_staff_application() {
+    if WASTELAND_GUILD.is_empty() {
+        return;
+    }
+    {
+        let mut map = lock();
+        let cfg = map.entry(WASTELAND_GUILD.to_string()).or_default();
+        if cfg.wasteland_staff_v1 {
+            return;
+        }
+        cfg.wasteland_staff_v1 = true;
+        if cfg.apps.contains_key("staff") {
+            return;
+        }
+        cfg.apps.insert(
+            "staff".into(),
+            Application {
+                key: "staff".into(),
+                label: "Staff".into(),
+                emoji: "\u{1f6e1}\u{fe0f}".into(),
+                panel_channel_id: WASTELAND_STAFF_PANEL.to_string(),
+                panel_message_id: String::new(),
+                review_channel_id: "1541862436938846350".into(),
+                accepted_channel_id: "1542696947993804840".into(),
+                denied_channel_id: "1542696989253312562".into(),
+                // No role on accept yet. Add one with
+                // `/applications addrole staff @Role` when you've picked it.
+                accepted_role_ids: Vec::new(),
+                questions: wasteland_staff_questions(),
+                min_age: None,
+                min_member_time: None,
+                closed: false,
+            },
+        );
+    }
+    save(WASTELAND_GUILD);
+    println!("\u{1f4dd} Seeded the staff application for {WASTELAND_GUILD}");
 }
