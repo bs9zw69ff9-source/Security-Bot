@@ -87,6 +87,7 @@ pub fn all() -> Vec<CreateCommand> {
         CreateCommand::new("config").description("View Guardian configuration (bot owner only)"),
         CreateCommand::new("nuketest").description("Confirm anti-nuke system is active (owner only)"),
         CreateCommand::new("status").description("Bot health: uptime, latency, guild count, memory (bot owner only)"),
+        CreateCommand::new("servers").description("DM the bot owner an invite to every server I'm in (owner only)"),
         CreateCommand::new("limits").description("Check your remaining mod action limits for today"),
 
         CreateCommand::new("antiping")

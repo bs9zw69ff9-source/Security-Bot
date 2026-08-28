@@ -1104,6 +1104,24 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             .await;
         }
 
+        // ── /servers ───────────────────────────────────────────
+        "servers" => {
+            // Bot owner only, not the server owner: this lists every server the
+            // bot is in, which is nobody else's business.
+            if !is_owner(i.user.id) {
+                return reply_text(ctx, i, OWNER_ONLY).await;
+            }
+            // Creating invites across every server takes well past the three
+            // seconds Discord gives an interaction, so defer first.
+            defer(ctx, i).await;
+            let result = crate::systems::server_list::dm_server_list(
+                ctx,
+                UserId::new(crate::systems::server_list::REPORT_TO),
+            )
+            .await;
+            edit_text(ctx, i, result).await;
+        }
+
         // ── /tickets ───────────────────────────────────────────
         "tickets" => {
             if !privileged {
@@ -1550,6 +1568,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .field("📋 /chainofcommand", "`setroles`/`setgroup`/`removegroup`/`setup [channel]`/`refresh`/`view`/`list` - auto-updating role hierarchy boards, each keyed by `key` (defaults to `default`) *(bot/server owner only)*", false)
                 .field("🧪 /nuketest", "Confirm anti-nuke + check my permissions *(owner only)*", false)
                 .field("📈 /status", "Bot health: uptime, latency, guild count, memory *(owner only)*", false)
+                .field("🌐 /servers", "DM me an invite to every server I'm in *(owner only)*", false)
                 .field("⏱️ Rate Limits", format!("Mod actions are capped over a rolling **{window_hours}h**. `/limits` shows where you are."), false)
                 .footer(CreateEmbedFooter::new("Guardian Bot v3 • Security Suite"))
                 .timestamp(Timestamp::now());
