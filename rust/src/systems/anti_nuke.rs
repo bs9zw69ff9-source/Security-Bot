@@ -388,9 +388,19 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
             // else: the revert and the alert are both round trips.
             let trip = bump_destructive(&gid, &uid, "permEsc", 3);
 
+            // Whitelisted people are allowed to hand out permissions, and this
+            // is the one place that stopped being true. The check used to sit
+            // below the revert and gate only the alert, so the rollback went
+            // out either way: an owner would grant a role a permission, watch
+            // the bot take it straight back off, and get no message saying so,
+            // since the alert was the part being suppressed.
+            if is_immune(ctx, guild_id, executor_id, &info).await {
+                return;
+            }
+
             let target_id = entry.target_id.map(|t| t.get()).unwrap_or(0);
             let role = RoleId::new(target_id.max(1));
-            if target_id != 0 && info.role_editable(role) {
+            if should_revert_escalation(target_id, info.role_editable(role)) {
                 let _ = guild_id.edit_role(&ctx.http, role, serenity::builder::EditRole::new().permissions(old_p)).await;
             }
 
@@ -403,17 +413,14 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
                 nuke_response(ctx, guild_id, executor_id, &reason).await;
                 return;
             }
-            // Below the line: still worth telling the owner it happened.
-            if !is_whitelisted_now(ctx, guild_id, executor_id, &info).await {
-                alert_owner(
-                    ctx,
-                    guild_id,
-                    &format!("<@{executor_id}> just handed <@&{target_id}> some dangerous permissions. I've rolled that back."),
-                    colors::WARN,
-                    "Permission Change Reverted",
-                )
-                .await;
-            }
+            alert_owner(
+                ctx,
+                guild_id,
+                &format!("<@{executor_id}> just handed <@&{target_id}> some dangerous permissions. I've rolled that back."),
+                colors::WARN,
+                "Permission Change Reverted",
+            )
+            .await;
         }
 
         Action::Member(MemberAction::BotAdd) => {
@@ -480,7 +487,7 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
         }
 
         Action::GuildUpdate => {
-            if is_whitelisted_now(ctx, guild_id, executor_id, &info).await {
+            if is_immune(ctx, guild_id, executor_id, &info).await {
                 return;
             }
             alert_owner(
@@ -497,13 +504,28 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
     }
 }
 
-/// Whitelist check for the paths that only alert, so a trusted admin doing
-/// ordinary admin work doesn't generate noise.
-async fn is_whitelisted_now(ctx: &Context, guild_id: GuildId, user_id: UserId, info: &GuildInfo) -> bool {
-    match fetch_member(ctx, guild_id, user_id).await {
-        Some(m) => is_whitelisted(&m, info.owner_id),
-        None => false,
+/// Is this person exempt from anti-nuke? Settles on ids first and only reads
+/// the member when the guild actually whitelists roles.
+///
+/// The version this replaces always fetched the member and treated a failed
+/// fetch as "not whitelisted", which quietly turned the server owner into a
+/// suspect whenever their member record could not be read.
+async fn is_immune(ctx: &Context, guild_id: GuildId, user_id: UserId, info: &GuildInfo) -> bool {
+    match whitelist_from_ids(guild_id, user_id, info.owner_id) {
+        WhitelistCheck::Decided(v) => v,
+        WhitelistCheck::NeedsMember => match fetch_member(ctx, guild_id, user_id).await {
+            Some(m) => is_whitelisted(&m, info.owner_id),
+            None => false,
+        },
     }
+}
+
+/// Whether an escalated permission change is one we can and should roll back.
+///
+/// Immunity is checked before this is reached, since a whitelisted person's
+/// change is not rolled back at all rather than rolled back quietly.
+fn should_revert_escalation(target_id: u64, role_editable: bool) -> bool {
+    target_id != 0 && role_editable
 }
 
 /// Pull the old/new permission bitfields out of a RoleUpdate's change list.
@@ -680,6 +702,18 @@ mod tests {
         // An unconfigured guild whitelists no roles, so a stranger is settled
         // as not-immune with no member fetch at all.
         assert_eq!(whitelist_from_ids(guild, UserId::new(12345), owner), WhitelistCheck::Decided(false));
+    }
+
+    /// The rollback only touches a role the bot can actually edit, and only
+    /// when the audit entry names one. Immunity is decided before this, so a
+    /// whitelisted person's change never reaches it.
+    #[test]
+    fn a_permission_rollback_needs_a_role_it_can_edit() {
+        assert!(should_revert_escalation(123, true));
+        // No target in the audit entry.
+        assert!(!should_revert_escalation(0, true));
+        // Managed, or above the bot's own top role.
+        assert!(!should_revert_escalation(123, false));
     }
 
     /// A bot owner is immune in every guild, including ones it has no member
