@@ -14,6 +14,7 @@ pub fn run_migrations() {
     guild_settings::migrate_env_to_home_guild();
     tickets::migrate_tickets_to_home_guild();
     tickets::migrate_ticket_category();
+    tickets::migrate_wasteland_tickets();
     applications::migrate_applications_to_home_guild();
     applications::migrate_application_requirements();
     applications::migrate_staff_questions_v2();

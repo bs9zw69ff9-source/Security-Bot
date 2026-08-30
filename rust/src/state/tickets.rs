@@ -26,6 +26,8 @@ pub struct TicketConfig {
     pub types: Vec<TicketType>,
     /// Guards the one-time category backfill below.
     pub category_seed_v1: bool,
+    /// Guards the one-time ticket seed for the wasteland server.
+    pub wasteland_seed_v1: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, TicketConfig>>> = Lazy::new(|| Mutex::new(db::load_all("tickets")));
@@ -158,4 +160,45 @@ pub fn migrate_ticket_category() {
         c.category_seed_v1 = true;
     });
     println!("🎫 Set the open-ticket category for home guild ({home})");
+}
+
+/// The wasteland server's own tickets, matching the panel it already runs:
+/// the same five options, all logging to one channel.
+///
+/// Not tied to GUILD_ID, the same way the faction applications aren't: these
+/// belong to that server and nowhere else, so the id is the condition rather
+/// than a home-guild check.
+const WASTELAND_GUILD: &str = "1541171641218764850";
+const WASTELAND_PANEL: &str = "1541755760059613215";
+/// Every type logs to the same place here, rather than one channel each.
+const WASTELAND_LOGS: &str = "1541755732867944510";
+
+pub fn migrate_wasteland_tickets() {
+    if get_ticket_config(WASTELAND_GUILD).wasteland_seed_v1 {
+        return;
+    }
+    let types = [
+        ("report_player", "Report Player", "🚨"),
+        ("staff_report", "Staff Report", "🛡️"),
+        ("faction_report", "Faction Report", "🪖"),
+        ("general_support", "General Support", "🎫"),
+        ("ban_appeal", "Ban Appeal", "⚖️"),
+    ];
+    update_ticket_config(WASTELAND_GUILD, |c| {
+        c.wasteland_seed_v1 = true;
+        c.panel_channel_id = WASTELAND_PANEL.to_string();
+        // Left blank on purpose: with no category set, the first ticket opened
+        // creates a "Tickets" category and everything lands in it. Point it
+        // somewhere specific with `/tickets category` if you'd rather choose.
+        c.types = types
+            .into_iter()
+            .map(|(key, label, emoji)| TicketType {
+                key: key.to_string(),
+                label: label.to_string(),
+                emoji: emoji.to_string(),
+                log_channel_id: WASTELAND_LOGS.to_string(),
+            })
+            .collect();
+    });
+    println!("🎫 Seeded the ticket panel and five ticket types for {WASTELAND_GUILD}");
 }

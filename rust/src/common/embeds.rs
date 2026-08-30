@@ -309,7 +309,10 @@ mod emoji_tests {
     /// Real emoji, which is what people usually paste.
     #[test]
     fn plain_unicode_emoji_are_accepted() {
-        for e in ["🎫", "🚨", "⚖️", "👮", "🛡️", "1️⃣", "🇬🇧", "👨‍👩‍👧"] {
+        // Every emoji seeded onto a ticket or application button is in here,
+        // so a bad one is caught by the test run rather than by Discord
+        // refusing the whole panel.
+        for e in ["🎫", "🚨", "⚖️", "👮", "🛡️", "🪖", "⭐", "🐂", "⚙️", "🦅", "1️⃣", "🇬🇧", "👨‍👩‍👧"] {
             assert!(parse_button_emoji(e).is_some(), "{e} should be usable");
         }
     }
