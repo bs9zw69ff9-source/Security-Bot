@@ -63,6 +63,12 @@ pub fn is_lockdown(guild_id: &str) -> bool {
     lock().contains_key(guild_id)
 }
 
+/// Why this guild is locked down, if it is. Lets a caller act on a raid lock
+/// without disturbing a manual or panic one.
+pub fn lockdown_reason(guild_id: &str) -> Option<String> {
+    lock().get(guild_id).map(|s| s.reason.clone())
+}
+
 pub fn locked_count() -> usize {
     lock().len()
 }

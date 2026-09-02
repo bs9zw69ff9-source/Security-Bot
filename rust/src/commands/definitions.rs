@@ -88,6 +88,11 @@ pub fn all() -> Vec<CreateCommand> {
         CreateCommand::new("nuketest").description("Confirm anti-nuke system is active (owner only)"),
         CreateCommand::new("status").description("Bot health: uptime, latency, guild count, memory (bot owner only)"),
         CreateCommand::new("servers").description("DM the bot owner an invite to every server I'm in (owner only)"),
+        CreateCommand::new("antiraid")
+            .description("Turn the raid protection on or off for this server")
+            .add_option(sub("status", "Is anti-raid on, and what are its settings?"))
+            .add_option(sub("disable", "Turn anti-raid off for this server"))
+            .add_option(sub("enable", "Turn anti-raid back on for this server")),
         CreateCommand::new("limits").description("Check your remaining mod action limits for today"),
 
         CreateCommand::new("antiping")

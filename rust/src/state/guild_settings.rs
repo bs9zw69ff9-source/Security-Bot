@@ -22,6 +22,10 @@ pub struct GuildSettings {
     pub nuke_whitelist_role_ids: Vec<String>,
     pub nuke_whitelist_user_ids: Vec<String>,
     pub failsafe_role_ids: Vec<String>,
+    /// Anti-raid off for this server. Stored as "disabled" rather than
+    /// "enabled" so it defaults to false, which means every existing row keeps
+    /// the protection it already had.
+    pub antiraid_disabled: bool,
 }
 
 static SETTINGS: Lazy<Mutex<HashMap<String, GuildSettings>>> = Lazy::new(|| {

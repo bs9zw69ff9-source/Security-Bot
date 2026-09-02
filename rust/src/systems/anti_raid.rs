@@ -28,6 +28,13 @@ pub async fn on_member_join(ctx: &Context, member: &Member) {
     let guild_id = member.guild_id;
     let gid = guild_id.to_string();
 
+    // Off for this server. Nothing below runs: no join is counted, so turning
+    // it back on later starts from a clean window rather than firing
+    // immediately on joins that happened while it was off.
+    if crate::state::guild_settings::gc(&gid).antiraid_disabled {
+        return;
+    }
+
     // Quarantine brand-new accounts that join while THIS guild's raid lockdown
     // is active.
     if is_lockdown(&gid) && CONFIG.raid_kick_new_on_lock && !member.user.bot {

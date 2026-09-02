@@ -20,7 +20,7 @@ use crate::state::anti_ping::{ap, AntiPing};
 use crate::state::applications::{get_application, get_applications, update_application};
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
 use crate::state::guild_settings::{gc, update as update_guild};
-use crate::state::lockdown::{clear_lockdown, is_lockdown, locked_count, record_changes, set_lockdown};
+use crate::state::lockdown::{clear_lockdown, is_lockdown, locked_count, lockdown_reason, record_changes, set_lockdown};
 use crate::state::mod_rates::{check_mod_limit, record_mod_action};
 use crate::state::muted_roles::stashed_count;
 use crate::state::tickets::{get_ticket_config, update_ticket_config, TicketType};
@@ -28,7 +28,9 @@ use crate::state::warnings::{add_warning, clear_warnings, get_warnings};
 use crate::systems::anti_nuke::{bump_destructive, nuke_response, total_reason, Trip};
 use crate::systems::applications::{apps_by_panel_channel, refresh_app_panel, render_channel_panel};
 use crate::systems::chain_of_command::render_chain_of_command;
-use crate::systems::mute::{lock_all_text_channels, mute_user, set_send_messages, unlock_all_text_channels, unmute_user};
+use crate::systems::mute::{
+    lift_lockdown_channels, lock_all_text_channels, mute_user, set_send_messages, unlock_all_text_channels, unmute_user,
+};
 use crate::systems::police_manual::build_police_manual_embed;
 use crate::systems::setup_helpers::{build_setup_embed, quick_setup_guild};
 use crate::systems::tickets::post_or_edit_panel;
@@ -1104,6 +1106,108 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             .await;
         }
 
+        // ── /antiraid ──────────────────────────────────────────
+        "antiraid" => {
+            if !privileged {
+                return reply_text(ctx, i, "Only the bot owner or the server owner can change the raid protection.").await;
+            }
+            let off = gc(&gid).antiraid_disabled;
+            match subcmd.as_deref().unwrap_or("status") {
+                "disable" => {
+                    if off {
+                        return reply_text(ctx, i, "Anti-raid is already off here.").await;
+                    }
+                    update_guild(&gid, |g| g.antiraid_disabled = true);
+
+                    // A raid lockdown left standing after the system that set
+                    // it has been switched off is just a locked server nobody
+                    // is watching, so lift it. Only the raid one: a manual or
+                    // panic lock was somebody's decision and stays.
+                    let lifted = lockdown_reason(&gid).as_deref() == Some("raid");
+                    if lifted {
+                        lift_lockdown_channels(
+                            ctx,
+                            guild_id,
+                            &format!("<@{}> turned anti-raid off, so I've reopened the channels it locked.", i.user.id),
+                        )
+                        .await;
+                    }
+                    sec_log(
+                        ctx,
+                        guild_id,
+                        "Anti-Raid Disabled",
+                        &format!("<@{}> turned the raid protection off for this server.", i.user.id),
+                        colors::WARN,
+                    )
+                    .await;
+                    let tail = if lifted {
+                        " The raid lockdown that was running is lifted, and the channels it locked are open again."
+                    } else {
+                        ""
+                    };
+                    reply_text(
+                        ctx,
+                        i,
+                        &format!(
+                            "Anti-raid is off. Joins aren't being counted any more, so nothing will trigger a lockdown or turn away new accounts.{tail} Turn it back on with `/antiraid enable`."
+                        ),
+                    )
+                    .await;
+                }
+                "enable" => {
+                    if !off {
+                        return reply_text(ctx, i, "Anti-raid is already on here.").await;
+                    }
+                    update_guild(&gid, |g| g.antiraid_disabled = false);
+                    sec_log(
+                        ctx,
+                        guild_id,
+                        "Anti-Raid Enabled",
+                        &format!("<@{}> turned the raid protection back on for this server.", i.user.id),
+                        colors::SUCCESS,
+                    )
+                    .await;
+                    reply_text(
+                        ctx,
+                        i,
+                        &format!(
+                            "Anti-raid is back on. {} joins inside {} seconds will lock the server down for {} minutes.",
+                            CONFIG.raid_join_threshold,
+                            CONFIG.raid_window_ms / 1000,
+                            CONFIG.raid_lockdown_min
+                        ),
+                    )
+                    .await;
+                }
+                _ => {
+                    let e = CreateEmbed::new()
+                        .color(if off { colors::WARN } else { colors::SUCCESS })
+                        .title("Anti-Raid")
+                        .description(if off {
+                            "**Off** for this server. Joins aren't being counted, so nothing will trigger a lockdown."
+                        } else {
+                            "**On** for this server."
+                        })
+                        .field("Trigger", format!("{} joins in {}s", CONFIG.raid_join_threshold, CONFIG.raid_window_ms / 1000), true)
+                        .field("Lockdown length", format!("{} minutes", CONFIG.raid_lockdown_min), true)
+                        .field(
+                            "New accounts during a lockdown",
+                            if CONFIG.raid_kick_new_on_lock {
+                                format!("turned away under {} minutes old", CONFIG.raid_min_account_age_min)
+                            } else {
+                                "let through".to_string()
+                            },
+                            true,
+                        )
+                        .field("Locked down right now", if is_lockdown(&gid) { "yes" } else { "no" }, true)
+                        .footer(CreateEmbedFooter::new(
+                            "The trigger and lockdown length come from the .env and apply to every server. On or off is per server.",
+                        ));
+                    reply_embed(ctx, i, e, true).await;
+                }
+            }
+        }
+
         // ── /servers ───────────────────────────────────────────
         "servers" => {
             // Bot owner only, not the server owner: this lists every server the
@@ -1569,6 +1673,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .field("🧪 /nuketest", "Confirm anti-nuke + check my permissions *(owner only)*", false)
                 .field("📈 /status", "Bot health: uptime, latency, guild count, memory *(owner only)*", false)
                 .field("🌐 /servers", "DM me an invite to every server I'm in *(owner only)*", false)
+                .field("🛡️ /antiraid", "`status`/`disable`/`enable` - turn the raid protection on or off for this server *(bot/server owner only)*", false)
                 .field("⏱️ Rate Limits", format!("Mod actions are capped over a rolling **{window_hours}h**. `/limits` shows where you are."), false)
                 .footer(CreateEmbedFooter::new("Guardian Bot v3 • Security Suite"))
                 .timestamp(Timestamp::now());
