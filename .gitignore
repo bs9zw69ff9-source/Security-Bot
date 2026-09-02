@@ -1,5 +1,8 @@
-node_modules/
 .env
+
+# deploy.sh process management
+guardian-bot.pid
+guardian-bot.log
 
 # runtime state (SQLite DB + WAL/SHM + forensic log)
 guardian.db
@@ -14,3 +17,6 @@ warnings.json
 guildsettings.json
 guild_snapshot.json
 failsafe_backup.json
+
+# Rust build artifacts
+rust/target/
