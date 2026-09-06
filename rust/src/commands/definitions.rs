@@ -1,7 +1,7 @@
 //! Slash command definitions.
 
 use serenity::builder::{CreateCommand, CreateCommandOption};
-use serenity::model::application::CommandOptionType;
+use serenity::model::application::{CommandOptionType, InteractionContext};
 use serenity::model::channel::ChannelType;
 
 const TEXT_LIKE: [ChannelType; 2] = [ChannelType::Text, ChannelType::News];
@@ -19,6 +19,19 @@ fn add_remove(name: &str, desc: &str) -> CreateCommandOption {
     req(CommandOptionType::String, name, desc)
         .add_string_choice("add", "add")
         .add_string_choice("remove", "remove")
+}
+
+/// Mark a command as usable in servers only.
+///
+/// Every command in here needs a guild: the handler's first act is to read
+/// `guild_id` and bail without one. Leaving them offered in DMs was worse than
+/// a wasted entry in the menu, because Discord refuses to dispatch a command
+/// carrying a channel option from a DM at all. It answers the person with its
+/// own "A specified channel ID is invalid", before the bot is involved and with
+/// nothing to say which command or option it means. Applied to the whole list
+/// rather than command by command, so a new command cannot miss it.
+fn guild_only(c: CreateCommand) -> CreateCommand {
+    c.contexts(vec![InteractionContext::Guild])
 }
 
 pub fn all() -> Vec<CreateCommand> {
@@ -233,4 +246,30 @@ pub fn all() -> Vec<CreateCommand> {
 
         CreateCommand::new("help").description("Show all Guardian Bot commands"),
     ]
+    .into_iter()
+    .map(guild_only)
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialising is the only way to see what the builder actually sends.
+    /// A command offered in DMs and then given a channel option is refused by
+    /// Discord at invoke time, which is not a failure the bot can catch or
+    /// explain, so none of them may be offered there.
+    #[test]
+    fn every_command_is_marked_server_only() {
+        for c in all() {
+            let json = serde_json::to_string(&c).unwrap();
+            assert!(json.contains("\"contexts\":[0]"), "a command is not server-only: {json}");
+        }
+    }
+
+    /// The list itself should not quietly empty out.
+    #[test]
+    fn the_command_list_is_not_empty() {
+        assert!(all().len() > 10);
+    }
 }
