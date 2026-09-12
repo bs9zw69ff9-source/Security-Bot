@@ -326,11 +326,22 @@ fn spawn_sweep_timer(ctx: Context) {
     tokio::spawn(async move {
         let mut health: std::collections::HashMap<GuildId, bool> = std::collections::HashMap::new();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ticks: u64 = 0;
         loop {
             interval.tick().await;
             systems::anti_spam::sweep();
             systems::anti_raid::sweep();
             systems::anti_nuke::sweep();
+
+            // Fold the write-ahead log into the database file every five
+            // minutes. The shutdown path does this too, but a host that kills
+            // the process outright never reaches it, and a .db left behind with
+            // all of its content still in the WAL is one careless copy away
+            // from looking completely empty.
+            ticks += 1;
+            if ticks.is_multiple_of(5) {
+                common::db::checkpoint();
+            }
 
             // If I lose the permissions anti-nuke needs, alert the owner (once
             // per state change).
@@ -395,6 +406,24 @@ async fn main() {
     let _ = START_TIME.set(now_ms());
 
     common::db::init();
+    let db_file = common::db::db_path();
+    match common::db::check_writable() {
+        Ok(()) => {
+            println!("\u{1f4be} Database: {}", db_file.display());
+            println!("\u{1f4be} Loaded: {}", common::db::summary());
+        }
+        Err(e) => {
+            eprintln!("\u{274c} I can read {} but I cannot write to it: {e}", db_file.display());
+            eprintln!("   Nothing will be saved. Every setting typed in by hand is lost on the next restart,");
+            eprintln!("   and anything I seed on boot comes back each time because the 'already done' flag");
+            eprintln!("   cannot be stored either, which is why only hand-made configuration looks missing.");
+            eprintln!("   This is almost always the file being owned by a different user than the one I run as.");
+            eprintln!("   Check with:  ls -l {}*", db_file.display());
+            eprintln!("   Fix with:    sudo chown $(stat -c '%U:%G' {}) {}*", db_file.display(), db_file.display());
+            eprintln!("   The -wal and -shm files beside it need the same owner.");
+            std::process::exit(1);
+        }
+    }
     state::run_migrations();
 
     if TOKEN.is_empty() {
@@ -425,6 +454,9 @@ async fn main() {
         let signal = wait_for_shutdown_signal().await;
         println!("\n{signal} received - shutting down…");
         shard_manager.shutdown_all().await;
+        // Nothing drops a static, so this is the only chance to fold the
+        // write-ahead log back into the database file.
+        common::db::checkpoint();
     });
 
     if let Err(e) = client.start_autosharded().await {

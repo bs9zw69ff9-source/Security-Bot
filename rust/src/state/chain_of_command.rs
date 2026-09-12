@@ -171,3 +171,44 @@ pub fn migrate_police_chain_of_command_to_home_guild() {
     });
     println!("📋 Seeded police chain-of-command board for home guild ({home})");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round trip through the real database: configure a board, then reload
+    /// the way a restart does, and confirm it comes back.
+    #[test]
+    fn a_board_survives_a_reload() {
+        let gid = "999999999999999991";
+        update_chain(gid, "default", |b| {
+            b.channel_id = "123".into();
+            b.title = "Test Board".into();
+            b.groups = vec![ChainGroup { label: Some("Ranks".into()), role_ids: strings(&["11", "22"]) }];
+        });
+
+        let reloaded = load_with_migration();
+        let boards = reloaded.get(gid).expect("the board should still be there after a reload");
+        let board = boards.get("default").expect("the default board should still be there");
+        assert_eq!(board.channel_id, "123");
+        assert_eq!(board.title, "Test Board");
+        assert_eq!(board.groups.len(), 1);
+        assert_eq!(board.groups[0].role_ids, vec!["11".to_string(), "22".to_string()]);
+
+        db::delete("chain_of_command", gid);
+    }
+
+    /// A board under any key other than "default" must not be mistaken for the
+    /// old flat format and rewritten.
+    #[test]
+    fn a_board_under_a_custom_key_survives_a_reload() {
+        let gid = "999999999999999992";
+        update_chain(gid, "police", |b| {
+            b.groups = vec![ChainGroup { label: None, role_ids: strings(&["77"]) }];
+        });
+        let reloaded = load_with_migration();
+        let boards = reloaded.get(gid).expect("the board should still be there after a reload");
+        assert!(boards.contains_key("police"), "the police board was lost: {:?}", boards.keys().collect::<Vec<_>>());
+        db::delete("chain_of_command", gid);
+    }
+}

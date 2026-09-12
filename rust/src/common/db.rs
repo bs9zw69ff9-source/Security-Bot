@@ -29,10 +29,14 @@ pub const TABLES: &[&str] = &[
     "chain_of_command",
 ];
 
+/// Where the database lives, so it can be named in an error rather than left
+/// for the reader to guess.
+pub fn db_path() -> std::path::PathBuf {
+    std::env::var("GUARDIAN_DB_FILE").map(std::path::PathBuf::from).unwrap_or_else(|_| root_file("guardian.db"))
+}
+
 static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
-    let path = std::env::var("GUARDIAN_DB_FILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| root_file("guardian.db"));
+    let path = db_path();
     let conn = Connection::open(&path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     let _ = conn.pragma_update(None, "busy_timeout", 5000);
@@ -48,6 +52,50 @@ static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
 /// Force the connection open (and run the CREATE TABLEs) at a known point.
 pub fn init() {
     Lazy::force(&DB);
+}
+
+/// Prove the database can actually be written to, by writing to it.
+///
+/// Opening a read-only SQLite file succeeds, and so does every read. Only the
+/// first write fails, and it failed one row at a time in a warning nobody was
+/// reading. Everything the bot seeds on boot then reappeared on the next boot,
+/// because the flags saying it had already been seeded could not be stored
+/// either, so the only thing that visibly went missing was configuration typed
+/// in by hand. This turns that into one loud failure at startup.
+pub fn check_writable() -> Result<(), String> {
+    const PROBE: &str = "__writable_probe__";
+    let conn = match DB.lock() {
+        Ok(c) => c,
+        Err(e) => e.into_inner(),
+    };
+    let write = conn.execute(
+        "INSERT INTO guild_settings (guild_id, data) VALUES (?1, '{}') ON CONFLICT(guild_id) DO UPDATE SET data = excluded.data",
+        rusqlite::params![PROBE],
+    );
+    match write {
+        Ok(_) => {
+            let _ = conn.execute("DELETE FROM guild_settings WHERE guild_id = ?1", rusqlite::params![PROBE]);
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Fold the write-ahead log back into the database file.
+///
+/// The connection lives in a `static`, and Rust does not drop statics at exit,
+/// so it is never closed and SQLite never gets to checkpoint on its own. That
+/// leaves an almost empty .db next to a WAL holding every actual change, which
+/// recovers fine on the next open but is lost the moment anything copies,
+/// moves or backs up the .db by itself.
+pub fn checkpoint() {
+    let conn = match DB.lock() {
+        Ok(c) => c,
+        Err(e) => e.into_inner(),
+    };
+    if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+        eprintln!("⚠️ couldn't fold the write-ahead log back into the database: {e}");
+    }
 }
 
 pub fn load_all<T: DeserializeOwned>(table: &str) -> HashMap<String, T> {
@@ -106,6 +154,28 @@ pub fn delete(table: &str, guild_id: &str) {
     let sql = format!("DELETE FROM {table} WHERE guild_id = ?1");
     if let Err(e) = conn.execute(&sql, rusqlite::params![guild_id]) {
         eprintln!("⚠️ db delete {table}/{guild_id} failed: {e}");
+    }
+}
+
+/// What is actually in the database, printed at startup.
+///
+/// This is the line that answers "did my configuration survive the restart?"
+/// without anyone having to open SQLite. If a table that was configured before
+/// the restart reads 0 here, nothing was saved; if it reads what it should and
+/// the board is still missing from Discord, the problem is the posting rather
+/// than the storage.
+pub fn summary() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for t in TABLES {
+        let n = row_count(t);
+        if n > 0 {
+            parts.push(format!("{t} {n}"));
+        }
+    }
+    if parts.is_empty() {
+        "empty".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 
