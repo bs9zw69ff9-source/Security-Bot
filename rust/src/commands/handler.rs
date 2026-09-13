@@ -33,7 +33,7 @@ use crate::systems::mute::{
 };
 use crate::systems::police_manual::build_police_manual_embed;
 use crate::systems::setup_helpers::{build_setup_embed, quick_setup_guild};
-use crate::systems::tickets::{post_or_edit_panel, refresh_ticket_panel};
+use crate::systems::tickets::{post_or_edit_panel, refresh_ticket_panel, types_by_panel_channel};
 
 const STAFF_ONLY: &str = "This one is staff only - you need the mod role.";
 const OWNER_ONLY: &str = "This one's owner only.";
@@ -1276,6 +1276,23 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let emoji_ok = crate::common::embeds::parse_button_emoji(&raw_emoji).is_some();
                     let emoji = if emoji_ok { raw_emoji.clone() } else { String::new() };
                     let Some(log_channel) = opts.channel("log_channel") else { return };
+                    let support_role = opts.role("support_role").map(|r| r.to_string());
+                    let type_category = opts.channel("category").map(|c| c.to_string()).unwrap_or_default();
+                    // Keep what an existing type already had, so re-running
+                    // addtype to fix a label does not silently drop its roles.
+                    let existing = cfg.types.iter().find(|t| t.key == key).cloned();
+                    let mut support_role_ids = existing.as_ref().map(|t| t.support_role_ids.clone()).unwrap_or_default();
+                    if let Some(r) = &support_role {
+                        if !support_role_ids.contains(r) {
+                            support_role_ids.push(r.clone());
+                        }
+                    }
+                    let category_id = if type_category.is_empty() {
+                        existing.as_ref().map(|t| t.category_id.clone()).unwrap_or_default()
+                    } else {
+                        type_category
+                    };
+                    let panel_channel_id = existing.as_ref().map(|t| t.panel_channel_id.clone()).unwrap_or_default();
                     let saved = update_ticket_config(&gid, |c| {
                         c.types.retain(|t| t.key != key);
                         c.types.push(TicketType {
@@ -1283,6 +1300,10 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             label: label.clone(),
                             emoji: emoji.clone(),
                             log_channel_id: log_channel.to_string(),
+                            support_role_ids: support_role_ids.clone(),
+                            category_id: category_id.clone(),
+                            panel_channel_id: panel_channel_id.clone(),
+                            panel_message_id: String::new(),
                         });
                     });
                     refresh_ticket_panel(ctx, guild_id).await;
@@ -1291,7 +1312,17 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     } else {
                         format!("\n\n⚠️ I left the emoji off: Discord won't take `{}` on a button. Use an actual emoji, or a custom one from this server as `<:name:id>`.", truncate(&raw_emoji, 40))
                     };
-                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Ticket type **{label}** (`{key}`) → logs to <#{log_channel}>.\nThe panel has been updated with it.{emoji_note}{}", save_note(saved)), Some("Ticket Type Saved")), true).await;
+                    let handled_by = if support_role_ids.is_empty() {
+                        "the server mod role".to_string()
+                    } else {
+                        support_role_ids.iter().map(|r| format!("<@&{r}>")).collect::<Vec<_>>().join(", ")
+                    };
+                    let where_ = if category_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nOpens under <#{category_id}>.")
+                    };
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Ticket type **{label}** (`{key}`) → logs to <#{log_channel}>.\nHandled by {handled_by}.{where_}\nThe panel has been updated with it.{emoji_note}{}", save_note(saved)), Some("Ticket Type Saved")), true).await;
                 }
                 "removetype" => {
                     let key = opts.str("key").unwrap_or("").trim().to_lowercase();
@@ -1309,9 +1340,24 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let lines = cfg
                         .types
                         .iter()
-                        .map(|t| format!("{} **{}** (`{}`) → <#{}>", if t.emoji.is_empty() { "🎫" } else { &t.emoji }, t.label, t.key, t.log_channel_id))
+                        .map(|t| {
+                            let roles = if t.support_role_ids.is_empty() {
+                                "mod role".to_string()
+                            } else {
+                                t.support_role_ids.iter().map(|r| format!("<@&{r}>")).collect::<Vec<_>>().join(", ")
+                            };
+                            let cat = if t.category_id.is_empty() { String::new() } else { format!(" · under <#{}>", t.category_id) };
+                            let panel = if t.panel_channel_id.is_empty() { String::new() } else { format!(" · panel in <#{}>", t.panel_channel_id) };
+                            format!(
+                                "{} **{}** (`{}`)\n-# logs to <#{}> · handled by {roles}{cat}{panel}",
+                                if t.emoji.is_empty() { "🎫" } else { &t.emoji },
+                                t.label,
+                                t.key,
+                                t.log_channel_id
+                            )
+                        })
                         .collect::<Vec<_>>()
-                        .join("\n");
+                        .join("\n\n");
                     reply_embed(ctx, i, embed(colors::INFO, lines, Some("Ticket Types")), true).await;
                 }
                 "category" => {
@@ -1319,6 +1365,43 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let saved = update_ticket_config(&gid, |c| c.category_id = category.to_string());
                     let name = ctx.cache.guild(guild_id).and_then(|g| g.channels.get(&category).map(|c| c.name.to_string())).unwrap_or_default();
                     reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("New tickets will open under **{name}** from now on.{}", save_note(saved)), Some("Ticket Category Set")), true).await;
+                }
+                "support" => {
+                    let key = opts.str("key").unwrap_or("").trim().to_lowercase();
+                    let add = opts.str("action").unwrap_or("add").eq_ignore_ascii_case("add");
+                    let Some(role) = opts.role("role") else { return };
+                    if !cfg.types.iter().any(|t| t.key == key) {
+                        return reply_text(ctx, i, &format!("There's no ticket type `{key}`. `/tickets listtypes` shows them.")).await;
+                    }
+                    let rid = role.to_string();
+                    let saved = update_ticket_config(&gid, |c| {
+                        if let Some(t) = c.types.iter_mut().find(|t| t.key == key) {
+                            t.support_role_ids.retain(|r| *r != rid);
+                            if add {
+                                t.support_role_ids.push(rid.clone());
+                            }
+                        }
+                    });
+                    let now = get_ticket_config(&gid).types.iter().find(|t| t.key == key).map(|t| t.support_role_ids.clone()).unwrap_or_default();
+                    let listed = if now.is_empty() {
+                        "nobody in particular, so it falls back to the server mod role".to_string()
+                    } else {
+                        now.iter().map(|r| format!("<@&{r}>")).collect::<Vec<_>>().join(", ")
+                    };
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("{} <@&{rid}> {} `{key}`.\n\n`{key}` is now handled by {listed}.\n\nThey can see these tickets, reply, claim and close them, and get pinged when one opens. Tickets already open keep the permissions they were created with.{}", if add { "Added" } else { "Removed" }, if add { "to" } else { "from" }, save_note(saved)), Some("Ticket Support Roles")), true).await;
+                }
+                "typecategory" => {
+                    let key = opts.str("key").unwrap_or("").trim().to_lowercase();
+                    let Some(category) = opts.channel("category") else { return };
+                    if !cfg.types.iter().any(|t| t.key == key) {
+                        return reply_text(ctx, i, &format!("There's no ticket type `{key}`. `/tickets listtypes` shows them.")).await;
+                    }
+                    let saved = update_ticket_config(&gid, |c| {
+                        if let Some(t) = c.types.iter_mut().find(|t| t.key == key) {
+                            t.category_id = category.to_string();
+                        }
+                    });
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("New `{key}` tickets will open under <#{category}>.{}", save_note(saved)), Some("Ticket Category Set")), true).await;
                 }
                 "panel" => {
                     if cfg.types.is_empty() {
@@ -1331,8 +1414,46 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         return reply_text(ctx, i, "Pick a channel, there isn't one set yet.").await;
                     };
                     defer(ctx, i).await;
-                    match post_or_edit_panel(ctx, guild_id, channel, &cfg).await {
-                        Ok(()) => edit_text(ctx, i, format!("Done - the ticket panel is up in <#{channel}>.")).await,
+
+                    // With a key, this puts one type on its own panel, the way
+                    // an Appy panel is linked to particular templates. Without
+                    // one, it moves every type that has not been split out,
+                    // which is the single-panel behaviour this always had.
+                    let key = opts.str("key").unwrap_or("").trim().to_lowercase();
+                    if !key.is_empty() {
+                        if !cfg.types.iter().any(|t| t.key == key) {
+                            return edit_text(ctx, i, format!("There's no ticket type `{key}`. `/tickets listtypes` shows them.")).await;
+                        }
+                        update_ticket_config(&gid, |c| {
+                            if let Some(t) = c.types.iter_mut().find(|t| t.key == key) {
+                                t.panel_channel_id = channel.to_string();
+                                // A different channel means a different panel
+                                // message, so the old id must not be reused.
+                                t.panel_message_id.clear();
+                            }
+                        });
+                    } else {
+                        update_ticket_config(&gid, |c| {
+                            if c.panel_channel_id != channel.to_string() {
+                                c.panel_channel_id = channel.to_string();
+                                c.panel_message_id.clear();
+                                for t in c.types.iter_mut().filter(|t| t.panel_channel_id.is_empty()) {
+                                    t.panel_message_id.clear();
+                                }
+                            }
+                        });
+                    }
+
+                    let group = types_by_panel_channel(&gid)
+                        .into_iter()
+                        .find(|(c, _)| *c == channel.to_string())
+                        .map(|(_, t)| t)
+                        .unwrap_or_default();
+                    match post_or_edit_panel(ctx, guild_id, channel, &group).await {
+                        Ok(()) => {
+                            let names = group.iter().map(|t| t.label.clone()).collect::<Vec<_>>().join(", ");
+                            edit_text(ctx, i, format!("Done - the ticket panel is up in <#{channel}> with: {names}.")).await
+                        }
                         Err(why) => edit_text(ctx, i, why).await,
                     }
                 }
@@ -1692,7 +1813,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .field("📊 /limits", "Check your remaining mod action limits today", false)
                 .field("⚙️ /config", "View configuration *(bot owner only)*", false)
                 .field("🔧 /setup", "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", false)
-                .field("🎫 /tickets", "`addtype`/`removetype`/`listtypes`/`category`/`panel` - configure the ticket system *(bot/server owner only)*", false)
+                .field("🎫 /tickets", "`addtype`/`removetype`/`listtypes`/`support`/`typecategory`/`category`/`panel` - ticket types, each with its own support roles, category and panel *(bot/server owner only)*", false)
                 .field("📝 /applications", "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole`/`setquestions` - configure the application system *(bot/server owner only)*", false)
                 .field("👮 /police", "`manual setup [channel]` - post the officer guide & procedures manual *(bot/server owner only)*", false)
                 .field("📋 /chainofcommand", "`setroles`/`setgroup`/`removegroup`/`setup [channel]`/`refresh`/`view`/`list` - auto-updating role hierarchy boards, each keyed by `key` (defaults to `default`) *(bot/server owner only)*", false)

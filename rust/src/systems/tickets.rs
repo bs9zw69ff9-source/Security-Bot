@@ -18,12 +18,11 @@ use crate::common::guildinfo::fetch_member;
 use crate::state::guild_settings::gc;
 use crate::state::tickets::{
     delete_open_ticket, find_open_ticket_by_user, get_open_ticket, get_ticket_config, set_open_ticket,
-    update_ticket_config, OpenTicket, TicketConfig,
+    update_ticket_config, OpenTicket, TicketConfig, TicketType,
 };
 
-pub fn build_ticket_panel_embed(guild_name: &str, icon_url: Option<String>, cfg: &TicketConfig) -> CreateEmbed {
-    let list = cfg
-        .types
+pub fn build_ticket_panel_embed(guild_name: &str, icon_url: Option<String>, types: &[TicketType]) -> CreateEmbed {
+    let list = types
         .iter()
         // Same test as the buttons use, so an emoji Discord would refuse does
         // not show up as literal text like ":police:" in the body either.
@@ -47,8 +46,8 @@ pub fn build_ticket_panel_embed(guild_name: &str, icon_url: Option<String>, cfg:
     e
 }
 
-pub fn build_ticket_panel_rows(cfg: &TicketConfig) -> Vec<CreateActionRow> {
-    cfg.types
+pub fn build_ticket_panel_rows(types: &[TicketType]) -> Vec<CreateActionRow> {
+    types
         .iter()
         .take(25)
         .map(|t| {
@@ -68,6 +67,55 @@ pub fn build_ticket_panel_rows(cfg: &TicketConfig) -> Vec<CreateActionRow> {
         .collect()
 }
 
+/// Group a guild's ticket types by the panel they belong on, the way the
+/// application panels are grouped.
+///
+/// A type with no panel channel of its own falls back to the server-wide one,
+/// so a server that never splits them up keeps the single panel it has always
+/// had, and one that does gets a separate panel per channel: support in one
+/// place, reports in another, which is how Appy's panels work.
+pub fn types_by_panel_channel(guild_id: &str) -> Vec<(String, Vec<TicketType>)> {
+    let cfg = get_ticket_config(guild_id);
+    let mut groups: Vec<(String, Vec<TicketType>)> = Vec::new();
+    for t in &cfg.types {
+        let channel = if t.panel_channel_id.is_empty() { cfg.panel_channel_id.clone() } else { t.panel_channel_id.clone() };
+        if channel.is_empty() {
+            continue;
+        }
+        match groups.iter_mut().find(|(c, _)| *c == channel) {
+            Some((_, list)) => list.push(t.clone()),
+            None => groups.push((channel, vec![t.clone()])),
+        }
+    }
+    groups
+}
+
+/// The panel message currently tracked for one channel group.
+fn tracked_panel_message(cfg: &TicketConfig, channel_id: &str, types: &[TicketType]) -> String {
+    if let Some(id) = types.iter().map(|t| t.panel_message_id.clone()).find(|m| !m.is_empty()) {
+        return id;
+    }
+    // The server-wide pair is where a single-panel server has always kept it.
+    if cfg.panel_channel_id == channel_id {
+        return cfg.panel_message_id.clone();
+    }
+    String::new()
+}
+
+/// Point every type in a group at the panel message they share.
+fn set_group_panel_message(guild_id: &str, channel_id: &str, types: &[TicketType], message_id: &str) {
+    let keys: Vec<String> = types.iter().map(|t| t.key.clone()).collect();
+    update_ticket_config(guild_id, |c| {
+        for t in c.types.iter_mut().filter(|t| keys.contains(&t.key)) {
+            t.panel_message_id = message_id.to_string();
+        }
+        if c.panel_channel_id == channel_id || c.panel_channel_id.is_empty() {
+            c.panel_channel_id = channel_id.to_string();
+            c.panel_message_id = message_id.to_string();
+        }
+    });
+}
+
 /// Refresh the ticket panel: edit the one that is already up, or post one if
 /// there isn't one. Called on boot, and after anything changes the ticket
 /// types, so the live panel always matches the configuration.
@@ -77,15 +125,13 @@ pub fn build_ticket_panel_rows(cfg: &TicketConfig) -> Vec<CreateActionRow> {
 /// on it until somebody ran `/tickets panel` by hand. Applications have always
 /// re-rendered in place; tickets now do the same.
 pub async fn refresh_ticket_panel(ctx: &Context, guild_id: GuildId) {
-    let cfg = get_ticket_config(&guild_id.to_string());
-    if cfg.types.is_empty() || cfg.panel_channel_id.is_empty() {
-        return;
-    }
-    let Ok(raw) = cfg.panel_channel_id.parse::<u64>() else { return };
-    if let Err(why) = post_or_edit_panel(ctx, guild_id, ChannelId::new(raw), &cfg).await {
-        // Said out loud rather than swallowed, so a panel that quietly stopped
-        // appearing has a reason attached to it in the log.
-        eprintln!("⚠️ couldn't put the ticket panel up in {raw}: {why}");
+    for (channel_id, types) in types_by_panel_channel(&guild_id.to_string()) {
+        let Ok(raw) = channel_id.parse::<u64>() else { continue };
+        if let Err(why) = post_or_edit_panel(ctx, guild_id, ChannelId::new(raw), &types).await {
+            // Said out loud rather than swallowed, so a panel that quietly
+            // stopped appearing has a reason attached to it in the log.
+            eprintln!("⚠️ couldn't put the ticket panel up in {raw}: {why}");
+        }
     }
 }
 
@@ -99,9 +145,11 @@ pub async fn ensure_ticket_panel(ctx: &Context, guild_id: GuildId) {
 /// currently tracked. Run at boot, after the panel is up.
 pub async fn sweep_duplicate_ticket_panels(ctx: &Context, guild_id: GuildId) {
     let cfg = get_ticket_config(&guild_id.to_string());
-    let Ok(raw) = cfg.panel_channel_id.parse::<u64>() else { return };
-    let keep = cfg.panel_message_id.parse::<u64>().ok().map(MessageId::new);
-    crate::common::embeds::remove_duplicate_panels(ctx, ChannelId::new(raw), keep, "ticket_open_", "ticket").await;
+    for (channel_id, types) in types_by_panel_channel(&guild_id.to_string()) {
+        let Ok(raw) = channel_id.parse::<u64>() else { continue };
+        let keep = tracked_panel_message(&cfg, &channel_id, &types).parse::<u64>().ok().map(MessageId::new);
+        crate::common::embeds::remove_duplicate_panels(ctx, ChannelId::new(raw), keep, "ticket_open_", "ticket").await;
+    }
 }
 
 pub fn guild_meta(ctx: &Context, guild_id: GuildId) -> (String, Option<String>) {
@@ -305,8 +353,10 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         )
         .await;
 
-    // Resolve (or create) the category tickets live under.
-    let mut category: Option<ChannelId> = cfg.category_id.parse::<u64>().ok().map(ChannelId::new);
+    // Resolve (or create) the category tickets live under. The type's own
+    // category wins, so a server can file each kind somewhere different.
+    let preferred = if t.category_id.is_empty() { &cfg.category_id } else { &t.category_id };
+    let mut category: Option<ChannelId> = preferred.parse::<u64>().ok().map(ChannelId::new);
     if category.map(|c| ctx.cache.guild(guild_id).map(|g| !g.channels.contains_key(&c)).unwrap_or(false)).unwrap_or(true) {
         let found = ctx.cache.guild(guild_id).and_then(|g| {
             g.channels.iter().find(|(_, c)| c.kind == ChannelType::Category && c.name == "Tickets").map(|(id, _)| *id)
@@ -324,7 +374,10 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
                 .ok()
                 .map(|c| c.id),
         };
-        if let Some(c) = category {
+        // Only remember an auto-created category as the server-wide default.
+        // Writing it onto a type that was pointed somewhere specific would
+        // quietly undo that choice.
+        if let (Some(c), true) = (category, t.category_id.is_empty()) {
             update_ticket_config(&guild_id.to_string(), |cfg| cfg.category_id = c.to_string());
         }
     }
@@ -345,14 +398,19 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
             kind: PermissionOverwriteType::Member(i.user.id),
         },
     ];
-    if let Ok(mr) = g.mod_role_id.parse::<u64>() {
+    // The type's own support roles, the way an Appy ticket template works, so
+    // one server can send reports to one team and partnerships to another.
+    // Falls back to the server mod role when the type has none of its own.
+    let support = t.support_roles(&g.mod_role_id);
+    for role in &support {
+        let Ok(rid) = role.parse::<u64>() else { continue };
         overwrites.push(PermissionOverwrite {
             allow: Permissions::VIEW_CHANNEL
                 | Permissions::SEND_MESSAGES
                 | Permissions::READ_MESSAGE_HISTORY
                 | Permissions::MANAGE_MESSAGES,
             deny: Permissions::empty(),
-            kind: PermissionOverwriteType::Role(RoleId::new(mr)),
+            kind: PermissionOverwriteType::Role(RoleId::new(rid)),
         });
     }
 
@@ -436,7 +494,9 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         CreateButton::new("ticket_claim").label("Claim").emoji('🙋').style(ButtonStyle::Primary),
         CreateButton::new("ticket_close").label("Close Ticket").emoji('🔒').style(ButtonStyle::Danger),
     ]);
-    let ping = if g.mod_role_id.is_empty() { String::new() } else { format!("<@&{}> ", g.mod_role_id) };
+    // Ping whoever handles this type, which is the point of per-type support
+    // roles: the team that deals with reports isn't pulled in for a partnership.
+    let ping = support.iter().map(|r| format!("<@&{r}> ")).collect::<String>();
     let _ = ticket_channel
         .id
         .send_message(
@@ -465,6 +525,29 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         .await;
 }
 
+/// Can this member act on a ticket of this type?
+///
+/// Anyone the server already treats as staff, plus the type's own support
+/// roles. Appy's rule is that a template's support roles can view and close
+/// its tickets, and that is the half this adds: before, a role given access to
+/// one ticket type could see the channel but was refused by the buttons in it,
+/// because the only check was the server-wide mod role.
+fn handles_ticket(
+    member: &serenity::model::guild::Member,
+    owner_id: UserId,
+    guild_id: GuildId,
+    type_key: &str,
+) -> bool {
+    if is_mod(member, owner_id) {
+        return true;
+    }
+    let cfg = get_ticket_config(&guild_id.to_string());
+    let Some(t) = cfg.types.iter().find(|t| t.key == type_key) else { return false };
+    // Only the type's own roles here: the mod-role fallback is already covered
+    // by is_mod above, and treating an empty list as "anyone" would be wrong.
+    t.support_role_ids.iter().any(|id| member.roles.iter().any(|r| r.to_string() == *id))
+}
+
 pub async fn handle_ticket_claim(ctx: &Context, i: &ComponentInteraction) {
     let Some(guild_id) = i.guild_id else { return };
     let Some(mut ticket) = get_open_ticket(&guild_id.to_string(), &i.channel_id.to_string()) else {
@@ -472,8 +555,8 @@ pub async fn handle_ticket_claim(ctx: &Context, i: &ComponentInteraction) {
     };
     let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id).unwrap_or(UserId::new(1));
     let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else { return };
-    if !is_mod(&member, owner_id) {
-        return ephemeral(ctx, i, "Only staff can claim tickets.").await;
+    if !handles_ticket(&member, owner_id, guild_id, &ticket.type_key) {
+        return ephemeral(ctx, i, "Only the team that handles this kind of ticket can claim it.").await;
     }
     if let Some(by) = &ticket.claimed_by {
         return ephemeral(ctx, i, &format!("This one's already claimed by <@{by}>.")).await;
@@ -528,8 +611,8 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
     };
     let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id).unwrap_or(UserId::new(1));
     let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else { return };
-    if !is_mod(&member, owner_id) && i.user.id.to_string() != ticket.opener_id {
-        return ephemeral(ctx, i, "Only staff or the person who opened this can close it.").await;
+    if !handles_ticket(&member, owner_id, guild_id, &ticket.type_key) && i.user.id.to_string() != ticket.opener_id {
+        return ephemeral(ctx, i, "Only the team that handles this kind of ticket, or the person who opened it, can close it.").await;
     }
 
     let _ = i
@@ -621,15 +704,18 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
     });
 }
 
-/// Re-render an existing panel message in place, or post a fresh one.
-/// Post the panel, or edit the existing one. `Err` carries something worth
-/// showing the person who ran the command.
+/// Post one channel's panel, or edit the one already there. `Err` carries
+/// something worth showing the person who ran the command.
 pub async fn post_or_edit_panel(
     ctx: &Context,
     guild_id: GuildId,
     channel: ChannelId,
-    cfg: &TicketConfig,
+    types: &[TicketType],
 ) -> Result<(), String> {
+    if types.is_empty() {
+        return Err("There are no ticket types to put on a panel yet. Add one with `/tickets addtype`.".to_string());
+    }
+
     // The panel channel has to belong to this guild. Discord posts by channel
     // id without checking which server the channel is in, so an id from
     // somewhere else posts quite happily: the panel turns up in the wrong
@@ -648,19 +734,19 @@ pub async fn post_or_edit_panel(
         return Err(format!("I need {} in <#{channel}> before I can put the panel there.", missing.join(", ")));
     }
 
+    let gid = guild_id.to_string();
     let (name, icon) = guild_meta(ctx, guild_id);
-    let e = build_ticket_panel_embed(&name, icon, cfg);
-    let rows = build_ticket_panel_rows(cfg);
+    let e = build_ticket_panel_embed(&name, icon, types);
+    let rows = build_ticket_panel_rows(types);
 
-    if cfg.panel_channel_id == channel.to_string() && !cfg.panel_message_id.is_empty() {
-        if let Ok(mid) = cfg.panel_message_id.parse::<u64>() {
+    let cfg = get_ticket_config(&gid);
+    let tracked = tracked_panel_message(&cfg, &channel.to_string(), types);
+    if !tracked.is_empty() {
+        if let Ok(mid) = tracked.parse::<u64>() {
             let mid = MessageId::new(mid);
             match edit_existing_panel(ctx, channel, mid, e.clone(), rows.clone()).await {
                 PanelEdit::Edited => {
-                    update_ticket_config(&guild_id.to_string(), |c| {
-                        c.panel_channel_id = channel.to_string();
-                        c.panel_message_id = mid.to_string();
-                    });
+                    set_group_panel_message(&gid, &channel.to_string(), types, &mid.to_string());
                     return Ok(());
                 }
                 // Not "it's gone", just "I couldn't tell". Posting another one
@@ -672,13 +758,71 @@ pub async fn post_or_edit_panel(
     }
     match channel.send_message(&ctx.http, CreateMessage::new().embed(e).components(rows)).await {
         Ok(posted) => {
-            update_ticket_config(&guild_id.to_string(), |c| {
-                c.panel_channel_id = channel.to_string();
-                c.panel_message_id = posted.id.to_string();
-            });
+            set_group_panel_message(&gid, &channel.to_string(), types, &posted.id.to_string());
             Ok(())
         }
         // Discord's own words: far more use than a guess at what went wrong.
         Err(e) => Err(format!("Discord wouldn't let me post there: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add(gid: &str, key: &str, panel: &str) {
+        update_ticket_config(gid, |c| {
+            c.types.push(TicketType {
+                key: key.into(),
+                label: key.into(),
+                panel_channel_id: panel.into(),
+                ..Default::default()
+            });
+        });
+    }
+
+    /// Types that were never split out all land on the server-wide panel, so a
+    /// server that has always had one panel still has exactly one.
+    #[test]
+    fn types_without_a_panel_of_their_own_share_the_default_one() {
+        let gid = "999999999999999981";
+        update_ticket_config(gid, |c| c.panel_channel_id = "500".into());
+        add(gid, "support", "");
+        add(gid, "reports", "");
+
+        let groups = types_by_panel_channel(gid);
+        assert_eq!(groups.len(), 1, "expected one panel, got {:?}", groups.iter().map(|(c, _)| c).collect::<Vec<_>>());
+        assert_eq!(groups[0].0, "500");
+        assert_eq!(groups[0].1.len(), 2);
+
+        crate::common::db::delete("tickets", gid);
+    }
+
+    /// Giving one type its own channel splits it onto its own panel and leaves
+    /// the rest where they were.
+    #[test]
+    fn a_type_with_its_own_channel_gets_its_own_panel() {
+        let gid = "999999999999999982";
+        update_ticket_config(gid, |c| c.panel_channel_id = "500".into());
+        add(gid, "support", "");
+        add(gid, "partnerships", "600");
+
+        let groups = types_by_panel_channel(gid);
+        assert_eq!(groups.len(), 2);
+        let split = groups.iter().find(|(c, _)| c == "600").expect("the split-out type should have its own panel");
+        assert_eq!(split.1.len(), 1);
+        assert_eq!(split.1[0].key, "partnerships");
+
+        crate::common::db::delete("tickets", gid);
+    }
+
+    /// With no panel channel anywhere there is nothing to render, rather than
+    /// a group keyed on an empty string that would fail to parse later.
+    #[test]
+    fn a_type_with_nowhere_to_go_is_left_out() {
+        let gid = "999999999999999983";
+        add(gid, "support", "");
+        assert!(types_by_panel_channel(gid).is_empty());
+        crate::common::db::delete("tickets", gid);
     }
 }

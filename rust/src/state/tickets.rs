@@ -8,13 +8,48 @@ use std::sync::Mutex;
 use crate::common::config::GUILD_ID;
 use crate::common::db;
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// One ticket type, modelled on Appy's ticket template: the type carries its
+/// own support roles, category and log channel rather than the whole server
+/// sharing one set.
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct TicketType {
     pub key: String,
     pub label: String,
     pub emoji: String,
     pub log_channel_id: String,
+    /// Who handles this type: they can see the ticket, reply, claim and close
+    /// it, and they get pinged when one opens.
+    ///
+    /// Empty means fall back to the server's mod role, which is how every
+    /// ticket behaved before this existed, so an untouched configuration keeps
+    /// working exactly as it did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub support_role_ids: Vec<String>,
+    /// Category this type's tickets open under. Empty falls back to the
+    /// server-wide category.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub category_id: String,
+    /// Panel this type appears on. Empty falls back to the server-wide panel
+    /// channel, so all the types share one panel unless you split them up.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub panel_channel_id: String,
+    /// Message id of the panel this type is on, tracked per panel channel.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub panel_message_id: String,
+}
+
+impl TicketType {
+    /// The roles that handle this type, falling back to the server mod role.
+    pub fn support_roles(&self, mod_role_id: &str) -> Vec<String> {
+        if !self.support_role_ids.is_empty() {
+            return self.support_role_ids.clone();
+        }
+        if mod_role_id.is_empty() {
+            return Vec::new();
+        }
+        vec![mod_role_id.to_string()]
+    }
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -138,6 +173,7 @@ pub fn migrate_tickets_to_home_guild() {
                 label: label.to_string(),
                 emoji: emoji.to_string(),
                 log_channel_id: log.to_string(),
+                ..Default::default()
             })
             .collect();
     });
@@ -199,8 +235,44 @@ pub fn migrate_wasteland_tickets() {
                 label: label.to_string(),
                 emoji: emoji.to_string(),
                 log_channel_id: WASTELAND_LOGS.to_string(),
+                ..Default::default()
             })
             .collect();
     });
     println!("🎫 Seeded the ticket panel and five ticket types for {WASTELAND_GUILD}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ticket_type(key: &str, roles: &[&str]) -> TicketType {
+        TicketType {
+            key: key.into(),
+            label: key.into(),
+            support_role_ids: roles.iter().map(|r| r.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A type with no roles of its own keeps behaving the way every ticket did
+    /// before per-type roles existed: the server mod role handles it.
+    #[test]
+    fn a_type_without_roles_falls_back_to_the_mod_role() {
+        assert_eq!(ticket_type("support", &[]).support_roles("42"), vec!["42".to_string()]);
+    }
+
+    /// And a type with its own roles does not also drag the mod role in, which
+    /// is the whole point of pointing one kind of ticket at one team.
+    #[test]
+    fn a_type_with_roles_uses_only_its_own() {
+        assert_eq!(ticket_type("reports", &["7", "8"]).support_roles("42"), vec!["7".to_string(), "8".to_string()]);
+    }
+
+    /// No roles anywhere is not an error, and must not produce an empty
+    /// mention that would ping nothing and deny everyone.
+    #[test]
+    fn no_roles_configured_anywhere_is_empty() {
+        assert!(ticket_type("support", &[]).support_roles("").is_empty());
+    }
 }
