@@ -234,11 +234,20 @@ pub async fn render_channel_panel(ctx: &Context, guild_id: GuildId, channel_id: 
 
     if let Some(existing_id) = apps.iter().map(|a| a.panel_message_id.clone()).find(|m| !m.is_empty()) {
         if let Ok(mid) = existing_id.parse::<u64>() {
-            if let Ok(mut msg) = channel.message(&ctx.http, MessageId::new(mid)).await {
-                if msg.edit(&ctx.http, EditMessage::new().embed(e.clone()).components(rows.clone())).await.is_ok() {
-                    set_group_panel_message(&guild_id.to_string(), apps, &msg.id.to_string());
+            let mid = MessageId::new(mid);
+            match crate::common::embeds::edit_existing_panel(ctx, channel, mid, e.clone(), rows.clone()).await {
+                crate::common::embeds::PanelEdit::Edited => {
+                    set_group_panel_message(&guild_id.to_string(), apps, &mid.to_string());
                     return;
                 }
+                // Only a confirmed 404 justifies posting a replacement. Any
+                // other failure means we could not tell, and posting anyway
+                // stacks another panel on every restart.
+                crate::common::embeds::PanelEdit::Unknown(why) => {
+                    eprintln!("⚠️ {why} in {channel}; leaving it alone rather than posting a second one.");
+                    return;
+                }
+                crate::common::embeds::PanelEdit::Gone => {}
             }
         }
     }

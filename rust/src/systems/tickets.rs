@@ -3,7 +3,7 @@
 
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateChannel, CreateEmbed, CreateEmbedFooter, CreateInputText,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateModal, EditMessage,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateModal,
 };
 use serenity::client::Context;
 use serenity::model::application::{ButtonStyle, ComponentInteraction, InputTextStyle, ModalInteraction};
@@ -12,7 +12,7 @@ use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use serenity::model::{Permissions, Timestamp};
 
 use crate::common::config::now_ms;
-use crate::common::embeds::{colors, embed, format_uptime, message_still_exists, sec_log};
+use crate::common::embeds::{colors, edit_existing_panel, embed, format_uptime, sec_log, PanelEdit};
 use crate::common::permissions::is_mod;
 use crate::common::guildinfo::fetch_member;
 use crate::state::guild_settings::gc;
@@ -68,35 +68,31 @@ pub fn build_ticket_panel_rows(cfg: &TicketConfig) -> Vec<CreateActionRow> {
         .collect()
 }
 
-/// Post the panel (or leave it alone if it's already up and the message still
-/// exists) - called on boot for every guild with ticket types configured.
-pub async fn ensure_ticket_panel(ctx: &Context, guild_id: GuildId) {
+/// Refresh the ticket panel: edit the one that is already up, or post one if
+/// there isn't one. Called on boot, and after anything changes the ticket
+/// types, so the live panel always matches the configuration.
+///
+/// This used to return as soon as it found the panel message still existed,
+/// which meant a type added or removed after the panel went up did not appear
+/// on it until somebody ran `/tickets panel` by hand. Applications have always
+/// re-rendered in place; tickets now do the same.
+pub async fn refresh_ticket_panel(ctx: &Context, guild_id: GuildId) {
     let cfg = get_ticket_config(&guild_id.to_string());
     if cfg.types.is_empty() || cfg.panel_channel_id.is_empty() {
         return;
     }
     let Ok(raw) = cfg.panel_channel_id.parse::<u64>() else { return };
-    let channel = ChannelId::new(raw);
-
-    // Only post a replacement when Discord confirms the old panel is gone. An
-    // error that is not a 404 means we could not tell, and posting anyway is
-    // how a channel ends up with a stack of identical panels.
-    if !cfg.panel_message_id.is_empty() {
-        if let Ok(mid) = cfg.panel_message_id.parse::<u64>() {
-            if message_still_exists(ctx, channel, MessageId::new(mid)).await {
-                return;
-            }
-        }
+    if let Err(why) = post_or_edit_panel(ctx, guild_id, ChannelId::new(raw), &cfg).await {
+        // Said out loud rather than swallowed, so a panel that quietly stopped
+        // appearing has a reason attached to it in the log.
+        eprintln!("⚠️ couldn't put the ticket panel up in {raw}: {why}");
     }
+}
 
-    let (name, icon) = guild_meta(ctx, guild_id);
-    let payload = CreateMessage::new()
-        .embed(build_ticket_panel_embed(&name, icon, &cfg))
-        .components(build_ticket_panel_rows(&cfg));
-    if let Ok(posted) = channel.send_message(&ctx.http, payload).await {
-        update_ticket_config(&guild_id.to_string(), |c| c.panel_message_id = posted.id.to_string());
-        println!("🎫 Posted ticket panel in #{name}");
-    }
+/// Boot entry point. Kept as its own name because that is what the ready and
+/// guild-create handlers call.
+pub async fn ensure_ticket_panel(ctx: &Context, guild_id: GuildId) {
+    refresh_ticket_panel(ctx, guild_id).await;
 }
 
 /// Clear any earlier ticket panels left in the panel channel, keeping the one
@@ -634,6 +630,19 @@ pub async fn post_or_edit_panel(
     channel: ChannelId,
     cfg: &TicketConfig,
 ) -> Result<(), String> {
+    // The panel channel has to belong to this guild. Discord posts by channel
+    // id without checking which server the channel is in, so an id from
+    // somewhere else posts quite happily: the panel turns up in the wrong
+    // place, wearing the wrong server's name, and every button is dead,
+    // because the click arrives from a guild with no such ticket type. The
+    // application panels already refuse this; tickets now do too.
+    let belongs = ctx.cache.guild(guild_id).map(|g| g.channels.contains_key(&channel)).unwrap_or(false);
+    if !belongs {
+        return Err(format!(
+            "<#{channel}> isn't a channel in this server, so the panel would go up somewhere else and its buttons wouldn't work. Pick a channel from here."
+        ));
+    }
+
     let missing = crate::common::embeds::missing_panel_permissions(ctx, guild_id, channel);
     if !missing.is_empty() {
         return Err(format!("I need {} in <#{channel}> before I can put the panel there.", missing.join(", ")));
@@ -645,14 +654,19 @@ pub async fn post_or_edit_panel(
 
     if cfg.panel_channel_id == channel.to_string() && !cfg.panel_message_id.is_empty() {
         if let Ok(mid) = cfg.panel_message_id.parse::<u64>() {
-            if let Ok(mut msg) = channel.message(&ctx.http, MessageId::new(mid)).await {
-                if msg.edit(&ctx.http, EditMessage::new().embed(e.clone()).components(rows.clone())).await.is_ok() {
+            let mid = MessageId::new(mid);
+            match edit_existing_panel(ctx, channel, mid, e.clone(), rows.clone()).await {
+                PanelEdit::Edited => {
                     update_ticket_config(&guild_id.to_string(), |c| {
                         c.panel_channel_id = channel.to_string();
-                        c.panel_message_id = msg.id.to_string();
+                        c.panel_message_id = mid.to_string();
                     });
                     return Ok(());
                 }
+                // Not "it's gone", just "I couldn't tell". Posting another one
+                // here is how a channel ends up with a stack of panels.
+                PanelEdit::Unknown(why) => return Err(format!("{why}, so I've left it alone rather than posting a second one.")),
+                PanelEdit::Gone => {}
             }
         }
     }

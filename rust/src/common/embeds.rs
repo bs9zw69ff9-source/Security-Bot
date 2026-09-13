@@ -154,30 +154,39 @@ pub fn format_uptime(ms: i64) -> String {
     }
 }
 
-/// Whether a panel message posted earlier is still there.
-///
-/// The distinction that matters is "Discord says this message does not exist"
-/// versus "I could not find out". Only the first justifies posting a
-/// replacement. Treating every error as deletion means a missing Read Message
-/// History permission, a rate limit, or a brief Discord hiccup all produce a
-/// duplicate panel on boot, and because the new id is then saved over the old
-/// one, every restart adds another.
-///
-/// Anything other than a 404 is reported as still present, so the worst case
-/// is a panel that does not get refreshed until the next restart, rather than
-/// a channel filling up with copies.
-pub async fn message_still_exists(
+/// What happened when we tried to edit a panel that should already be there.
+pub enum PanelEdit {
+    /// Edited in place. Nothing else to do.
+    Edited,
+    /// Discord answered "no such message", so a replacement is warranted.
+    Gone,
+    /// We could not tell, or the edit itself failed.
+    ///
+    /// Posting a replacement here is what fills a channel with copies: a
+    /// missing Read Message History permission, a rate limit or a brief
+    /// Discord hiccup all look like a failed lookup, and because the new id is
+    /// then saved over the old one, every restart adds another panel. Leaving
+    /// it alone costs at most one stale panel until the next restart.
+    Unknown(String),
+}
+
+/// Edit the panel at `message_id`, and say clearly which of the three
+/// outcomes happened so the caller knows whether posting a new one is right.
+pub async fn edit_existing_panel(
     ctx: &Context,
     channel_id: serenity::model::id::ChannelId,
     message_id: serenity::model::id::MessageId,
-) -> bool {
-    match channel_id.message(&ctx.http, message_id).await {
-        Ok(_) => true,
-        Err(e) if is_unknown_message(&e) => false,
-        Err(e) => {
-            eprintln!("⚠️ couldn't check whether message {message_id} still exists ({e}); assuming it does, so as not to post a duplicate");
-            true
-        }
+    embed: CreateEmbed,
+    rows: Vec<serenity::builder::CreateActionRow>,
+) -> PanelEdit {
+    let mut msg = match channel_id.message(&ctx.http, message_id).await {
+        Ok(m) => m,
+        Err(e) if is_unknown_message(&e) => return PanelEdit::Gone,
+        Err(e) => return PanelEdit::Unknown(format!("couldn't check whether the panel is still there ({e})")),
+    };
+    match msg.edit(&ctx.http, serenity::builder::EditMessage::new().embed(embed).components(rows)).await {
+        Ok(()) => PanelEdit::Edited,
+        Err(e) => PanelEdit::Unknown(format!("couldn't update the panel that's already there ({e})")),
     }
 }
 

@@ -33,10 +33,24 @@ use crate::systems::mute::{
 };
 use crate::systems::police_manual::build_police_manual_embed;
 use crate::systems::setup_helpers::{build_setup_embed, quick_setup_guild};
-use crate::systems::tickets::post_or_edit_panel;
+use crate::systems::tickets::{post_or_edit_panel, refresh_ticket_panel};
 
 const STAFF_ONLY: &str = "This one is staff only - you need the mod role.";
 const OWNER_ONLY: &str = "This one's owner only.";
+
+/// Appended when a configuration change was applied in memory but never
+/// reached the database. Without it the reply says "saved" and the setting is
+/// gone at the next restart, which reads as the bot losing work at random.
+const NOT_SAVED: &str = "\n\n\u{274c} **It did not save.** I applied it for now, but writing it to the database failed, so it will be gone the next time I restart. The bot's log has the reason.";
+
+/// `""` when the write went through, the warning above when it did not.
+fn save_note(saved: bool) -> &'static str {
+    if saved {
+        ""
+    } else {
+        NOT_SAVED
+    }
+}
 const NO_MUTE_ROLE: &str =
     "There's no mute role yet. Run `/setup quick`, or point me at one with `/setup roles mute_role:@Role`.";
 
@@ -1099,6 +1113,14 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     .field("Memory (RSS)", format!("{} MB", rss_mb()), true)
                     .field("Guilds in lockdown", locked_count().to_string(), true)
                     .field("Build", concat!("Guardian v", env!("CARGO_PKG_VERSION"), " · Rust"), true)
+                    .field(
+                        "Saving",
+                        match crate::common::db::write_failures() {
+                            0 => "working".to_string(),
+                            n => format!("⚠️ {n} failed write{}", if n == 1 { "" } else { "s" }),
+                        },
+                        true,
+                    )
                     .footer(CreateEmbedFooter::new("Use /nuketest to check my permissions in this server."))
                     .timestamp(Timestamp::now()),
                 true,
@@ -1254,7 +1276,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let emoji_ok = crate::common::embeds::parse_button_emoji(&raw_emoji).is_some();
                     let emoji = if emoji_ok { raw_emoji.clone() } else { String::new() };
                     let Some(log_channel) = opts.channel("log_channel") else { return };
-                    update_ticket_config(&gid, |c| {
+                    let saved = update_ticket_config(&gid, |c| {
                         c.types.retain(|t| t.key != key);
                         c.types.push(TicketType {
                             key: key.clone(),
@@ -1263,18 +1285,22 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             log_channel_id: log_channel.to_string(),
                         });
                     });
+                    refresh_ticket_panel(ctx, guild_id).await;
                     let emoji_note = if raw_emoji.is_empty() || emoji_ok {
                         String::new()
                     } else {
                         format!("\n\n⚠️ I left the emoji off: Discord won't take `{}` on a button. Use an actual emoji, or a custom one from this server as `<:name:id>`.", truncate(&raw_emoji, 40))
                     };
-                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("Ticket type **{label}** (`{key}`) → logs to <#{log_channel}>.\nRun `/tickets panel` to refresh the panel with this type.{emoji_note}"), Some("Ticket Type Saved")), true).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Ticket type **{label}** (`{key}`) → logs to <#{log_channel}>.\nThe panel has been updated with it.{emoji_note}{}", save_note(saved)), Some("Ticket Type Saved")), true).await;
                 }
                 "removetype" => {
                     let key = opts.str("key").unwrap_or("").trim().to_lowercase();
                     let had = cfg.types.iter().any(|t| t.key == key);
-                    update_ticket_config(&gid, |c| c.types.retain(|t| t.key != key));
-                    reply_embed(ctx, i, embed(if had { colors::SUCCESS } else { colors::WARN }, if had { format!("Removed ticket type `{key}`. Run `/tickets panel` to refresh the panel.") } else { format!("No ticket type `{key}` was configured.") }, Some("Ticket Type Removed")), true).await;
+                    let saved = update_ticket_config(&gid, |c| c.types.retain(|t| t.key != key));
+                    if had {
+                        refresh_ticket_panel(ctx, guild_id).await;
+                    }
+                    reply_embed(ctx, i, embed(if had && saved { colors::SUCCESS } else if had { colors::DANGER } else { colors::WARN }, if had { format!("Removed ticket type `{key}`. The panel has been updated.{}", save_note(saved)) } else { format!("No ticket type `{key}` was configured.") }, Some("Ticket Type Removed")), true).await;
                 }
                 "listtypes" => {
                     if cfg.types.is_empty() {
@@ -1290,9 +1316,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 }
                 "category" => {
                     let Some(category) = opts.channel("category") else { return };
-                    update_ticket_config(&gid, |c| c.category_id = category.to_string());
+                    let saved = update_ticket_config(&gid, |c| c.category_id = category.to_string());
                     let name = ctx.cache.guild(guild_id).and_then(|g| g.channels.get(&category).map(|c| c.name.to_string())).unwrap_or_default();
-                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("New tickets will open under **{name}** from now on."), Some("Ticket Category Set")), true).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("New tickets will open under **{name}** from now on.{}", save_note(saved)), Some("Ticket Category Set")), true).await;
                 }
                 "panel" => {
                     if cfg.types.is_empty() {
@@ -1566,9 +1592,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     if role_ids.is_empty() {
                         return reply_text(ctx, i, "Give at least one role, mentioned or by ID.").await;
                     }
-                    update_chain(&gid, &key, |b| b.groups = vec![ChainGroup { label: None, role_ids: role_ids.clone() }]);
+                    let saved = update_chain(&gid, &key, |b| b.groups = vec![ChainGroup { label: None, role_ids: role_ids.clone() }]);
                     render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("Board `{key}` now tracks **{}** role(s), top rank first:\n{}", role_ids.len(), numbered_roles(&role_ids)), Some("Chain of Command")), true).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` now tracks **{}** role(s), top rank first:\n{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved)), Some("Chain of Command")), true).await;
                 }
                 "setgroup" => {
                     let label = opts.str("label").unwrap_or("").trim().to_string();
@@ -1576,7 +1602,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     if role_ids.is_empty() {
                         return reply_text(ctx, i, "Give at least one role, mentioned or by ID.").await;
                     }
-                    update_chain(&gid, &key, |b| {
+                    let saved = update_chain(&gid, &key, |b| {
                         let existing = b.groups.iter().position(|g| g.label.as_deref().map(|l| l.eq_ignore_ascii_case(&label)).unwrap_or(false));
                         let group = ChainGroup { label: Some(label.clone()), role_ids: role_ids.clone() };
                         match existing {
@@ -1585,19 +1611,19 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         }
                     });
                     render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("Board `{key}` group **{label}** now tracks **{}** role(s):\n{}", role_ids.len(), numbered_roles(&role_ids)), Some("Chain of Command")), true).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` group **{label}** now tracks **{}** role(s):\n{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved)), Some("Chain of Command")), true).await;
                 }
                 "removegroup" => {
                     let label = opts.str("label").unwrap_or("").trim().to_string();
                     let before = get_chain(&gid, &key).groups.len();
-                    update_chain(&gid, &key, |b| {
+                    let saved = update_chain(&gid, &key, |b| {
                         b.groups.retain(|g| !g.label.as_deref().map(|l| l.eq_ignore_ascii_case(&label)).unwrap_or(false))
                     });
                     if get_chain(&gid, &key).groups.len() == before {
                         return reply_text(ctx, i, &format!("Board `{key}` has no group called **{label}**.")).await;
                     }
                     render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(colors::SUCCESS, format!("Removed group **{label}** from board `{key}`."), Some("Chain of Command")), true).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Removed group **{label}** from board `{key}`.{}", save_note(saved)), Some("Chain of Command")), true).await;
                 }
                 "setup" => {
                     let cfg = get_chain(&gid, &key);
@@ -1607,7 +1633,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let channel = opts.channel("channel").unwrap_or(i.channel_id);
                     let title = opts.str("title").map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
                     defer(ctx, i).await;
-                    update_chain(&gid, &key, |b| {
+                    let saved = update_chain(&gid, &key, |b| {
                         if channel.to_string() != b.channel_id {
                             b.channel_id = channel.to_string();
                             b.message_id.clear();
@@ -1617,7 +1643,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         }
                     });
                     render_chain_of_command(ctx, guild_id, &key).await;
-                    edit_text(ctx, i, format!("Done - board `{key}` is up in <#{channel}>, and will keep itself updated as roles change.")).await;
+                    edit_text(ctx, i, format!("Done - board `{key}` is up in <#{channel}>, and will keep itself updated as roles change.{}", save_note(saved))).await;
                 }
                 "refresh" => {
                     let cfg = get_chain(&gid, &key);

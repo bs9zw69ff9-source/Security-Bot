@@ -125,13 +125,30 @@ pub fn load_all<T: DeserializeOwned>(table: &str) -> HashMap<String, T> {
     out
 }
 
+/// How many writes have failed since the process started.
+///
+/// A failed write means the in-memory state and the file no longer agree, and
+/// everything configured since then is going to vanish at the next restart. It
+/// is worth being able to answer "has that happened" rather than hoping
+/// somebody was reading the log at the time.
+static WRITE_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn write_failures() -> usize {
+    WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-guild write (shard-safe: only ever touches this guild's row).
-pub fn put<T: Serialize>(table: &str, guild_id: &str, value: &T) {
+///
+/// Returns whether it actually reached the file. Callers that are about to
+/// tell somebody their configuration is saved should check it, because saying
+/// "done" over a failed write is how a setting gets typed in twice.
+pub fn put<T: Serialize>(table: &str, guild_id: &str, value: &T) -> bool {
     let json = match serde_json::to_string(value) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("⚠️ db serialize {table}/{guild_id} failed: {e}");
-            return;
+            WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
         }
     };
     let conn = match DB.lock() {
@@ -142,8 +159,12 @@ pub fn put<T: Serialize>(table: &str, guild_id: &str, value: &T) {
         "INSERT INTO {table} (guild_id, data) VALUES (?1, ?2) ON CONFLICT(guild_id) DO UPDATE SET data = excluded.data"
     );
     if let Err(e) = conn.execute(&sql, rusqlite::params![guild_id, json]) {
-        eprintln!("⚠️ db write {table}/{guild_id} failed: {e}");
+        eprintln!("❌ couldn't save {table} for guild {guild_id} to {}: {e}", db_path().display());
+        eprintln!("   That change is only in memory now, and will be gone at the next restart.");
+        WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
     }
+    true
 }
 
 pub fn delete(table: &str, guild_id: &str) {

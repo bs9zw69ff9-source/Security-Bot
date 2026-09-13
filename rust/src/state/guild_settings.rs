@@ -47,13 +47,16 @@ pub fn gc(guild_id: &str) -> GuildSettings {
 }
 
 /// Apply a mutation to one guild's settings and persist it.
-pub fn update<F: FnOnce(&mut GuildSettings)>(guild_id: &str, f: F) {
+///
+/// Returns whether the change reached the database, so a caller can avoid
+/// reporting a save that did not happen.
+pub fn update<F: FnOnce(&mut GuildSettings)>(guild_id: &str, f: F) -> bool {
     let mut map = lock();
     let entry = map.entry(guild_id.to_string()).or_default();
     f(entry);
     let snapshot = entry.clone();
     drop(map);
-    db::put("guild_settings", guild_id, &snapshot);
+    db::put("guild_settings", guild_id, &snapshot)
 }
 
 /// One-time backward-compat: if legacy .env identity values are set, seed them

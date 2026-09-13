@@ -77,10 +77,11 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, AppConfig>> {
     }
 }
 
-fn save(guild_id: &str) {
+fn save(guild_id: &str) -> bool {
     let snapshot = lock().get(guild_id).cloned();
-    if let Some(s) = snapshot {
-        db::put("applications", guild_id, &s);
+    match snapshot {
+        Some(s) => db::put("applications", guild_id, &s),
+        None => true,
     }
 }
 
@@ -93,14 +94,17 @@ pub fn get_application(guild_id: &str, key: &str) -> Option<Application> {
 }
 
 /// Merge a patch into one application (creating it if new), then persist.
-pub fn update_application<F: FnOnce(&mut Application)>(guild_id: &str, key: &str, f: F) {
+///
+/// Returns whether the change reached the database, so a caller can avoid
+/// reporting a save that did not happen.
+pub fn update_application<F: FnOnce(&mut Application)>(guild_id: &str, key: &str, f: F) -> bool {
     {
         let mut map = lock();
         let cfg = map.entry(guild_id.to_string()).or_default();
         let app = cfg.apps.entry(key.to_string()).or_default();
         f(app);
     }
-    save(guild_id);
+    save(guild_id)
 }
 
 fn strings(v: &[&str]) -> Vec<String> {

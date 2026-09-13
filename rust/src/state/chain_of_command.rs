@@ -84,14 +84,18 @@ pub fn get_chain(guild_id: &str, key: &str) -> Board {
     lock().get(guild_id).and_then(|b| b.get(key).cloned()).unwrap_or_default()
 }
 
-pub fn update_chain<F: FnOnce(&mut Board)>(guild_id: &str, key: &str, f: F) {
+/// Returns whether the change reached the database. A caller about to report
+/// success to somebody should check it: telling them a role order is saved
+/// when it only ever made it into memory is how the same setup gets typed in
+/// again after every restart.
+pub fn update_chain<F: FnOnce(&mut Board)>(guild_id: &str, key: &str, f: F) -> bool {
     let mut map = lock();
     let boards = map.entry(guild_id.to_string()).or_default();
     let board = boards.entry(key.to_string()).or_default();
     f(board);
     let snapshot = boards.clone();
     drop(map);
-    db::put("chain_of_command", guild_id, &snapshot);
+    db::put("chain_of_command", guild_id, &snapshot)
 }
 
 /// All role ids tracked by any board in a guild - used to decide whether a

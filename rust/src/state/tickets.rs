@@ -43,13 +43,15 @@ pub fn get_ticket_config(guild_id: &str) -> TicketConfig {
     lock_cfg().get(guild_id).cloned().unwrap_or_default()
 }
 
-pub fn update_ticket_config<F: FnOnce(&mut TicketConfig)>(guild_id: &str, f: F) {
+/// Returns whether the change reached the database, so a caller can avoid
+/// reporting a save that did not happen.
+pub fn update_ticket_config<F: FnOnce(&mut TicketConfig)>(guild_id: &str, f: F) -> bool {
     let mut map = lock_cfg();
     let entry = map.entry(guild_id.to_string()).or_default();
     f(entry);
     let snapshot = entry.clone();
     drop(map);
-    db::put("tickets", guild_id, &snapshot);
+    db::put("tickets", guild_id, &snapshot)
 }
 
 // ── Open ticket tracking ──────────────────────────────────────
