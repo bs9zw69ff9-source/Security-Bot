@@ -12,7 +12,9 @@ use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use serenity::model::{Permissions, Timestamp};
 
 use crate::common::config::now_ms;
-use crate::common::embeds::{colors, edit_existing_panel, embed, format_uptime, sec_log, PanelEdit};
+use crate::common::embeds::{
+    colors, edit_existing_panel, format_uptime, sec_log, PanelEdit, APPY_BLURPLE, APPY_GREEN, APPY_RED,
+};
 use crate::common::permissions::is_mod;
 use crate::common::guildinfo::fetch_member;
 use crate::state::guild_settings::gc;
@@ -21,6 +23,10 @@ use crate::state::tickets::{
     update_ticket_config, OpenTicket, TicketConfig, TicketType,
 };
 
+/// The panel embed, built the same way the application panel is: one
+/// underlined heading per option, and a shared block of text underneath when
+/// every option says the same thing. Keeping the two panels the same shape is
+/// the point - a server running both should not look like it runs two bots.
 pub fn build_ticket_panel_embed(guild_name: &str, icon_url: Option<String>, types: &[TicketType]) -> CreateEmbed {
     let list = types
         .iter()
@@ -28,15 +34,15 @@ pub fn build_ticket_panel_embed(guild_name: &str, icon_url: Option<String>, type
         // not show up as literal text like ":police:" in the body either.
         .map(|t| {
             let icon = if crate::common::embeds::parse_button_emoji(&t.emoji).is_some() { t.emoji.as_str() } else { "🎫" };
-            format!("{icon}  **{}**", t.label)
+            format!("{icon} __{}__", t.label)
         })
         .collect::<Vec<_>>()
         .join("\n");
     let mut e = CreateEmbed::new()
-        .color(colors::INFO)
+        .color(APPY_BLURPLE)
         .title("🎫 Support Tickets")
         .description(format!(
-            "Need a hand? Pick the option below that fits what you need, and I'll open a private ticket just for you and the team.\n\n{list}\n\nSomeone will be with you as soon as they can. Please stick to one ticket at a time."
+            "Pick whichever of these fits, and I'll open a private channel for you and the team.\n\n{list}\n\n**BEFORE YOU OPEN ONE**\nOne ticket at a time, please\nGive us the details up front, it saves a lot of back and forth\nNo joke tickets"
         ))
         .footer(CreateEmbedFooter::new(guild_name))
         .timestamp(Timestamp::now());
@@ -478,22 +484,22 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         },
     );
 
+    // Green bar and the same field layout as a submitted application, so the
+    // two systems read as one bot rather than two.
     let welcome = CreateEmbed::new()
-        .color(colors::INFO)
-        .title(format!("{} {}", if t.emoji.is_empty() { "🎫" } else { &t.emoji }, t.label))
+        .color(APPY_GREEN)
+        .title(format!("{} {} Ticket Opened", if t.emoji.is_empty() { "🎫" } else { &t.emoji }, t.label))
         .description(format!(
-            "Thanks for reaching out, <@{}> - someone from the team will be with you shortly. Here's what you told us:\n\n{reason}",
+            "Thanks for reaching out, <@{}>. Someone from the team will be with you shortly.",
             i.user.id
         ))
+        .field("1. What can we help you with?", truncate(reason, 1024), false)
         .field("Opened by", format!("<@{}>", i.user.id), true)
-        .field("Category", t.label.clone(), true)
-        .field("Status", "🟢 Open, waiting for staff", true)
+        .field("Type", t.label.clone(), true)
+        .field("Status", "🟢 Waiting for staff", true)
         .footer(CreateEmbedFooter::new(format!("Ticket ID: {}", ticket_channel.id)))
         .timestamp(Timestamp::now());
-    let controls = CreateActionRow::Buttons(vec![
-        CreateButton::new("ticket_claim").label("Claim").emoji('🙋').style(ButtonStyle::Primary),
-        CreateButton::new("ticket_close").label("Close Ticket").emoji('🔒').style(ButtonStyle::Danger),
-    ]);
+    let controls = ticket_controls(None);
     // Ping whoever handles this type, which is the point of per-type support
     // roles: the team that deals with reports isn't pulled in for a partnership.
     let ping = support.iter().map(|r| format!("<@&{r}> ")).collect::<String>();
@@ -523,6 +529,26 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
                 .content(format!("You're all set - your ticket's open here: <#{}>", ticket_channel.id)),
         )
         .await;
+}
+
+/// The Claim / Close row.
+///
+/// `claimed_by` retires the Claim button in place, disabled and relabelled
+/// with who took it, which is how a decided application shows its outcome.
+/// Close stays live either way.
+fn ticket_controls(claimed_by: Option<&str>) -> CreateActionRow {
+    let claim = match claimed_by {
+        Some(name) => CreateButton::new("ticket_claim")
+            .label(truncate(&format!("Claimed by {name}"), 80))
+            .emoji('🙋')
+            .style(ButtonStyle::Success)
+            .disabled(true),
+        None => CreateButton::new("ticket_claim").label("Claim").emoji('🙋').style(ButtonStyle::Primary),
+    };
+    CreateActionRow::Buttons(vec![
+        claim,
+        CreateButton::new("ticket_close").label("Close Ticket").emoji('🔒').style(ButtonStyle::Danger),
+    ])
 }
 
 /// Can this member act on a ticket of this type?
@@ -565,27 +591,20 @@ pub async fn handle_ticket_claim(ctx: &Context, i: &ComponentInteraction) {
     ticket.claimed_by = Some(i.user.id.to_string());
     set_open_ticket(&guild_id.to_string(), &i.channel_id.to_string(), ticket);
 
-    // Repaint the status field in place, keeping the rest of the embed.
+    // Repaint exactly the way a decided application is repainted: recolour the
+    // bar, update the one field that changed, and retire the button that was
+    // pressed, relabelled with who pressed it.
     if let Some(old) = i.message.embeds.first() {
-        let mut e = CreateEmbed::new().color(colors::INFO);
-        if let Some(t) = &old.title {
-            e = e.title(t.clone());
-        }
-        if let Some(d) = &old.description {
-            e = e.description(d.clone());
-        }
-        for (idx, f) in old.fields.iter().enumerate() {
-            if idx == 2 {
-                e = e.field("Status", format!("🟡 Claimed by <@{}>", i.user.id), true);
-            } else {
-                e = e.field(f.name.clone(), f.value.clone(), f.inline);
-            }
-        }
-        if let Some(f) = &old.footer {
-            e = e.footer(CreateEmbedFooter::new(f.text.clone()));
-        }
+        let e = repaint_ticket(old, APPY_BLURPLE, "Status", &format!("🙋 Claimed by <@{}>", i.user.id));
         let _ = i
-            .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(CreateInteractionResponseMessage::new().embed(e)))
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .embed(e)
+                        .components(vec![ticket_controls(Some(&i.user.name))]),
+                ),
+            )
             .await;
     } else {
         let _ = i.create_response(&ctx.http, CreateInteractionResponse::Acknowledge).await;
@@ -595,13 +614,48 @@ pub async fn handle_ticket_claim(ctx: &Context, i: &ComponentInteraction) {
         .channel_id
         .send_message(
             &ctx.http,
-            CreateMessage::new().embed(embed(
-                colors::WARN,
-                format!("<@{}> has got this one and will help you out from here.", i.user.id),
-                None,
-            )),
+            CreateMessage::new().embed(
+                CreateEmbed::new()
+                    .color(APPY_BLURPLE)
+                    .title("Ticket claimed")
+                    .description(format!("<@{}> has got this one and will help you out from here.", i.user.id))
+                    .timestamp(Timestamp::now()),
+            ),
         )
         .await;
+}
+
+/// Rebuild a ticket embed with a new colour and one field replaced.
+///
+/// Serenity gives back a read-only `Embed` on an interaction, so a repaint has
+/// to be copied field by field. The application review does the same thing;
+/// this is that, with the field named rather than found by position, since the
+/// old version replaced field index 2 and would have silently rewritten the
+/// wrong one if the layout ever changed.
+fn repaint_ticket(old: &serenity::model::channel::Embed, color: u32, field: &str, value: &str) -> CreateEmbed {
+    let mut e = CreateEmbed::new().color(color).timestamp(Timestamp::now());
+    if let Some(t) = &old.title {
+        e = e.title(t.clone());
+    }
+    if let Some(d) = &old.description {
+        e = e.description(d.clone());
+    }
+    let mut replaced = false;
+    for f in &old.fields {
+        if f.name == field {
+            e = e.field(f.name.clone(), value.to_string(), f.inline);
+            replaced = true;
+        } else {
+            e = e.field(f.name.clone(), f.value.clone(), f.inline);
+        }
+    }
+    if !replaced {
+        e = e.field(field.to_string(), value.to_string(), true);
+    }
+    if let Some(f) = &old.footer {
+        e = e.footer(CreateEmbedFooter::new(f.text.clone()));
+    }
+    e
 }
 
 pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
@@ -618,11 +672,13 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
     let _ = i
         .create_response(
             &ctx.http,
-            CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().embed(embed(
-                colors::WARN,
-                "Closing this ticket and saving a transcript, one sec...",
-                None,
-            ))),
+            CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().embed(
+                CreateEmbed::new()
+                    .color(APPY_RED)
+                    .title("Closing this ticket")
+                    .description("Saving the transcript, one sec.")
+                    .timestamp(Timestamp::now()),
+            )),
         )
         .await;
 
@@ -649,8 +705,8 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
     };
 
     let summary = CreateEmbed::new()
-        .color(colors::NEUTRAL)
-        .title(format!("🔒 Ticket Closed - {label}"))
+        .color(APPY_RED)
+        .title(format!("🔒 {label} Ticket Closed"))
         .field(
             "Opened by",
             match &opener_tag {
@@ -779,6 +835,45 @@ mod tests {
                 ..Default::default()
             });
         });
+    }
+
+    /// The repaint has to find the field by name. The version this replaced
+    /// rewrote field index 2, which was Status only as long as nothing above
+    /// it moved; the moment a field was added the wrong one got overwritten.
+    #[test]
+    fn a_repaint_replaces_the_named_field_and_leaves_the_rest() {
+        let raw = serde_json::json!({
+            "title": "Faction Report Ticket Opened",
+            "description": "Thanks for reaching out.",
+            "fields": [
+                {"name": "1. What can we help you with?", "value": "someone is rdming", "inline": false},
+                {"name": "Opened by", "value": "<@1>", "inline": true},
+                {"name": "Type", "value": "Faction Report", "inline": true},
+                {"name": "Status", "value": "🟢 Waiting for staff", "inline": true}
+            ],
+            "footer": {"text": "Ticket ID: 42"}
+        });
+        let old: serenity::model::channel::Embed = serde_json::from_value(raw).unwrap();
+        let repainted = repaint_ticket(&old, APPY_BLURPLE, "Status", "🙋 Claimed by <@9>");
+        let json = serde_json::to_string(&repainted).unwrap();
+
+        assert!(json.contains("Claimed by <@9>"), "the status was not replaced: {json}");
+        assert!(!json.contains("Waiting for staff"), "the old status is still there: {json}");
+        // Everything else survives, including the answer the person typed.
+        assert!(json.contains("someone is rdming"), "the answer was dropped: {json}");
+        assert!(json.contains("Faction Report"), "the type was dropped: {json}");
+        assert!(json.contains("Ticket ID: 42"), "the footer was dropped: {json}");
+    }
+
+    /// A ticket opened before this field existed still gets a Status, rather
+    /// than the repaint quietly doing nothing.
+    #[test]
+    fn a_repaint_adds_the_field_when_it_is_missing() {
+        let raw = serde_json::json!({ "title": "Ticket", "fields": [] });
+        let old: serenity::model::channel::Embed = serde_json::from_value(raw).unwrap();
+        let json = serde_json::to_string(&repaint_ticket(&old, APPY_BLURPLE, "Status", "claimed")).unwrap();
+        assert!(json.contains("Status"));
+        assert!(json.contains("claimed"));
     }
 
     /// Types that were never split out all land on the server-wide panel, so a
