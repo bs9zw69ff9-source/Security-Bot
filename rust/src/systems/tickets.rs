@@ -1,0 +1,923 @@
+//! Ticket System: panel, per-type private channels, claim/close, and a
+//! self-contained HTML transcript written to that type's log channel.
+
+use serenity::builder::{
+    CreateActionRow, CreateAttachment, CreateButton, CreateChannel, CreateEmbed, CreateEmbedFooter, CreateInputText,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateModal,
+};
+use serenity::client::Context;
+use serenity::model::application::{ButtonStyle, ComponentInteraction, InputTextStyle, ModalInteraction};
+use serenity::model::channel::{ChannelType, PermissionOverwrite, PermissionOverwriteType};
+use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
+use serenity::model::{Permissions, Timestamp};
+
+use crate::common::config::now_ms;
+use crate::common::embeds::{
+    colors, edit_existing_panel, format_uptime, sec_log, PanelEdit, APPY_BLURPLE, APPY_GREEN, APPY_RED,
+};
+use crate::common::permissions::is_mod;
+use crate::common::guildinfo::fetch_member;
+use crate::state::guild_settings::gc;
+use crate::state::tickets::{
+    delete_open_ticket, find_open_ticket_by_user, get_open_ticket, get_ticket_config, set_open_ticket,
+    update_ticket_config, OpenTicket, TicketConfig, TicketType,
+};
+
+/// The panel embed, built the same way the application panel is: one
+/// underlined heading per option, and a shared block of text underneath when
+/// every option says the same thing. Keeping the two panels the same shape is
+/// the point - a server running both should not look like it runs two bots.
+pub fn build_ticket_panel_embed(guild_name: &str, icon_url: Option<String>, types: &[TicketType]) -> CreateEmbed {
+    let list = types
+        .iter()
+        // Same test as the buttons use, so an emoji Discord would refuse does
+        // not show up as literal text like ":police:" in the body either.
+        .map(|t| {
+            let icon = if crate::common::embeds::parse_button_emoji(&t.emoji).is_some() { t.emoji.as_str() } else { "🎫" };
+            format!("{icon} __{}__", t.label)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut e = CreateEmbed::new()
+        .color(APPY_BLURPLE)
+        .title("🎫 Support Tickets")
+        .description(format!(
+            "Pick whichever of these fits, and I'll open a private channel for you and the team.\n\n{list}\n\n**BEFORE YOU OPEN ONE**\nOne ticket at a time, please\nGive us the details up front, it saves a lot of back and forth\nNo joke tickets"
+        ))
+        .footer(CreateEmbedFooter::new(guild_name))
+        .timestamp(Timestamp::now());
+    if let Some(url) = icon_url {
+        e = e.thumbnail(url);
+    }
+    e
+}
+
+pub fn build_ticket_panel_rows(types: &[TicketType]) -> Vec<CreateActionRow> {
+    types
+        .iter()
+        .take(25)
+        .map(|t| {
+            let mut b = CreateButton::new(format!("ticket_open_{}", t.key))
+                .label(t.label.clone())
+                .style(ButtonStyle::Secondary);
+            // Anything Discord would refuse is dropped rather than sent: a
+            // panel with one plain button beats no panel at all.
+            if let Some(emoji) = crate::common::embeds::parse_button_emoji(&t.emoji) {
+                b = b.emoji(emoji);
+            }
+            b
+        })
+        .collect::<Vec<_>>()
+        .chunks(5)
+        .map(|chunk| CreateActionRow::Buttons(chunk.to_vec()))
+        .collect()
+}
+
+/// Group a guild's ticket types by the panel they belong on, the way the
+/// application panels are grouped.
+///
+/// A type with no panel channel of its own falls back to the server-wide one,
+/// so a server that never splits them up keeps the single panel it has always
+/// had, and one that does gets a separate panel per channel: support in one
+/// place, reports in another, which is how Appy's panels work.
+pub fn types_by_panel_channel(guild_id: &str) -> Vec<(String, Vec<TicketType>)> {
+    let cfg = get_ticket_config(guild_id);
+    let mut groups: Vec<(String, Vec<TicketType>)> = Vec::new();
+    for t in &cfg.types {
+        let channel = if t.panel_channel_id.is_empty() { cfg.panel_channel_id.clone() } else { t.panel_channel_id.clone() };
+        if channel.is_empty() {
+            continue;
+        }
+        match groups.iter_mut().find(|(c, _)| *c == channel) {
+            Some((_, list)) => list.push(t.clone()),
+            None => groups.push((channel, vec![t.clone()])),
+        }
+    }
+    groups
+}
+
+/// The panel message currently tracked for one channel group.
+fn tracked_panel_message(cfg: &TicketConfig, channel_id: &str, types: &[TicketType]) -> String {
+    if let Some(id) = types.iter().map(|t| t.panel_message_id.clone()).find(|m| !m.is_empty()) {
+        return id;
+    }
+    // The server-wide pair is where a single-panel server has always kept it.
+    if cfg.panel_channel_id == channel_id {
+        return cfg.panel_message_id.clone();
+    }
+    String::new()
+}
+
+/// Point every type in a group at the panel message they share.
+fn set_group_panel_message(guild_id: &str, channel_id: &str, types: &[TicketType], message_id: &str) {
+    let keys: Vec<String> = types.iter().map(|t| t.key.clone()).collect();
+    update_ticket_config(guild_id, |c| {
+        for t in c.types.iter_mut().filter(|t| keys.contains(&t.key)) {
+            t.panel_message_id = message_id.to_string();
+        }
+        if c.panel_channel_id == channel_id || c.panel_channel_id.is_empty() {
+            c.panel_channel_id = channel_id.to_string();
+            c.panel_message_id = message_id.to_string();
+        }
+    });
+}
+
+/// Refresh the ticket panel: edit the one that is already up, or post one if
+/// there isn't one. Called on boot, and after anything changes the ticket
+/// types, so the live panel always matches the configuration.
+///
+/// This used to return as soon as it found the panel message still existed,
+/// which meant a type added or removed after the panel went up did not appear
+/// on it until somebody ran `/tickets panel` by hand. Applications have always
+/// re-rendered in place; tickets now do the same.
+pub async fn refresh_ticket_panel(ctx: &Context, guild_id: GuildId) {
+    for (channel_id, types) in types_by_panel_channel(&guild_id.to_string()) {
+        let Ok(raw) = channel_id.parse::<u64>() else { continue };
+        if let Err(why) = post_or_edit_panel(ctx, guild_id, ChannelId::new(raw), &types).await {
+            // Said out loud rather than swallowed, so a panel that quietly
+            // stopped appearing has a reason attached to it in the log.
+            eprintln!("⚠️ couldn't put the ticket panel up in {raw}: {why}");
+        }
+    }
+}
+
+/// Boot entry point. Kept as its own name because that is what the ready and
+/// guild-create handlers call.
+pub async fn ensure_ticket_panel(ctx: &Context, guild_id: GuildId) {
+    refresh_ticket_panel(ctx, guild_id).await;
+}
+
+/// Clear any earlier ticket panels left in the panel channel, keeping the one
+/// currently tracked. Run at boot, after the panel is up.
+pub async fn sweep_duplicate_ticket_panels(ctx: &Context, guild_id: GuildId) {
+    let cfg = get_ticket_config(&guild_id.to_string());
+    for (channel_id, types) in types_by_panel_channel(&guild_id.to_string()) {
+        let Ok(raw) = channel_id.parse::<u64>() else { continue };
+        let keep = tracked_panel_message(&cfg, &channel_id, &types).parse::<u64>().ok().map(MessageId::new);
+        crate::common::embeds::remove_duplicate_panels(ctx, ChannelId::new(raw), keep, "ticket_open_", "ticket").await;
+    }
+}
+
+pub fn guild_meta(ctx: &Context, guild_id: GuildId) -> (String, Option<String>) {
+    ctx.cache
+        .guild(guild_id)
+        .map(|g| (g.name.to_string(), g.icon_url()))
+        .unwrap_or_else(|| (guild_id.to_string(), None))
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+/// Paginate through the whole channel history, oldest first.
+async fn fetch_all_messages(ctx: &Context, channel: ChannelId) -> Vec<serenity::model::channel::Message> {
+    let mut all = Vec::new();
+    let mut last: Option<MessageId> = None;
+    loop {
+        let mut req = serenity::builder::GetMessages::new().limit(100);
+        if let Some(id) = last {
+            req = req.before(id);
+        }
+        let Ok(batch) = channel.messages(&ctx.http, req).await else { break };
+        if batch.is_empty() {
+            break;
+        }
+        let n = batch.len();
+        last = batch.last().map(|m| m.id);
+        all.extend(batch);
+        if n < 100 {
+            break;
+        }
+    }
+    all.reverse();
+    all
+}
+
+/// Self-contained, dependency-free HTML transcript (dark-themed to resemble
+/// Discord).
+async fn build_transcript(
+    ctx: &Context,
+    channel: ChannelId,
+    channel_name: &str,
+    ticket: &OpenTicket,
+    type_label: &str,
+    closer_tag: &str,
+) -> String {
+    let messages = fetch_all_messages(ctx, channel).await;
+    let rows = messages
+        .iter()
+        .map(|m| {
+            let secs = m.timestamp.unix_timestamp();
+            let time = format_utc(secs);
+            let author = escape_html(&m.author.tag());
+            let avatar = escape_html(&m.author.face());
+            let content = escape_html(&m.content).replace('\n', "<br>");
+            let atts = m
+                .attachments
+                .iter()
+                .map(|a| {
+                    format!(
+                        "<div class=\"att\"><a href=\"{}\" target=\"_blank\" rel=\"noopener\">📎 {}</a></div>",
+                        escape_html(&a.url),
+                        escape_html(&a.filename)
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "<div class=\"msg\"><img class=\"avatar\" src=\"{avatar}\"><div class=\"body\"><div class=\"meta\"><span class=\"author\">{author}</span><span class=\"time\">{time}</span></div><div class=\"content\">{}</div>{atts}</div></div>",
+                if content.is_empty() { "<i>(no text content)</i>".to_string() } else { content }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Transcript - #{name}</title>
+<style>
+  body {{ background:#313338; color:#dbdee1; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:24px; }}
+  .header {{ border-bottom:1px solid #3f4147; padding-bottom:16px; margin-bottom:16px; }}
+  .header h1 {{ margin:0 0 4px; font-size:20px; color:#f2f3f5; }}
+  .header .sub {{ color:#949ba4; font-size:13px; }}
+  .msg {{ display:flex; gap:12px; padding:8px 0; }}
+  .avatar {{ width:40px; height:40px; border-radius:50%; flex-shrink:0; background:#5865f2; }}
+  .meta {{ font-size:13px; margin-bottom:2px; }}
+  .author {{ font-weight:600; color:#f2f3f5; }}
+  .time {{ color:#949ba4; margin-left:8px; }}
+  .content {{ font-size:15px; line-height:1.4; white-space:pre-wrap; word-wrap:break-word; }}
+  .att {{ margin-top:4px; }}
+  .att a {{ color:#00a8fc; text-decoration:none; }}
+</style></head>
+<body>
+  <div class="header">
+    <h1>🎫 {label} - #{name}</h1>
+    <div class="sub">Opened by &lt;{opener}&gt; · Closed by {closer} · {count} message(s)</div>
+  </div>
+  {rows}
+</body></html>"#,
+        name = escape_html(channel_name),
+        label = escape_html(type_label),
+        opener = escape_html(&ticket.opener_id),
+        closer = escape_html(closer_tag),
+        count = messages.len(),
+        rows = if rows.is_empty() { "<p><i>No messages were sent in this ticket.</i></p>".to_string() } else { rows },
+    )
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC`, matching the JS transcript's timestamp format.
+fn format_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
+async fn ephemeral(ctx: &Context, i: &ComponentInteraction, content: &str) {
+    let _ = i
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(content).ephemeral(true)),
+        )
+        .await;
+}
+
+/// Panel button → ask what they need in a modal.
+pub async fn handle_ticket_open(ctx: &Context, i: &ComponentInteraction) {
+    let Some(guild_id) = i.guild_id else { return };
+    let key = i.data.custom_id.trim_start_matches("ticket_open_").to_string();
+    let cfg = get_ticket_config(&guild_id.to_string());
+    let Some(t) = cfg.types.iter().find(|t| t.key == key) else {
+        return ephemeral(ctx, i, "Sorry, that ticket option isn't available anymore.").await;
+    };
+
+    if let Some(existing) = find_open_ticket_by_user(&guild_id.to_string(), &i.user.id.to_string(), &key) {
+        if ctx.cache.guild(guild_id).map(|g| g.channels.contains_key(&ChannelId::new(existing.parse().unwrap_or(0)))).unwrap_or(false) {
+            return ephemeral(ctx, i, &format!("You've already got one open over here: <#{existing}>")).await;
+        }
+    }
+
+    let modal = CreateModal::new(format!("ticket_reason_{key}"), truncate(&format!("{} - Ticket", t.label), 45))
+        .components(vec![CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Paragraph, "What can we help you with?", "reason")
+                .required(true)
+                .max_length(1000)
+                .placeholder("A few details go a long way (who, what, when)..."),
+        )]);
+    let _ = i.create_response(&ctx.http, CreateInteractionResponse::Modal(modal)).await;
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Modal submit → actually create the private channel.
+pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &str, reason: &str) {
+    let Some(guild_id) = i.guild_id else { return };
+    let cfg = get_ticket_config(&guild_id.to_string());
+    let Some(t) = cfg.types.iter().find(|t| t.key == key).cloned() else {
+        let _ = i
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("Sorry, that ticket option isn't available anymore.")
+                        .ephemeral(true),
+                ),
+            )
+            .await;
+        return;
+    };
+
+    if let Some(existing) = find_open_ticket_by_user(&guild_id.to_string(), &i.user.id.to_string(), key) {
+        let _ = i
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("You've already got one open over here: <#{existing}>"))
+                        .ephemeral(true),
+                ),
+            )
+            .await;
+        return;
+    }
+
+    let _ = i
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true)),
+        )
+        .await;
+
+    // Resolve (or create) the category tickets live under. The type's own
+    // category wins, so a server can file each kind somewhere different.
+    let preferred = if t.category_id.is_empty() { &cfg.category_id } else { &t.category_id };
+    let mut category: Option<ChannelId> = preferred.parse::<u64>().ok().map(ChannelId::new);
+    if category.map(|c| ctx.cache.guild(guild_id).map(|g| !g.channels.contains_key(&c)).unwrap_or(false)).unwrap_or(true) {
+        let found = ctx.cache.guild(guild_id).and_then(|g| {
+            g.channels.iter().find(|(_, c)| c.kind == ChannelType::Category && c.name == "Tickets").map(|(id, _)| *id)
+        });
+        category = match found {
+            Some(id) => Some(id),
+            None => guild_id
+                .create_channel(
+                    &ctx.http,
+                    CreateChannel::new("Tickets")
+                        .kind(ChannelType::Category)
+                        .audit_log_reason("Ticket system: auto-created category"),
+                )
+                .await
+                .ok()
+                .map(|c| c.id),
+        };
+        // Only remember an auto-created category as the server-wide default.
+        // Writing it onto a type that was pointed somewhere specific would
+        // quietly undo that choice.
+        if let (Some(c), true) = (category, t.category_id.is_empty()) {
+            update_ticket_config(&guild_id.to_string(), |cfg| cfg.category_id = c.to_string());
+        }
+    }
+
+    let g = gc(&guild_id.to_string());
+    let mut overwrites = vec![
+        PermissionOverwrite {
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+            kind: PermissionOverwriteType::Role(RoleId::new(guild_id.get())),
+        },
+        PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL
+                | Permissions::SEND_MESSAGES
+                | Permissions::READ_MESSAGE_HISTORY
+                | Permissions::ATTACH_FILES,
+            deny: Permissions::empty(),
+            kind: PermissionOverwriteType::Member(i.user.id),
+        },
+    ];
+    // The type's own support roles, the way an Appy ticket template works, so
+    // one server can send reports to one team and partnerships to another.
+    // Falls back to the server mod role when the type has none of its own.
+    let support = t.support_roles(&g.mod_role_id);
+    for role in &support {
+        let Ok(rid) = role.parse::<u64>() else { continue };
+        overwrites.push(PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL
+                | Permissions::SEND_MESSAGES
+                | Permissions::READ_MESSAGE_HISTORY
+                | Permissions::MANAGE_MESSAGES,
+            deny: Permissions::empty(),
+            kind: PermissionOverwriteType::Role(RoleId::new(rid)),
+        });
+    }
+
+    let safe_name: String = i
+        .user
+        .name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .take(20)
+        .collect();
+    let safe_name = if safe_name.is_empty() { "user".to_string() } else { safe_name };
+    let channel_name = truncate(&format!("{}-{safe_name}", t.key.replace('_', "-")), 90);
+    let topic = format!("{} ticket for {} ({})", t.label, i.user.tag(), i.user.id);
+
+    let audit_reason = format!("Ticket opened by {}", i.user.tag());
+    let mut builder = CreateChannel::new(channel_name.clone())
+        .kind(ChannelType::Text)
+        .permissions(overwrites.clone())
+        .topic(topic.clone())
+        .audit_log_reason(&audit_reason);
+    if let Some(cat) = category {
+        builder = builder.category(cat);
+    }
+    let mut created = guild_id.create_channel(&ctx.http, builder).await;
+    // If it failed while assigned to a category, retry once without a parent -
+    // covers a full/invalid/stale category without fully blocking creation.
+    if created.is_err() && category.is_some() {
+        created = guild_id
+            .create_channel(
+                &ctx.http,
+                CreateChannel::new(channel_name)
+                    .kind(ChannelType::Text)
+                    .permissions(overwrites)
+                    .topic(topic)
+                    .audit_log_reason(&audit_reason),
+            )
+            .await;
+    }
+
+    let ticket_channel = match created {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = i
+                .edit_response(
+                    &ctx.http,
+                    serenity::builder::EditInteractionResponse::new().content(format!(
+                        "Hmm, I couldn't open a ticket channel: `{e}`. Please double-check I have the Manage Channels permission."
+                    )),
+                )
+                .await;
+            return;
+        }
+    };
+
+    set_open_ticket(
+        &guild_id.to_string(),
+        &ticket_channel.id.to_string(),
+        OpenTicket {
+            type_key: key.to_string(),
+            opener_id: i.user.id.to_string(),
+            opened_at: now_ms(),
+            claimed_by: None,
+            reason: reason.to_string(),
+        },
+    );
+
+    // Green bar and the same field layout as a submitted application, so the
+    // two systems read as one bot rather than two.
+    let welcome = CreateEmbed::new()
+        .color(APPY_GREEN)
+        .title(format!("{} {} Ticket Opened", if t.emoji.is_empty() { "🎫" } else { &t.emoji }, t.label))
+        .description(format!(
+            "Thanks for reaching out, <@{}>. Someone from the team will be with you shortly.",
+            i.user.id
+        ))
+        .field("1. What can we help you with?", truncate(reason, 1024), false)
+        .field("Opened by", format!("<@{}>", i.user.id), true)
+        .field("Type", t.label.clone(), true)
+        .field("Status", "🟢 Waiting for staff", true)
+        .footer(CreateEmbedFooter::new(format!("Ticket ID: {}", ticket_channel.id)))
+        .timestamp(Timestamp::now());
+    let controls = ticket_controls(None);
+    // Ping whoever handles this type, which is the point of per-type support
+    // roles: the team that deals with reports isn't pulled in for a partnership.
+    let ping = support.iter().map(|r| format!("<@&{r}> ")).collect::<String>();
+    let _ = ticket_channel
+        .id
+        .send_message(
+            &ctx.http,
+            CreateMessage::new()
+                .content(format!("{ping}<@{}>", i.user.id))
+                .embed(welcome)
+                .components(vec![controls]),
+        )
+        .await;
+
+    sec_log(
+        ctx,
+        guild_id,
+        "Ticket Opened",
+        &format!("<@{}> opened a **{}** ticket over in <#{}>.", i.user.id, t.label, ticket_channel.id),
+        colors::INFO,
+    )
+    .await;
+    let _ = i
+        .edit_response(
+            &ctx.http,
+            serenity::builder::EditInteractionResponse::new()
+                .content(format!("You're all set - your ticket's open here: <#{}>", ticket_channel.id)),
+        )
+        .await;
+}
+
+/// The Claim / Close row.
+///
+/// `claimed_by` retires the Claim button in place, disabled and relabelled
+/// with who took it, which is how a decided application shows its outcome.
+/// Close stays live either way.
+fn ticket_controls(claimed_by: Option<&str>) -> CreateActionRow {
+    let claim = match claimed_by {
+        Some(name) => CreateButton::new("ticket_claim")
+            .label(truncate(&format!("Claimed by {name}"), 80))
+            .emoji('🙋')
+            .style(ButtonStyle::Success)
+            .disabled(true),
+        None => CreateButton::new("ticket_claim").label("Claim").emoji('🙋').style(ButtonStyle::Primary),
+    };
+    CreateActionRow::Buttons(vec![
+        claim,
+        CreateButton::new("ticket_close").label("Close Ticket").emoji('🔒').style(ButtonStyle::Danger),
+    ])
+}
+
+/// Can this member act on a ticket of this type?
+///
+/// Anyone the server already treats as staff, plus the type's own support
+/// roles. Appy's rule is that a template's support roles can view and close
+/// its tickets, and that is the half this adds: before, a role given access to
+/// one ticket type could see the channel but was refused by the buttons in it,
+/// because the only check was the server-wide mod role.
+fn handles_ticket(
+    member: &serenity::model::guild::Member,
+    owner_id: UserId,
+    guild_id: GuildId,
+    type_key: &str,
+) -> bool {
+    if is_mod(member, owner_id) {
+        return true;
+    }
+    let cfg = get_ticket_config(&guild_id.to_string());
+    let Some(t) = cfg.types.iter().find(|t| t.key == type_key) else { return false };
+    // Only the type's own roles here: the mod-role fallback is already covered
+    // by is_mod above, and treating an empty list as "anyone" would be wrong.
+    t.support_role_ids.iter().any(|id| member.roles.iter().any(|r| r.to_string() == *id))
+}
+
+pub async fn handle_ticket_claim(ctx: &Context, i: &ComponentInteraction) {
+    let Some(guild_id) = i.guild_id else { return };
+    let Some(mut ticket) = get_open_ticket(&guild_id.to_string(), &i.channel_id.to_string()) else {
+        return ephemeral(ctx, i, "This isn't an active ticket channel.").await;
+    };
+    let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id).unwrap_or(UserId::new(1));
+    let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else { return };
+    if !handles_ticket(&member, owner_id, guild_id, &ticket.type_key) {
+        return ephemeral(ctx, i, "Only the team that handles this kind of ticket can claim it.").await;
+    }
+    if let Some(by) = &ticket.claimed_by {
+        return ephemeral(ctx, i, &format!("This one's already claimed by <@{by}>.")).await;
+    }
+
+    ticket.claimed_by = Some(i.user.id.to_string());
+    set_open_ticket(&guild_id.to_string(), &i.channel_id.to_string(), ticket);
+
+    // Repaint exactly the way a decided application is repainted: recolour the
+    // bar, update the one field that changed, and retire the button that was
+    // pressed, relabelled with who pressed it.
+    if let Some(old) = i.message.embeds.first() {
+        let e = repaint_ticket(old, APPY_BLURPLE, "Status", &format!("🙋 Claimed by <@{}>", i.user.id));
+        let _ = i
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .embed(e)
+                        .components(vec![ticket_controls(Some(&i.user.name))]),
+                ),
+            )
+            .await;
+    } else {
+        let _ = i.create_response(&ctx.http, CreateInteractionResponse::Acknowledge).await;
+    }
+
+    let _ = i
+        .channel_id
+        .send_message(
+            &ctx.http,
+            CreateMessage::new().embed(
+                CreateEmbed::new()
+                    .color(APPY_BLURPLE)
+                    .title("Ticket claimed")
+                    .description(format!("<@{}> has got this one and will help you out from here.", i.user.id))
+                    .timestamp(Timestamp::now()),
+            ),
+        )
+        .await;
+}
+
+/// Rebuild a ticket embed with a new colour and one field replaced.
+///
+/// Serenity gives back a read-only `Embed` on an interaction, so a repaint has
+/// to be copied field by field. The application review does the same thing;
+/// this is that, with the field named rather than found by position, since the
+/// old version replaced field index 2 and would have silently rewritten the
+/// wrong one if the layout ever changed.
+fn repaint_ticket(old: &serenity::model::channel::Embed, color: u32, field: &str, value: &str) -> CreateEmbed {
+    let mut e = CreateEmbed::new().color(color).timestamp(Timestamp::now());
+    if let Some(t) = &old.title {
+        e = e.title(t.clone());
+    }
+    if let Some(d) = &old.description {
+        e = e.description(d.clone());
+    }
+    let mut replaced = false;
+    for f in &old.fields {
+        if f.name == field {
+            e = e.field(f.name.clone(), value.to_string(), f.inline);
+            replaced = true;
+        } else {
+            e = e.field(f.name.clone(), f.value.clone(), f.inline);
+        }
+    }
+    if !replaced {
+        e = e.field(field.to_string(), value.to_string(), true);
+    }
+    if let Some(f) = &old.footer {
+        e = e.footer(CreateEmbedFooter::new(f.text.clone()));
+    }
+    e
+}
+
+pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
+    let Some(guild_id) = i.guild_id else { return };
+    let Some(ticket) = get_open_ticket(&guild_id.to_string(), &i.channel_id.to_string()) else {
+        return ephemeral(ctx, i, "This isn't an active ticket channel.").await;
+    };
+    let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id).unwrap_or(UserId::new(1));
+    let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else { return };
+    if !handles_ticket(&member, owner_id, guild_id, &ticket.type_key) && i.user.id.to_string() != ticket.opener_id {
+        return ephemeral(ctx, i, "Only the team that handles this kind of ticket, or the person who opened it, can close it.").await;
+    }
+
+    let _ = i
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().embed(
+                CreateEmbed::new()
+                    .color(APPY_RED)
+                    .title("Closing this ticket")
+                    .description("Saving the transcript, one sec.")
+                    .timestamp(Timestamp::now()),
+            )),
+        )
+        .await;
+
+    let cfg = get_ticket_config(&guild_id.to_string());
+    let t = cfg.types.iter().find(|t| t.key == ticket.type_key).cloned();
+    let label = t.as_ref().map(|t| t.label.clone()).unwrap_or_else(|| ticket.type_key.clone());
+    let channel_name = ctx
+        .cache
+        .guild(guild_id)
+        .and_then(|g| g.channels.get(&i.channel_id).map(|c| c.name.to_string()))
+        .unwrap_or_else(|| i.channel_id.to_string());
+
+    let transcript = build_transcript(ctx, i.channel_id, &channel_name, &ticket, &label, &i.user.tag()).await;
+
+    let opener_tag = ticket
+        .opener_id
+        .parse::<u64>()
+        .ok()
+        .map(UserId::new)
+        .map(|id| async move { id.to_user(&ctx.http).await.ok().map(|u| u.tag()) });
+    let opener_tag = match opener_tag {
+        Some(fut) => fut.await,
+        None => None,
+    };
+
+    let summary = CreateEmbed::new()
+        .color(APPY_RED)
+        .title(format!("🔒 {label} Ticket Closed"))
+        .field(
+            "Opened by",
+            match &opener_tag {
+                Some(tag) => format!("{tag} (`{}`)", ticket.opener_id),
+                None => format!("`{}`", ticket.opener_id),
+            },
+            true,
+        )
+        .field("Closed by", format!("<@{}>", i.user.id), true)
+        .field(
+            "Claimed by",
+            ticket.claimed_by.as_ref().map(|c| format!("<@{c}>")).unwrap_or_else(|| "Unclaimed".to_string()),
+            true,
+        )
+        .field("Opened", format!("<t:{}:F>", ticket.opened_at / 1000), true)
+        .field("Duration", format_uptime(now_ms() - ticket.opened_at), true)
+        .field("Reason", truncate(if ticket.reason.is_empty() { "N/A" } else { &ticket.reason }, 1024), false)
+        .timestamp(Timestamp::now());
+
+    if let Some(log_id) = t.as_ref().and_then(|t| t.log_channel_id.parse::<u64>().ok()) {
+        let _ = ChannelId::new(log_id)
+            .send_message(
+                &ctx.http,
+                CreateMessage::new().embed(summary).add_file(CreateAttachment::bytes(
+                    transcript.into_bytes(),
+                    format!("transcript-{channel_name}.html"),
+                )),
+            )
+            .await;
+    }
+
+    sec_log(
+        ctx,
+        guild_id,
+        "Ticket Closed",
+        &format!(
+            "<@{}> closed the **{label}** ticket that <@{}> opened (<#{}>).",
+            i.user.id, ticket.opener_id, i.channel_id
+        ),
+        colors::NEUTRAL,
+    )
+    .await;
+    delete_open_ticket(&guild_id.to_string(), &i.channel_id.to_string());
+
+    let _ = i.channel_id.say(&ctx.http, "All done here - this channel will disappear in a few seconds.").await;
+    let http = ctx.http.clone();
+    let channel = i.channel_id;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let _ = channel.delete(&http).await;
+    });
+}
+
+/// Post one channel's panel, or edit the one already there. `Err` carries
+/// something worth showing the person who ran the command.
+pub async fn post_or_edit_panel(
+    ctx: &Context,
+    guild_id: GuildId,
+    channel: ChannelId,
+    types: &[TicketType],
+) -> Result<(), String> {
+    if types.is_empty() {
+        return Err("There are no ticket types to put on a panel yet. Add one with `/tickets addtype`.".to_string());
+    }
+
+    // The panel channel has to belong to this guild. Discord posts by channel
+    // id without checking which server the channel is in, so an id from
+    // somewhere else posts quite happily: the panel turns up in the wrong
+    // place, wearing the wrong server's name, and every button is dead,
+    // because the click arrives from a guild with no such ticket type. The
+    // application panels already refuse this; tickets now do too.
+    let belongs = ctx.cache.guild(guild_id).map(|g| g.channels.contains_key(&channel)).unwrap_or(false);
+    if !belongs {
+        return Err(format!(
+            "<#{channel}> isn't a channel in this server, so the panel would go up somewhere else and its buttons wouldn't work. Pick a channel from here."
+        ));
+    }
+
+    let missing = crate::common::embeds::missing_panel_permissions(ctx, guild_id, channel);
+    if !missing.is_empty() {
+        return Err(format!("I need {} in <#{channel}> before I can put the panel there.", missing.join(", ")));
+    }
+
+    let gid = guild_id.to_string();
+    let (name, icon) = guild_meta(ctx, guild_id);
+    let e = build_ticket_panel_embed(&name, icon, types);
+    let rows = build_ticket_panel_rows(types);
+
+    let cfg = get_ticket_config(&gid);
+    let tracked = tracked_panel_message(&cfg, &channel.to_string(), types);
+    if !tracked.is_empty() {
+        if let Ok(mid) = tracked.parse::<u64>() {
+            let mid = MessageId::new(mid);
+            match edit_existing_panel(ctx, channel, mid, e.clone(), rows.clone()).await {
+                PanelEdit::Edited => {
+                    set_group_panel_message(&gid, &channel.to_string(), types, &mid.to_string());
+                    return Ok(());
+                }
+                // Not "it's gone", just "I couldn't tell". Posting another one
+                // here is how a channel ends up with a stack of panels.
+                PanelEdit::Unknown(why) => return Err(format!("{why}, so I've left it alone rather than posting a second one.")),
+                PanelEdit::Gone => {}
+            }
+        }
+    }
+    match channel.send_message(&ctx.http, CreateMessage::new().embed(e).components(rows)).await {
+        Ok(posted) => {
+            set_group_panel_message(&gid, &channel.to_string(), types, &posted.id.to_string());
+            Ok(())
+        }
+        // Discord's own words: far more use than a guess at what went wrong.
+        Err(e) => Err(format!("Discord wouldn't let me post there: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add(gid: &str, key: &str, panel: &str) {
+        update_ticket_config(gid, |c| {
+            c.types.push(TicketType {
+                key: key.into(),
+                label: key.into(),
+                panel_channel_id: panel.into(),
+                ..Default::default()
+            });
+        });
+    }
+
+    /// The repaint has to find the field by name. The version this replaced
+    /// rewrote field index 2, which was Status only as long as nothing above
+    /// it moved; the moment a field was added the wrong one got overwritten.
+    #[test]
+    fn a_repaint_replaces_the_named_field_and_leaves_the_rest() {
+        let raw = serde_json::json!({
+            "title": "Faction Report Ticket Opened",
+            "description": "Thanks for reaching out.",
+            "fields": [
+                {"name": "1. What can we help you with?", "value": "someone is rdming", "inline": false},
+                {"name": "Opened by", "value": "<@1>", "inline": true},
+                {"name": "Type", "value": "Faction Report", "inline": true},
+                {"name": "Status", "value": "🟢 Waiting for staff", "inline": true}
+            ],
+            "footer": {"text": "Ticket ID: 42"}
+        });
+        let old: serenity::model::channel::Embed = serde_json::from_value(raw).unwrap();
+        let repainted = repaint_ticket(&old, APPY_BLURPLE, "Status", "🙋 Claimed by <@9>");
+        let json = serde_json::to_string(&repainted).unwrap();
+
+        assert!(json.contains("Claimed by <@9>"), "the status was not replaced: {json}");
+        assert!(!json.contains("Waiting for staff"), "the old status is still there: {json}");
+        // Everything else survives, including the answer the person typed.
+        assert!(json.contains("someone is rdming"), "the answer was dropped: {json}");
+        assert!(json.contains("Faction Report"), "the type was dropped: {json}");
+        assert!(json.contains("Ticket ID: 42"), "the footer was dropped: {json}");
+    }
+
+    /// A ticket opened before this field existed still gets a Status, rather
+    /// than the repaint quietly doing nothing.
+    #[test]
+    fn a_repaint_adds_the_field_when_it_is_missing() {
+        let raw = serde_json::json!({ "title": "Ticket", "fields": [] });
+        let old: serenity::model::channel::Embed = serde_json::from_value(raw).unwrap();
+        let json = serde_json::to_string(&repaint_ticket(&old, APPY_BLURPLE, "Status", "claimed")).unwrap();
+        assert!(json.contains("Status"));
+        assert!(json.contains("claimed"));
+    }
+
+    /// Types that were never split out all land on the server-wide panel, so a
+    /// server that has always had one panel still has exactly one.
+    #[test]
+    fn types_without_a_panel_of_their_own_share_the_default_one() {
+        let gid = "999999999999999981";
+        update_ticket_config(gid, |c| c.panel_channel_id = "500".into());
+        add(gid, "support", "");
+        add(gid, "reports", "");
+
+        let groups = types_by_panel_channel(gid);
+        assert_eq!(groups.len(), 1, "expected one panel, got {:?}", groups.iter().map(|(c, _)| c).collect::<Vec<_>>());
+        assert_eq!(groups[0].0, "500");
+        assert_eq!(groups[0].1.len(), 2);
+
+        crate::common::db::delete("tickets", gid);
+    }
+
+    /// Giving one type its own channel splits it onto its own panel and leaves
+    /// the rest where they were.
+    #[test]
+    fn a_type_with_its_own_channel_gets_its_own_panel() {
+        let gid = "999999999999999982";
+        update_ticket_config(gid, |c| c.panel_channel_id = "500".into());
+        add(gid, "support", "");
+        add(gid, "partnerships", "600");
+
+        let groups = types_by_panel_channel(gid);
+        assert_eq!(groups.len(), 2);
+        let split = groups.iter().find(|(c, _)| c == "600").expect("the split-out type should have its own panel");
+        assert_eq!(split.1.len(), 1);
+        assert_eq!(split.1[0].key, "partnerships");
+
+        crate::common::db::delete("tickets", gid);
+    }
+
+    /// With no panel channel anywhere there is nothing to render, rather than
+    /// a group keyed on an empty string that would fail to parse later.
+    #[test]
+    fn a_type_with_nowhere_to_go_is_left_out() {
+        let gid = "999999999999999983";
+        add(gid, "support", "");
+        assert!(types_by_panel_channel(gid).is_empty());
+        crate::common::db::delete("tickets", gid);
+    }
+}
