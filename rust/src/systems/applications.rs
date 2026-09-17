@@ -467,12 +467,14 @@ async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
         .id
         .send_message(
             &ctx.http,
-            CreateMessage::new().embed(
-                CreateEmbed::new()
-                    .color(APPY_GREEN)
-                    .title("Application Started")
-                    .description("Just answer the questions below by sending a message to the bot. Take your time, and be honest."),
-            ),
+            CreateMessage::new()
+                .content("**Application started**\nJust answer the questions below by sending a message here. Take your time, and be honest.")
+                .embed(
+                    CreateEmbed::new()
+                        .color(APPY_GREEN)
+                        .title("Application Started")
+                        .description("Just answer the questions below by sending a message to the bot. Take your time, and be honest."),
+                ),
         )
         .await;
     let Ok(intro) = intro else {
@@ -514,10 +516,41 @@ async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
     });
 }
 
+/// A one-off notice in the applicant's DMs.
+///
+/// Carries its text in the content as well as the embed, for the same reason
+/// the questions do: an embed that does not render leaves a blank message, and
+/// "your application has been submitted" is not a thing to leave to chance.
 async fn dm_notice(ctx: &Context, dm: ChannelId, color: u32, title: &str, description: String) {
     let _ = dm
-        .send_message(&ctx.http, CreateMessage::new().embed(CreateEmbed::new().color(color).title(title).description(description)))
+        .send_message(
+            &ctx.http,
+            CreateMessage::new()
+                .content(format!("**{title}**\n{description}"))
+                .embed(CreateEmbed::new().color(color).title(title).description(description)),
+        )
         .await;
+}
+
+/// One interview question.
+///
+/// The question is in the message content, not only in the embed. An embed is
+/// the nicer thing to look at, but it is also the thing that can come out
+/// blank: a client that does not render it leaves the applicant staring at an
+/// empty message from the bot with no idea what is being asked, which is
+/// exactly what happened. Plain content always renders, everywhere. The embed
+/// stays for the look and carries the parts that do not change, so nothing is
+/// said twice.
+fn question_prompt(label: &str, question: &str, number: usize, total: usize, cancel: CreateActionRow) -> CreateMessage {
+    CreateMessage::new()
+        .content(format!("**Question {number} of {total}**\n{question}"))
+        .embed(
+            CreateEmbed::new()
+                .color(APPY_BLURPLE)
+                .title(format!("{label} Application"))
+                .description("Answer by sending your reply as a message here. Take your time, and be honest."),
+        )
+        .components(vec![cancel])
 }
 
 /// Walk the applicant through the questions in DMs, one at a time.
@@ -536,22 +569,18 @@ async fn run_dm_application(ctx: &Context, guild_id: GuildId, user: User, app: A
             .label("Cancel Application")
             .style(ButtonStyle::Danger)]);
         let q_msg = dm
-            .send_message(
-                &ctx.http,
-                CreateMessage::new()
-                    .embed(
-                        CreateEmbed::new()
-                            .color(APPY_BLURPLE)
-                            .title(format!("{} Application", app.label))
-                            .description(format!(
-                                "{}/{total}. {question}\n\n-# To answer this one, just send your response as a message here.",
-                                idx + 1
-                            )),
-                    )
-                    .components(vec![cancel_row]),
-            )
-            .await
-            .ok();
+            .send_message(&ctx.http, question_prompt(&app.label, question, idx + 1, total, cancel_row))
+            .await;
+        let q_msg = match q_msg {
+            Ok(m) => Some(m),
+            Err(e) => {
+                // This used to be `.ok()`, which threw the reason away. An
+                // interview that goes wrong here is the one place nobody can
+                // see what happened, since it all happens in a DM.
+                eprintln!("⚠️ couldn't send question {} of the {} application to {}: {e}", idx + 1, app.label, user.id);
+                None
+            }
+        };
 
         let q_msg_id = q_msg.as_ref().map(|m| m.id);
         let user_id = user.id;
@@ -1096,6 +1125,29 @@ mod tests {
         let questions: Vec<String> = (0..6).map(|n| format!("Question {n}")).collect();
         assert!(app_answer_cap(&questions) > 800);
         assert!(worst_case_embed_size(&questions) <= 6000);
+    }
+
+    /// The question has to survive a client that shows no embeds. It lives in
+    /// the message content for that reason, and a refactor that moves it back
+    /// into the embed would leave applicants looking at a blank message.
+    #[test]
+    fn a_question_is_readable_without_the_embed() {
+        let cancel = CreateActionRow::Buttons(vec![CreateButton::new("app_cancel").label("Cancel")]);
+        let json = serde_json::to_string(&question_prompt(
+            "NCR",
+            "How old are you along with your DOB?",
+            1,
+            7,
+            cancel,
+        ))
+        .unwrap();
+
+        let content = json.split("\"content\":\"").nth(1).and_then(|s| s.split("\",").next()).unwrap_or("");
+        assert!(content.contains("How old are you"), "the question is not in the content: {content}");
+        assert!(content.contains("1 of 7"), "the progress is not in the content: {content}");
+        // And the embed must not repeat it, or every question reads twice.
+        let embed_part = json.split("\"embeds\":").nth(1).unwrap_or("");
+        assert!(!embed_part.contains("How old are you"), "the question is said twice: {embed_part}");
     }
 
     /// One application, one button.
