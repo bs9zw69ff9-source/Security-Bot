@@ -145,6 +145,8 @@ pub fn all() -> Vec<CreateCommand> {
             .description("Configure Guardian for this server")
             .add_option(sub("quick", "Auto-provision a Muted role + log/alert/message-log channels in one step")
                 .add_sub_option(opt(CommandOptionType::Role, "mod_role", "Role allowed to use moderation commands (optional)")))
+            .add_option(sub("logs", "Auto-create a 🗃️│ log channel for every log type (ban-log, join-log, …)")
+                .add_sub_option(opt(CommandOptionType::Role, "mod_role", "Role that can see the log channels (optional)")))
             .add_option(sub("view", "Show current configuration for this server"))
             .add_option(sub("roles", "Set the mod role and/or mute role")
                 .add_sub_option(opt(CommandOptionType::Role, "mod_role", "Role allowed to use moderation commands"))

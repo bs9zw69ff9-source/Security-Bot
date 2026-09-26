@@ -10,6 +10,7 @@ pub mod message_logging;
 pub mod mute;
 pub mod police_manual;
 pub mod server_list;
+pub mod server_logs;
 pub mod setup_helpers;
 pub mod snapshot_rollback;
 pub mod tickets;

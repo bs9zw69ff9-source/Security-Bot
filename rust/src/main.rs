@@ -23,6 +23,7 @@ use serenity::model::guild::audit_log::AuditLogEntry;
 use serenity::model::guild::{Guild, Member};
 use serenity::model::id::{ChannelId, GuildId, MessageId};
 use serenity::model::user::User;
+use serenity::model::voice::VoiceState;
 use serenity::model::Permissions;
 
 use common::config::{now_ms, CONFIG, TOKEN};
@@ -135,6 +136,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_member_addition(&self, ctx: Context, member: Member) {
+        systems::server_logs::on_member_join(&ctx, &member).await;
         systems::anti_raid::on_member_join(&ctx, &member).await;
     }
 
@@ -164,7 +166,8 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn guild_member_removal(&self, ctx: Context, guild_id: GuildId, _user: User, member: Option<Member>) {
+    async fn guild_member_removal(&self, ctx: Context, guild_id: GuildId, user: User, member: Option<Member>) {
+        systems::server_logs::on_member_leave(&ctx, guild_id, &user, member.as_ref()).await;
         let tracked = state::chain_of_command::get_all_chain_role_ids(&guild_id.to_string());
         if tracked.is_empty() {
             return;
@@ -179,6 +182,11 @@ impl EventHandler for Handler {
 
     async fn guild_audit_log_entry_create(&self, ctx: Context, entry: AuditLogEntry, guild_id: GuildId) {
         systems::anti_nuke::on_audit_log_entry(&ctx, &entry, guild_id).await;
+        systems::server_logs::on_audit_log_entry(&ctx, &entry, guild_id).await;
+    }
+
+    async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        systems::server_logs::on_voice_state(&ctx, old.as_ref(), &new).await;
     }
 
     async fn message_delete(
@@ -214,7 +222,10 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
-            Interaction::Command(i) => commands::handler::handle(&ctx, &i).await,
+            Interaction::Command(i) => {
+                systems::server_logs::on_command(&ctx, &i).await;
+                commands::handler::handle(&ctx, &i).await
+            }
             Interaction::Component(i) => {
                 if i.guild_id.is_none() {
                     return;
@@ -436,6 +447,7 @@ async fn main() {
         | serenity::model::gateway::GatewayIntents::GUILD_MEMBERS
         | serenity::model::gateway::GatewayIntents::GUILD_MODERATION
         | serenity::model::gateway::GatewayIntents::GUILD_WEBHOOKS
+        | serenity::model::gateway::GatewayIntents::GUILD_VOICE_STATES // ProBot-style voice logs
         | serenity::model::gateway::GatewayIntents::MESSAGE_CONTENT
         | serenity::model::gateway::GatewayIntents::DIRECT_MESSAGES;
 

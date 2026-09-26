@@ -32,6 +32,7 @@ use crate::systems::mute::{
     lift_lockdown_channels, lock_all_text_channels, mute_user, set_send_messages, unlock_all_text_channels, unmute_user,
 };
 use crate::systems::police_manual::build_police_manual_embed;
+use crate::systems::server_logs::{build_log_setup_embed, setup_log_channels};
 use crate::systems::setup_helpers::{build_setup_embed, quick_setup_guild};
 use crate::systems::tickets::{post_or_edit_panel, refresh_ticket_panel, types_by_panel_channel};
 
@@ -920,6 +921,11 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         if r.reused.is_empty() { String::new() } else { format!("**Reused existing:** {}\n", r.reused.join(", ")) },
                     ));
                     edit_embed(ctx, i, e).await;
+                }
+                "logs" => {
+                    defer(ctx, i).await;
+                    let r = setup_log_channels(ctx, guild_id, opts.role("mod_role")).await;
+                    edit_embed(ctx, i, build_log_setup_embed(guild_id, &r)).await;
                 }
                 "view" => reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &[]), true).await,
                 "roles" => {
@@ -1812,7 +1818,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .field("📡 /antiping", "Configure ping protection - `status`, `toggle`, `action`, `protect`, etc. *(bot owner only)*", false)
                 .field("📊 /limits", "Check your remaining mod action limits today", false)
                 .field("⚙️ /config", "View configuration *(bot owner only)*", false)
-                .field("🔧 /setup", "`quick` auto-provisions a mute role + log channels in one step; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", false)
+                .field("🔧 /setup", "`quick` auto-provisions a mute role + log channels in one step; `logs` creates a 🗃️│ channel for every ProBot-style log type; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", false)
                 .field("🎫 /tickets", "`addtype`/`removetype`/`listtypes`/`support`/`typecategory`/`category`/`panel` - ticket types, each with its own support roles, category and panel *(bot/server owner only)*", false)
                 .field("📝 /applications", "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole`/`setquestions` - configure the application system *(bot/server owner only)*", false)
                 .field("👮 /police", "`manual setup [channel]` - post the officer guide & procedures manual *(bot/server owner only)*", false)

@@ -1,27 +1,24 @@
-//! Deleted-message, bulk-delete, and edit logging.
+//! Deleted-message, bulk-delete, and edit logging, in the ProBot style (see
+//! server_logs.rs).
 //!
 //! Discord does not include content in delete events, so the original message
 //! is recovered from serenity's message cache where possible - the same
 //! "_content not cached (sent before restart)_" caveat the JS bot had.
 
-use serenity::builder::{CreateAttachment, CreateEmbed, CreateEmbedAuthor, CreateMessage};
+use serenity::builder::{CreateAttachment, CreateMessage};
 use serenity::client::Context;
 use serenity::model::channel::Message;
 use serenity::model::id::{ChannelId, GuildId, MessageId};
-use serenity::model::Timestamp;
 
-use crate::common::embeds::colors;
-use crate::state::guild_settings::gc;
+use crate::systems::server_logs::{build, is_log_channel, log_channel_for, server_of, Who};
 
-/// Resolve the configured message-log channel, skipping the log channel itself.
-fn log_channel(guild_id: GuildId, source: ChannelId) -> Option<ChannelId> {
-    let id = gc(&guild_id.to_string()).msg_log_channel_id;
-    let raw = id.parse::<u64>().ok()?;
-    let ch = ChannelId::new(raw);
-    if ch == source {
-        return None; // don't log the log channel itself
+/// Resolve where a message log goes (its `/setup logs` channel, else the
+/// legacy message-log channel), skipping anything that is itself a log channel.
+fn log_channel(guild_id: GuildId, source: ChannelId, key: &str) -> Option<ChannelId> {
+    if is_log_channel(guild_id, source) {
+        return None; // don't log the log channels themselves
     }
-    Some(ch)
+    log_channel_for(guild_id, key)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -30,7 +27,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 pub async fn on_message_delete(ctx: &Context, channel_id: ChannelId, message_id: MessageId, guild_id: Option<GuildId>) {
     let Some(guild_id) = guild_id else { return };
-    let Some(log_ch) = log_channel(guild_id, channel_id) else { return };
+    let Some(log_ch) = log_channel(guild_id, channel_id, "messageDelete") else { return };
 
     let cached: Option<Message> = ctx.cache.message(channel_id, message_id).map(|m| m.clone());
     if let Some(m) = &cached {
@@ -39,23 +36,11 @@ pub async fn on_message_delete(ctx: &Context, channel_id: ChannelId, message_id:
         }
     }
 
-    let author_line = match &cached {
-        Some(m) => format!("**Author:** <@{}> · `{}` · `{}`\n", m.author.id, m.author.tag(), m.author.id),
-        None => "**Author:** _uncached_\n".to_string(),
-    };
-    let content_line = match &cached {
-        Some(m) if !m.content.is_empty() => format!("**Content:**\n{}", truncate(&m.content, 1800)),
-        Some(_) => "_no text content_".to_string(),
+    let content = match &cached {
+        Some(m) => m.content.clone(),
         None => "_content not cached (sent before restart)_".to_string(),
     };
-
-    let mut e = CreateEmbed::new()
-        .color(colors::MUTED)
-        .description(format!("🗑️ **Message deleted** in <#{channel_id}>\n{author_line}{content_line}"))
-        .timestamp(Timestamp::now());
-    if let Some(m) = &cached {
-        e = e.author(CreateEmbedAuthor::new(m.author.tag()).icon_url(m.author.face()));
-    }
+    let author = cached.as_ref().map(|m| Who::from_user(&m.author));
 
     // Re-upload attachments so images survive Discord's CDN expiry.
     let mut files = Vec::new();
@@ -79,12 +64,10 @@ pub async fn on_message_delete(ctx: &Context, channel_id: ChannelId, message_id:
                 first_image = Some(safe);
             }
         }
-        if let Some(img) = &first_image {
-            e = e.attachment(img.clone());
-        }
-        if !m.attachments.is_empty() {
-            e = e.field(format!("Attachments ({})", m.attachments.len()), truncate(&lines.join("\n"), 1024), false);
-        }
+    }
+    let mut e = build::message_delete(&server_of(ctx, guild_id), author.as_ref(), channel_id.get(), &content, &lines);
+    if let Some(img) = &first_image {
+        e = e.attachment(img.clone());
     }
 
     let mut payload = CreateMessage::new().embed(e);
@@ -101,7 +84,7 @@ pub async fn on_message_delete_bulk(
     guild_id: Option<GuildId>,
 ) {
     let Some(guild_id) = guild_id else { return };
-    let Some(log_ch) = log_channel(guild_id, channel_id) else { return };
+    let Some(log_ch) = log_channel(guild_id, channel_id, "messageDelete") else { return };
 
     let cached: Vec<Message> =
         ids.iter().filter_map(|id| ctx.cache.message(channel_id, *id).map(|m| m.clone())).collect();
@@ -115,22 +98,14 @@ pub async fn on_message_delete_bulk(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let e = CreateEmbed::new()
-        .color(colors::WARN)
-        .title("🧹 Bulk delete")
-        .description(format!(
-            "**{}** messages deleted in <#{channel_id}>{}{}",
-            ids.len(),
-            if lines.is_empty() { String::new() } else { format!("\n\n{lines}") },
-            if cached.len() > 15 { format!("\n…and {} more cached", cached.len() - 15) } else { String::new() }
-        ))
-        .timestamp(Timestamp::now());
+    let more = if cached.len() > 15 { format!("\n…and {} more cached", cached.len() - 15) } else { String::new() };
+    let e = build::message_bulk_delete(&server_of(ctx, guild_id), channel_id.get(), ids.len(), &format!("{lines}{more}"));
     let _ = log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await;
 }
 
 pub async fn on_message_update(ctx: &Context, old: Option<&Message>, new: &Message) {
     let Some(guild_id) = new.guild_id else { return };
-    let Some(log_ch) = log_channel(guild_id, new.channel_id) else { return };
+    let Some(log_ch) = log_channel(guild_id, new.channel_id, "messageEdit") else { return };
     if new.author.id == ctx.cache.current_user().id {
         return;
     }
@@ -140,25 +115,16 @@ pub async fn on_message_update(ctx: &Context, old: Option<&Message>, new: &Messa
     }
 
     let before = match old {
-        Some(o) if !o.content.is_empty() => truncate(&o.content, 1024),
-        Some(_) => "_empty_".to_string(),
+        Some(o) => o.content.clone(),
         None => "_not cached (sent before restart)_".to_string(),
     };
-    let after = if new.content.is_empty() { "_empty_".to_string() } else { truncate(&new.content, 1024) };
-
-    let e = CreateEmbed::new()
-        .color(colors::INFO)
-        .description(format!(
-            "✏️ **Message edited** in <#{}> · [jump]({})\n**Author:** <@{}> · `{}` · `{}`",
-            new.channel_id,
-            new.link(),
-            new.author.id,
-            new.author.tag(),
-            new.author.id
-        ))
-        .field("Before", before, false)
-        .field("After", after, false)
-        .author(CreateEmbedAuthor::new(new.author.tag()).icon_url(new.author.face()))
-        .timestamp(Timestamp::now());
+    let e = build::message_edit(
+        &server_of(ctx, guild_id),
+        &Who::from_user(&new.author),
+        new.channel_id.get(),
+        &new.link(),
+        &before,
+        &new.content,
+    );
     let _ = log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await;
 }

@@ -26,6 +26,9 @@ pub struct GuildSettings {
     /// "enabled" so it defaults to false, which means every existing row keeps
     /// the protection it already had.
     pub antiraid_disabled: bool,
+    /// ProBot-style log channels created by `/setup logs`: log type key
+    /// (e.g. "memberBan") -> channel id. Same "logChannels" key the JS bot used.
+    pub log_channels: HashMap<String, String>,
 }
 
 static SETTINGS: Lazy<Mutex<HashMap<String, GuildSettings>>> = Lazy::new(|| {

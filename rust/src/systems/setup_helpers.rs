@@ -21,7 +21,7 @@ fn or_not_set(value: &str, prefix: &str) -> String {
 pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]) -> CreateEmbed {
     let g = gc(&guild_id.to_string());
     let description = if changes.is_empty() {
-        "Run `/setup quick` for one-command setup, or `/setup roles` / `/setup channels` / `/setup whitelist` / `/setup failsafe` to configure individual fields. Current settings:".to_string()
+        "Run `/setup quick` for one-command setup, `/setup logs` for a 🗃️│ channel per log type, or `/setup roles` / `/setup channels` / `/setup whitelist` / `/setup failsafe` to configure individual fields. Current settings:".to_string()
     } else {
         format!("**Updated:**\n{}", changes.iter().map(|c| format!("• {c}")).collect::<Vec<_>>().join("\n"))
     };
@@ -48,6 +48,16 @@ pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]
             true,
         )
         .field("Msg Log", or_not_set(&g.msg_log_channel_id, "<#"), true)
+        .field(
+            "Server Logs",
+            format!(
+                "{}/{} log types have a channel{}",
+                g.log_channels.len(),
+                crate::systems::server_logs::LOG_TYPES.len(),
+                if g.log_channels.is_empty() { " - run `/setup logs`" } else { "" }
+            ),
+            false,
+        )
         .field("Whitelist Users", list(&g.nuke_whitelist_user_ids, "<@"), false)
         .field("Whitelist Roles", list(&g.nuke_whitelist_role_ids, "<@&"), false)
         .field(

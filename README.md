@@ -111,6 +111,31 @@ no manual role/channel creation or ID-copying required. Pass
 after with `/setup roles mod_role:@YourStaffRole`. Running `/setup quick`
 again reuses whatever it already created instead of duplicating it.
 
+### Server logs (ProBot-style)
+
+```
+/setup logs [mod_role:@Staff]
+```
+
+Creates a private **Logs** category with one channel per log type, each
+named `🗃️│<type>-log`, and routes every log there. The embeds follow ProBot's
+layout: the member as author, a bold emoji headline, detail fields (old/new
+values, responsible moderator, reason), and the server name in the footer.
+The log types follow [ProBot's list](https://docs.probot.io/docs/modules/logs):
+
+| Group | Channels |
+|---|---|
+| Members | `ban-log`, `unban-log`, `join-log`, `leave-log`, `kick-log`, `timeout-log` |
+| Voice | `voice-join-log`, `voice-leave-log`, `voice-move-log`, `voice-disconnect-log`, `voice-switch-log`, `voice-state-log` |
+| Channels | `channel-create-log`, `channel-delete-log`, `channel-update-log`, `channel-permissions-log` |
+| Roles | `role-create-log`, `role-delete-log`, `role-update-log`, `role-given-log`, `role-removed-log` |
+| Messages | `message-delete-log`, `message-edit-log` |
+| Server | `mod-command-log`, `invite-log`, `server-update-log`, `nickname-log` |
+
+Running it again reuses existing channels (matched by name) instead of
+duplicating them. The bot needs **Manage Channels** and **View Audit Log**.
+The code is in `rust/src/systems/server_logs.rs`.
+
 Other subcommands: `/setup view` (show current config), `/setup roles`,
 `/setup channels`, `/setup whitelist` (anti-nuke immunity), `/setup
 failsafe` (roles targeted by `!failsafe`).
