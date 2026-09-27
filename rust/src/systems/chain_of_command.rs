@@ -12,7 +12,6 @@ use serenity::model::Timestamp;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::common::embeds::colors;
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
 
 /// One member, reduced to what a board actually needs.
@@ -69,8 +68,9 @@ pub fn build_chain_of_command_embed(
         ctx.cache.guild(guild_id).map(|g| g.roles.keys().copied().collect()).unwrap_or_default();
 
     CreateEmbed::new()
-        .color(colors::INFO)
-        .title(if title.is_empty() { "📋 Chain of Command" } else { title })
+        .color(crate::common::theme::palette::GOLD)
+        .title(if title.is_empty() { "🎖️  CHAIN OF COMMAND" } else { title })
+        .footer(crate::common::theme::footer("Chain of Command • updates itself as roles change"))
         .timestamp(Timestamp::now())
         .description(chain_description(groups, members, &existing_roles))
 }

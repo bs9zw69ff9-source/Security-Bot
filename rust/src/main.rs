@@ -299,10 +299,23 @@ impl EventHandler for Handler {
                     let _ = user
                         .direct_message(
                             &ctx.http,
-                            serenity::builder::CreateMessage::new().content(format!(
-                                "Just got added to **{}** (`{}`). To get set up fast, run `/setup quick` over there - it'll create a mute role and the log channels for you. Then point me at your staff role with `/setup roles mod_role:@YourStaffRole` and you're good.",
-                                guild.name, guild.id
-                            )),
+                            serenity::builder::CreateMessage::new().embed(
+                                serenity::builder::CreateEmbed::new()
+                                    .color(common::theme::palette::MAGENTA)
+                                    .author(serenity::builder::CreateEmbedAuthor::new("➕ NEW SERVER"))
+                                    .title(format!("🛡️  Guardian joined {}", guild.name))
+                                    .description(
+                                        "Three steps and it's protected:\n\n\
+                                         **1️⃣  `/setup quick`** - mute role + log channels\n\
+                                         **2️⃣  `/setup logs`** - a 🗃️│ channel for every log type\n\
+                                         **3️⃣  `/setup roles mod_role:@Staff`** - who can moderate",
+                                    )
+                                    .field("🏠 Server", guild.name.clone(), true)
+                                    .field("🆔 ID", format!("`{}`", guild.id), true)
+                                    .field("👥 Members", format!("`{}`", guild.member_count), true)
+                                    .footer(common::theme::footer("Welcome"))
+                                    .timestamp(serenity::model::Timestamp::now()),
+                            ),
                         )
                         .await;
                 }

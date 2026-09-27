@@ -1053,7 +1053,8 @@ pub fn build_log_setup_embed(guild_id: GuildId, r: &LogSetupResult) -> CreateEmb
         .join("\n");
     let mut e = CreateEmbed::new()
         .color(if r.failed.is_empty() { crate::common::embeds::colors::SUCCESS } else { crate::common::embeds::colors::WARN })
-        .title("🗃️ Log channels ready")
+        .author(serenity::builder::CreateEmbedAuthor::new("🗃️ SERVER LOGS"))
+        .title(format!("{}  {} log channels ready", if r.failed.is_empty() { "✅" } else { "⚠️" }, LOG_TYPES.len() - r.failed.len()))
         .description(clip(
             &format!(
                 "Every log type now has its own channel{}.\n\n{list}",
@@ -1061,12 +1062,13 @@ pub fn build_log_setup_embed(guild_id: GuildId, r: &LogSetupResult) -> CreateEmb
             ),
             4096,
         ))
-        .field("Created", r.created.to_string(), true)
-        .field("Reused", r.reused.to_string(), true)
+        .field("🆕 Created", format!("**{}**", r.created), true)
+        .field("♻️ Reused", format!("**{}**", r.reused), true)
+        .footer(crate::common::theme::footer("Server Logs"))
         .timestamp(Timestamp::now());
     if !r.failed.is_empty() {
         e = e.field(
-            "Couldn't create",
+            "❌ Couldn't create",
             clip(&format!("{}\n_Check I have Manage Channels._", r.failed.join("\n")), 1024),
             false,
         );

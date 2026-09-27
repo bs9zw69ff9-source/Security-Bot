@@ -7,16 +7,20 @@ use serenity::model::Timestamp;
 
 use super::config::{BOT_OWNER_IDS, CONFIG};
 use super::db::append_forensic;
+use super::theme;
 use crate::state::guild_settings::gc;
 
+/// The bot-wide colours, mapped onto the bold palette in `theme.rs`. Kept as
+/// names so every existing call site picks up the new look unchanged.
 pub mod colors {
-    pub const SUCCESS: u32 = 0x00e5a0;
-    pub const WARN: u32 = 0xf5a623;
-    pub const DANGER: u32 = 0xff3b5c;
-    pub const INFO: u32 = 0x5865f2;
-    pub const MUTED: u32 = 0xff7518;
-    pub const NUKE: u32 = 0xff0033;
-    pub const NEUTRAL: u32 = 0x2f3136;
+    use super::super::theme::palette;
+    pub const SUCCESS: u32 = palette::EMERALD;
+    pub const WARN: u32 = palette::AMBER;
+    pub const DANGER: u32 = palette::CRIMSON;
+    pub const INFO: u32 = palette::AZURE;
+    pub const MUTED: u32 = palette::TANGERINE;
+    pub const NUKE: u32 = palette::INFERNO;
+    pub const NEUTRAL: u32 = palette::SLATE;
 }
 
 /// Appy-style accent colours for the application DM flow and review embed.
@@ -25,12 +29,16 @@ pub const APPY_BLURPLE: u32 = 0x5865f2; // per-question prompts (blurple left ba
 pub const APPY_RED: u32 = 0xed4245; // denied (red left bar)
 pub const APP_PENDING: u32 = 0xf59e0b; // review pending (orange left bar)
 
-/// The standard Guardian embed: coloured bar, description, timestamp, and an
-/// optional shield-prefixed title.
+/// The standard Guardian embed: bold colour bar, an icon matched to the
+/// colour in front of the title, the Guardian footer and a timestamp.
 pub fn embed(color: u32, description: impl Into<String>, title: Option<&str>) -> CreateEmbed {
-    let mut e = CreateEmbed::new().color(color).description(description).timestamp(Timestamp::now());
+    let mut e = CreateEmbed::new()
+        .color(color)
+        .description(description)
+        .footer(theme::footer(""))
+        .timestamp(Timestamp::now());
     if let Some(t) = title {
-        e = e.title(format!("🛡️ {t}"));
+        e = e.title(theme::titled(theme::icon_for_color(color), t));
     }
     e
 }
@@ -49,7 +57,7 @@ pub async fn sec_log(ctx: &Context, guild_id: GuildId, title: &str, desc: &str, 
     }
     let Ok(id) = log_id.parse::<u64>() else { return };
     let _ = ChannelId::new(id)
-        .send_message(&ctx.http, CreateMessage::new().embed(embed(color, desc, Some(title))))
+        .send_message(&ctx.http, CreateMessage::new().embed(theme::log_card(title, desc, color)))
         .await;
 }
 
@@ -74,7 +82,7 @@ pub async fn alert_owner(ctx: &Context, guild_id: GuildId, desc: &str, color: u3
                 &ctx.http,
                 CreateMessage::new()
                     .content(content)
-                    .embed(embed(color, desc, Some(title)))
+                    .embed(theme::alert_card(title, desc, color, None))
                     .allowed_mentions(mentions),
             )
             .await;
@@ -90,7 +98,7 @@ pub async fn alert_owner(ctx: &Context, guild_id: GuildId, desc: &str, color: u3
                     .direct_message(
                         &ctx.http,
                         CreateMessage::new()
-                            .embed(embed(color, format!("**[{guild_name}]** {desc}"), Some(title))),
+                            .embed(theme::alert_card(title, desc, color, Some(&guild_name))),
                     )
                     .await;
             }
@@ -129,8 +137,10 @@ pub fn limit_denied_embed(action: &str, used: usize, limit: usize, resets_in_min
             CONFIG.mod_window_ms / 3_600_000,
             if resets_in_min == 1 { "" } else { "s" }
         ),
-        None,
+        Some("⏳ Rate Limit Reached"),
     )
+    .field("📊 Used", format!("`{}` **{used}/{limit}**", build_bar(used, limit, 10)), true)
+    .field("🔁 Resets in", format!("~{resets_in_min} min"), true)
 }
 
 pub fn render_anti_ping_response(template: &str, member_id: &str, targets: &str, action_text: &str) -> String {

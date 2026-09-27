@@ -1,13 +1,13 @@
 //! `/setup` helpers: the settings overview embed and the one-command
 //! auto-provisioning of a Muted role + Guardian log channels.
 
-use serenity::builder::{CreateChannel, CreateEmbed, EditRole};
+use serenity::builder::{CreateChannel, CreateEmbed, CreateEmbedAuthor, EditRole};
 use serenity::client::Context;
 use serenity::model::channel::{ChannelType, PermissionOverwrite, PermissionOverwriteType};
 use serenity::model::id::{GuildId, RoleId};
 use serenity::model::{Permissions, Timestamp};
 
-use crate::common::embeds::colors;
+use crate::common::theme;
 use crate::state::guild_settings::{gc, update};
 
 fn or_not_set(value: &str, prefix: &str) -> String {
@@ -21,9 +21,9 @@ fn or_not_set(value: &str, prefix: &str) -> String {
 pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]) -> CreateEmbed {
     let g = gc(&guild_id.to_string());
     let description = if changes.is_empty() {
-        "Run `/setup quick` for one-command setup, `/setup logs` for a 🗃️│ channel per log type, or `/setup roles` / `/setup channels` / `/setup whitelist` / `/setup failsafe` to configure individual fields. Current settings:".to_string()
+        "🚀 `/setup quick` does the basics in one step, then `/setup logs` adds a 🗃️│ channel per log type.\nFine-tune with `/setup roles` · `channels` · `whitelist` · `failsafe`.".to_string()
     } else {
-        format!("**Updated:**\n{}", changes.iter().map(|c| format!("• {c}")).collect::<Vec<_>>().join("\n"))
+        format!("✅ **Updated**\n{}", changes.iter().map(|c| format!("› {c}")).collect::<Vec<_>>().join("\n"))
     };
 
     let list = |ids: &[String], prefix: &str| -> String {
@@ -34,44 +34,74 @@ pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]
         }
     };
 
+    let logs = g.log_channels.len();
+    let log_total = crate::systems::server_logs::LOG_TYPES.len();
+    let check = |ok: bool| if ok { "🟢" } else { "🔴" };
+    let progress = [
+        !g.mod_role_id.is_empty(),
+        !g.mute_role_id.is_empty(),
+        !g.log_channel_id.is_empty(),
+        !g.msg_log_channel_id.is_empty(),
+        logs == log_total,
+    ];
+    let done = progress.iter().filter(|x| **x).count();
+
     CreateEmbed::new()
-        .color(if changes.is_empty() { colors::INFO } else { colors::SUCCESS })
-        .title(format!("🛡️ Guardian setup - {guild_name}"))
-        .description(description)
-        .field("Mod Role", or_not_set(&g.mod_role_id, "<@&"), true)
-        .field("Mute Role", or_not_set(&g.mute_role_id, "<@&"), true)
-        .field("\u{200b}", "\u{200b}", true)
-        .field("Log Channel", or_not_set(&g.log_channel_id, "<#"), true)
+        .color(if changes.is_empty() { theme::palette::BLURPLE } else { theme::palette::EMERALD })
+        .author(CreateEmbedAuthor::new(format!("⚙️ SETUP • {}", guild_name.to_uppercase())))
+        .title(format!(
+            "{}  Setup progress: {done}/{}",
+            if done == progress.len() { "🏁" } else { "🛠️" },
+            progress.len()
+        ))
+        .description(format!(
+            "`{}`\n\n{description}",
+            crate::common::embeds::build_bar(done, progress.len(), 15)
+        ))
         .field(
-            "Alert Channel",
-            if g.alert_channel_id.is_empty() { "(uses log)".to_string() } else { format!("<#{}>", g.alert_channel_id) },
+            "🎭 Roles",
+            format!(
+                "{} **Mod:** {}\n{} **Mute:** {}",
+                check(!g.mod_role_id.is_empty()),
+                or_not_set(&g.mod_role_id, "<@&"),
+                check(!g.mute_role_id.is_empty()),
+                or_not_set(&g.mute_role_id, "<@&")
+            ),
             true,
         )
-        .field("Msg Log", or_not_set(&g.msg_log_channel_id, "<#"), true)
         .field(
-            "Server Logs",
+            "📡 Channels",
             format!(
-                "{}/{} log types have a channel{}",
-                g.log_channels.len(),
-                crate::systems::server_logs::LOG_TYPES.len(),
-                if g.log_channels.is_empty() { " - run `/setup logs`" } else { "" }
+                "{} **Log:** {}\n🟣 **Alerts:** {}\n{} **Messages:** {}",
+                check(!g.log_channel_id.is_empty()),
+                or_not_set(&g.log_channel_id, "<#"),
+                if g.alert_channel_id.is_empty() { "(uses log)".to_string() } else { format!("<#{}>", g.alert_channel_id) },
+                check(!g.msg_log_channel_id.is_empty()),
+                or_not_set(&g.msg_log_channel_id, "<#")
             ),
-            false,
+            true,
         )
-        .field("Whitelist Users", list(&g.nuke_whitelist_user_ids, "<@"), false)
-        .field("Whitelist Roles", list(&g.nuke_whitelist_role_ids, "<@&"), false)
         .field(
-            "Failsafe Roles",
+            "🗃️ Server Logs",
+            format!(
+                "{} **{logs}/{log_total}** log types have a channel{}",
+                check(logs == log_total),
+                if logs == 0 { "\nRun `/setup logs`" } else { "" }
+            ),
+            true,
+        )
+        .field("🏅 Whitelisted Users", list(&g.nuke_whitelist_user_ids, "<@"), true)
+        .field("🏅 Whitelisted Roles", list(&g.nuke_whitelist_role_ids, "<@&"), true)
+        .field(
+            "🧨 Failsafe Roles",
             if g.failsafe_role_ids.is_empty() {
-                "None - configure with `/setup failsafe`".to_string()
+                "None - `/setup failsafe`".to_string()
             } else {
                 list(&g.failsafe_role_ids, "<@&")
             },
-            false,
+            true,
         )
-        .footer(serenity::builder::CreateEmbedFooter::new(
-            "Spam, raid and nuke thresholds are the same everywhere (they come from .env). What you set here is per server.",
-        ))
+        .footer(theme::footer("Setup • spam, raid and nuke thresholds come from .env"))
         .timestamp(Timestamp::now())
 }
 

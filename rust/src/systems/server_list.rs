@@ -158,13 +158,13 @@ pub async fn dm_server_list(ctx: &Context, to: UserId) -> String {
     let page_count = pages.len();
     for (idx, page) in pages.into_iter().enumerate() {
         let title = if page_count > 1 {
-            format!("Servers I'm in ({} of {page_count})", idx + 1)
+            format!("🌐  SERVERS I'M IN • {} of {page_count}", idx + 1)
         } else {
-            "Servers I'm in".to_string()
+            "🌐  SERVERS I'M IN".to_string()
         };
         let mut e = CreateEmbed::new().color(colors::INFO).title(title).description(page);
         if idx + 1 == page_count {
-            e = e.footer(CreateEmbedFooter::new(format!(
+            e = e.footer(crate::common::theme::footer(&format!(
                 "{total} servers, {with_invite} with an invite"
             )));
         }

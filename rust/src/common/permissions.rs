@@ -42,9 +42,17 @@ pub fn is_whitelisted(member: &Member, guild_owner_id: UserId) -> bool {
 }
 
 /// Best-effort DM to a member before punitive action.
+/// DM a ready-made embed. Silently does nothing when DMs are closed.
+pub async fn try_dm_embed(http: &Http, user_id: UserId, embed: serenity::builder::CreateEmbed) {
+    if let Ok(user) = user_id.to_user(http).await {
+        let _ = user.direct_message(http, CreateMessage::new().embed(embed)).await;
+    }
+}
+
 pub async fn try_dm(http: &Http, user_id: UserId, text: &str) {
     if let Ok(user) = user_id.to_user(http).await {
-        let _ = user.direct_message(http, CreateMessage::new().content(text)).await;
+        let card = crate::common::theme::card(crate::common::theme::Tone::Warning, Some("📬 Message from Guardian"), text);
+        let _ = user.direct_message(http, CreateMessage::new().embed(card)).await;
     }
 }
 

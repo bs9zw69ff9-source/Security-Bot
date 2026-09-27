@@ -15,7 +15,8 @@ use crate::common::embeds::{
     usage_footer,
 };
 use crate::common::guildinfo::{fetch_member, GuildInfo};
-use crate::common::permissions::{can_act_on, is_mod, is_owner, is_whitelisted, try_dm};
+use crate::common::theme::{self, ModAction, Subject};
+use crate::common::permissions::{can_act_on, is_mod, is_owner, is_whitelisted, try_dm_embed};
 use crate::state::anti_ping::{ap, AntiPing};
 use crate::state::applications::{get_application, get_applications, update_application};
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
@@ -127,10 +128,14 @@ async fn reply(ctx: &Context, i: &CommandInteraction, msg: CreateInteractionResp
     let _ = i.create_response(ctx, CreateInteractionResponse::Message(msg)).await;
 }
 async fn reply_text(ctx: &Context, i: &CommandInteraction, text: &str) {
-    reply(ctx, i, CreateInteractionResponseMessage::new().content(text).ephemeral(true)).await;
+    let card = theme::card(theme::Tone::infer(text), None, text);
+    reply(ctx, i, CreateInteractionResponseMessage::new().embed(card).ephemeral(true)).await;
 }
 async fn reply_embed(ctx: &Context, i: &CommandInteraction, e: CreateEmbed, ephemeral: bool) {
-    reply(ctx, i, CreateInteractionResponseMessage::new().embed(e).ephemeral(ephemeral)).await;
+    reply(ctx, i, CreateInteractionResponseMessage::new().embed(theme::finish(e)).ephemeral(ephemeral)).await;
+}
+async fn reply_embeds(ctx: &Context, i: &CommandInteraction, embeds: Vec<CreateEmbed>, ephemeral: bool) {
+    reply(ctx, i, CreateInteractionResponseMessage::new().embeds(embeds).ephemeral(ephemeral)).await;
 }
 async fn defer(ctx: &Context, i: &CommandInteraction) {
     let _ = i
@@ -138,10 +143,17 @@ async fn defer(ctx: &Context, i: &CommandInteraction) {
         .await;
 }
 async fn edit_text(ctx: &Context, i: &CommandInteraction, text: impl Into<String>) {
-    let _ = i.edit_response(ctx, EditInteractionResponse::new().content(text.into())).await;
+    let text = text.into();
+    let card = theme::card(theme::Tone::infer(&text), None, text);
+    let _ = i.edit_response(ctx, EditInteractionResponse::new().content("").embed(card)).await;
 }
 async fn edit_embed(ctx: &Context, i: &CommandInteraction, e: CreateEmbed) {
-    let _ = i.edit_response(ctx, EditInteractionResponse::new().embed(e)).await;
+    let _ = i.edit_response(ctx, EditInteractionResponse::new().embed(theme::finish(e))).await;
+}
+
+/// The avatar and tag of the member a moderation card is about.
+fn subject_of(member: &serenity::model::guild::Member) -> (Option<String>, String) {
+    (Some(member.user.face()), member.user.tag())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -209,15 +221,17 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
             let c = check_mod_limit(&gid, &i.user.id.to_string(), "mute");
             let stashed = stashed_count(&gid, &target_id.to_string());
-            let mut e = CreateEmbed::new()
-                .color(colors::MUTED)
-                .title("🔇 Member Muted")
-                .description(format!(
-                    "Muted <@{target_id}> for **{}**.\n**Reason:** {reason}\nI've set aside **{stashed}** role{} and will hand them back on unmute.",
-                    if minutes > 0 { format!("{minutes} minutes") } else { "as long as it takes".to_string() },
-                    plural(stashed)
-                ))
-                .timestamp(Timestamp::now());
+            let (avatar, tag) = subject_of(&target);
+            let mut e = theme::mod_card(
+                ModAction::Mute,
+                &Subject { id: target_id.get(), tag: Some(&tag), avatar },
+                i.user.id.get(),
+                Some(&reason),
+                &[
+                    ("⏱️ Duration", if minutes > 0 { format!("**{minutes}** minutes") } else { "Until unmuted".to_string() }),
+                    ("🎒 Roles set aside", format!("**{stashed}** role{} - handed back on unmute", plural(stashed))),
+                ],
+            );
             if !exempt {
                 e = e.footer(CreateEmbedFooter::new(usage_footer("mute", c.used, c.limit)));
             }
@@ -240,14 +254,13 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             reply_embed(
                 ctx,
                 i,
-                CreateEmbed::new()
-                    .color(colors::SUCCESS)
-                    .title("🔊 Member Unmuted")
-                    .description(format!(
-                        "<@{target_id}> is unmuted, and I gave back **{stashed}** stashed role{}.",
-                        plural(stashed)
-                    ))
-                    .timestamp(Timestamp::now()),
+                theme::mod_card(
+                    ModAction::Unmute,
+                    &Subject { id: target_id.get(), tag: None, avatar: None },
+                    i.user.id.get(),
+                    None,
+                    &[("🎒 Roles restored", format!("**{stashed}** role{}", plural(stashed)))],
+                ),
                 false,
             )
             .await;
@@ -286,7 +299,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "kick");
             }
-            try_dm(&ctx.http, target_id, &format!("You've been kicked from **{}**.\nReason: {reason}", info.name)).await;
+            try_dm_embed(&ctx.http, target_id, theme::dm_notice(ModAction::Kick, &info.name, &reason, None)).await;
             let _ = guild_id.kick_with_reason(&ctx.http, target_id, &reason).await;
             sec_log(
                 ctx,
@@ -297,11 +310,14 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             )
             .await;
             let c = check_mod_limit(&gid, &i.user.id.to_string(), "kick");
-            let mut e = CreateEmbed::new()
-                .color(colors::DANGER)
-                .title("👢 Member Kicked")
-                .description(format!("Kicked <@{target_id}>.\n**Reason:** {reason}"))
-                .timestamp(Timestamp::now());
+            let (avatar, tag) = subject_of(&target);
+            let mut e = theme::mod_card(
+                ModAction::Kick,
+                &Subject { id: target_id.get(), tag: Some(&tag), avatar },
+                i.user.id.get(),
+                Some(&reason),
+                &[],
+            );
             if !exempt {
                 e = e.footer(CreateEmbedFooter::new(usage_footer("kick", c.used, c.limit)));
             }
@@ -342,7 +358,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "ban");
             }
-            try_dm(&ctx.http, target_id, &format!("You've been banned from **{}**.\nReason: {reason}", info.name)).await;
+            try_dm_embed(&ctx.http, target_id, theme::dm_notice(ModAction::Ban, &info.name, &reason, None)).await;
             let _ = guild_id.ban_with_reason(&ctx.http, target_id, delete_days, &reason).await;
             let c = check_mod_limit(&gid, &i.user.id.to_string(), "ban");
             sec_log(
@@ -353,11 +369,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 colors::DANGER,
             )
             .await;
-            let mut e = CreateEmbed::new()
-                .color(colors::DANGER)
-                .title("🔨 Member Banned")
-                .description(format!("Banned <@{target_id}>.\n**Reason:** {reason}"))
-                .timestamp(Timestamp::now());
+            let (avatar, tag) = subject_of(&target);
+            let mut extra = Vec::new();
+            if delete_days > 0 {
+                extra.push(("🧹 Messages removed", format!("Last **{delete_days}** day{}", plural(delete_days as usize))));
+            }
+            let mut e = theme::mod_card(
+                ModAction::Ban,
+                &Subject { id: target_id.get(), tag: Some(&tag), avatar },
+                i.user.id.get(),
+                Some(&reason),
+                &extra,
+            );
             if !exempt {
                 e = e.footer(CreateEmbedFooter::new(usage_footer("ban", c.used, c.limit)));
             }
@@ -391,11 +414,13 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             reply_embed(
                 ctx,
                 i,
-                CreateEmbed::new()
-                    .color(colors::SUCCESS)
-                    .title("♻️ Member Unbanned")
-                    .description(format!("<@{user_id_raw}> (`{user_id_raw}`) is unbanned.\n**Reason:** {reason}"))
-                    .timestamp(Timestamp::now()),
+                theme::mod_card(
+                    ModAction::Unban,
+                    &Subject { id: uid.get(), tag: None, avatar: None },
+                    i.user.id.get(),
+                    Some(&reason),
+                    &[],
+                ),
                 false,
             )
             .await;
@@ -444,9 +469,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             .await;
             let c = check_mod_limit(&gid, &i.user.id.to_string(), "purge");
             let mut e = CreateEmbed::new()
-                .color(colors::WARN)
-                .title("🗑️ Messages Cleared")
-                .description(format!("Cleared **{n}** message{}{from}.", plural(n)))
+                .color(ModAction::Purge.color())
+                .author(serenity::builder::CreateEmbedAuthor::new("🗑️ MESSAGES CLEARED"))
+                .description(format!("**Cleared {n} message{}{from}.**", plural(n)))
+                .field("📍 Channel", format!("<#{}>", i.channel_id), true)
+                .field("🛡️ Moderator", format!("<@{}>", i.user.id), true)
+                .field("🔢 Requested", format!("**{count}**"), true)
                 .timestamp(Timestamp::now());
             if !exempt {
                 e = e.footer(CreateEmbedFooter::new(usage_footer("purge", c.used, c.limit)));
@@ -576,10 +604,15 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 record_mod_action(&gid, &i.user.id.to_string(), "warn");
             }
             let total = add_warning(&gid, &target_id.to_string(), &reason, &i.user.id.to_string());
-            try_dm(
+            try_dm_embed(
                 &ctx.http,
                 target_id,
-                &format!("You've picked up a warning in **{}** (that's #{total}). Reason: {reason}", info.name),
+                theme::dm_notice(
+                    ModAction::Warn,
+                    &info.name,
+                    &reason,
+                    Some(&format!("That's warning **#{total}**. More warnings lead to a mute, kick or ban.")),
+                ),
             )
             .await;
             sec_log(
@@ -635,13 +668,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
 
             let c = check_mod_limit(&gid, &i.user.id.to_string(), "warn");
-            let mut e = CreateEmbed::new()
-                .color(colors::WARN)
-                .title("⚠️ Warning Issued")
-                .description(format!(
-                    "Warned <@{target_id}>. **That's {total} in total.**\n**Reason:** {reason}{escalation}"
-                ))
-                .timestamp(Timestamp::now());
+            let (avatar, tag) = subject_of(&target);
+            let mut extra = vec![("🔢 Total warnings", format!("**{total}**"))];
+            if !escalation.is_empty() {
+                extra.push(("📈 Auto-escalation", escalation.trim().to_string()));
+            }
+            let mut e = theme::mod_card(
+                ModAction::Warn,
+                &Subject { id: target_id.get(), tag: Some(&tag), avatar },
+                i.user.id.get(),
+                Some(&reason),
+                &extra,
+            );
             if !exempt {
                 e = e.footer(CreateEmbedFooter::new(usage_footer("warn", c.used, c.limit)));
             }
@@ -674,9 +712,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 ctx,
                 i,
                 CreateEmbed::new()
-                    .color(colors::WARN)
-                    .title(format!("⚠️ Warnings for {tag}"))
-                    .description(format!("**{} in total.**\n\n{lines}", list.len()))
+                    .color(theme::palette::AMBER)
+                    .author(serenity::builder::CreateEmbedAuthor::new(format!("⚠️ WARNING HISTORY • {tag}")))
+                    .description(format!("<@{target_id}> has **{} warning{}** on record.\n\n{lines}", list.len(), plural(list.len())))
                     .footer(CreateEmbedFooter::new(format!(
                         "Auto-actions kick in at: mute@{} · kick@{} · ban@{}",
                         CONFIG.warn_mute_at, CONFIG.warn_kick_at, CONFIG.warn_ban_at
@@ -727,8 +765,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     ctx,
                     i,
                     CreateEmbed::new()
-                        .color(colors::INFO)
-                        .title("🛡️ Your Mod Limits")
+                        .color(theme::palette::EMERALD)
+                        .title("♾️  YOUR MOD LIMITS")
                         .description("You're whitelisted, so none of the rate limits apply to you.")
                         .timestamp(Timestamp::now()),
                     true,
@@ -744,8 +782,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 ("lockdown", "🔒", "Lockdowns"),
             ];
             let mut e = CreateEmbed::new()
-                .color(colors::INFO)
-                .title("📊 Your Mod Action Limits")
+                .color(theme::palette::VIOLET)
+                .title("📊  YOUR MOD ACTION LIMITS")
+                .thumbnail(i.user.face())
                 .description(format!(
                     "Here's where you're at over the last **{window_hours}h**. These top back up on their own as older actions age out."
                 ))
@@ -915,10 +954,10 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let mod_role = opts.role("mod_role");
                     let r = quick_setup_guild(ctx, guild_id, mod_role).await;
                     let mut e = build_setup_embed(guild_id, &info.name, &[]);
-                    e = e.title(format!("🛡️ Guardian quick setup - {}", info.name)).description(format!(
-                        "{}{}\nCurrent settings:",
-                        if r.created.is_empty() { String::new() } else { format!("**Created:** {}\n", r.created.join(", ")) },
-                        if r.reused.is_empty() { String::new() } else { format!("**Reused existing:** {}\n", r.reused.join(", ")) },
+                    e = e.color(theme::palette::EMERALD).description(format!(
+                        "⚡ **Quick setup finished.**\n{}{}\nNext: `/setup logs` for a channel per log type.",
+                        if r.created.is_empty() { String::new() } else { format!("🆕 **Created:** {}\n", r.created.join(", ")) },
+                        if r.reused.is_empty() { String::new() } else { format!("♻️ **Reused:** {}\n", r.reused.join(", ")) },
                     ));
                     edit_embed(ctx, i, e).await;
                 }
@@ -1027,39 +1066,45 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             let window_hours = CONFIG.mod_window_ms / 3_600_000;
             let g = gc(&gid);
             let a = ap(&gid);
-            let e = CreateEmbed::new()
-                .title("🛡️ Guardian Bot - Configuration")
-                .color(colors::INFO)
-                .field("🔧 Infrastructure", "\u{200b}", false)
-                .field("Owner(s)", BOT_OWNER_IDS.iter().map(|id| format!("<@{id}>")).collect::<Vec<_>>().join(", "), true)
-                .field("Log Channel", opt_channel(&g.log_channel_id), true)
-                .field("Alert Channel", if g.alert_channel_id.is_empty() { "(uses log)".into() } else { format!("<#{}>", g.alert_channel_id) }, true)
-                .field("Msg Log", opt_channel(&g.msg_log_channel_id), true)
-                .field("Mute Role", opt_role(&g.mute_role_id), true)
-                .field("Mod Role", opt_role(&g.mod_role_id), true)
-                .field("🏅 Nuke Whitelist Roles", id_list(&g.nuke_whitelist_role_ids, "<@&"), false)
-                .field("🏅 Nuke Whitelist Users", id_list(&g.nuke_whitelist_user_ids, "<@"), false)
-                .field("💬 Anti-Spam", format!("{} msgs / {}ms · mention≥{} · dupes≥{} · invites {} → {} min mute", CONFIG.spam_threshold, CONFIG.spam_window_ms, CONFIG.spam_mention_limit, CONFIG.spam_duplicate_limit, if CONFIG.spam_block_invites { "blocked" } else { "allowed" }, CONFIG.spam_mute_min), false)
-                .field("🚪 Anti-Raid", format!("{} joins / {}ms → {} min lockdown · new-acct kick: {}", CONFIG.raid_join_threshold, CONFIG.raid_window_ms, CONFIG.raid_lockdown_min, if CONFIG.raid_kick_new_on_lock { format!("<{}m", CONFIG.raid_min_account_age_min) } else { "off".into() }), false)
-                .field("📡 Anti-Ping", format!("{} • `{}` • {} min • {} users / {} roles", if a.enabled { "On" } else { "Off" }, a.action, a.timeout_min, a.protected_users.len(), a.protected_roles.len()), false)
-                .field("💣 Anti-Nuke (fast window)", format!("Window: {}ms", CONFIG.nuke_window_ms), false)
-                .field("Chan Del/Create", format!("≥ {} / {}", CONFIG.nuke_channel_threshold, CONFIG.nuke_channel_create_thresh), true)
-                .field("Role Del/Create", format!("≥ {} / {}", CONFIG.nuke_role_threshold, CONFIG.nuke_role_create_thresh), true)
-                .field("Bans / Kicks", format!("≥ {} / {}", CONFIG.nuke_ban_threshold, CONFIG.nuke_kick_threshold), true)
-                .field("Webhooks", format!("≥ {}", CONFIG.nuke_webhook_threshold), true)
-                .field("Bot add", CONFIG.nuke_bot_add_action.clone(), true)
-                .field("Any mix", if CONFIG.nuke_total_threshold > 0 { format!("≥ {}", CONFIG.nuke_total_threshold) } else { "off".to_string() }, true)
-                .field("⚠️ Warn Escalation", format!("mute @ {} ({}m) · kick @ {} · ban @ {}", CONFIG.warn_mute_at, CONFIG.warn_mute_min, CONFIG.warn_kick_at, CONFIG.warn_ban_at), false)
-                .field(format!("📊 Mod Daily Limits ({window_hours}h - whitelisted exempt)"), "\u{200b}", false)
-                .field("🔨 Bans", CONFIG.mod_ban_limit.to_string(), true)
-                .field("👢 Kicks", CONFIG.mod_kick_limit.to_string(), true)
-                .field("🔇 Mutes", CONFIG.mod_mute_limit.to_string(), true)
-                .field("⚠️ Warns", CONFIG.mod_warn_limit.to_string(), true)
-                .field("🗑️ Purges", CONFIG.mod_purge_limit.to_string(), true)
-                .field("🔒 Lockdowns", CONFIG.mod_lockdown_limit.to_string(), true)
-                .footer(CreateEmbedFooter::new("These live in .env. Change them there and restart to pick them up."))
+            let infra = CreateEmbed::new()
+                .color(theme::palette::BLURPLE)
+                .title("⚙️  CONFIGURATION • INFRASTRUCTURE")
+                .field("👑 Owner(s)", BOT_OWNER_IDS.iter().map(|id| format!("<@{id}>")).collect::<Vec<_>>().join(", "), false)
+                .field("📜 Log Channel", opt_channel(&g.log_channel_id), true)
+                .field("🚨 Alert Channel", if g.alert_channel_id.is_empty() { "(uses log)".into() } else { format!("<#{}>", g.alert_channel_id) }, true)
+                .field("💬 Msg Log", opt_channel(&g.msg_log_channel_id), true)
+                .field("🔇 Mute Role", opt_role(&g.mute_role_id), true)
+                .field("🛡️ Mod Role", opt_role(&g.mod_role_id), true)
+                .field("🗃️ Server Logs", format!("{}/{} types", g.log_channels.len(), crate::systems::server_logs::LOG_TYPES.len()), true)
+                .field("🏅 Whitelisted Roles", id_list(&g.nuke_whitelist_role_ids, "<@&"), false)
+                .field("🏅 Whitelisted Users", id_list(&g.nuke_whitelist_user_ids, "<@"), false);
+            let protection = CreateEmbed::new()
+                .color(theme::palette::MAGENTA)
+                .title("🚨  CONFIGURATION • PROTECTION")
+                .field("🧹 Anti-Spam", format!("**{}** msgs / {}ms\nmentions ≥ {} · dupes ≥ {}\ninvites {} → **{} min** mute", CONFIG.spam_threshold, CONFIG.spam_window_ms, CONFIG.spam_mention_limit, CONFIG.spam_duplicate_limit, if CONFIG.spam_block_invites { "blocked" } else { "allowed" }, CONFIG.spam_mute_min), true)
+                .field("🚪 Anti-Raid", format!("**{}** joins / {}ms\n→ **{} min** lockdown\nnew-account kick: {}", CONFIG.raid_join_threshold, CONFIG.raid_window_ms, CONFIG.raid_lockdown_min, if CONFIG.raid_kick_new_on_lock { format!("<{}m", CONFIG.raid_min_account_age_min) } else { "off".into() }), true)
+                .field("📵 Anti-Ping", format!("{}\naction `{}` · {} min\n{} users / {} roles", if a.enabled { "🟢 **On**" } else { "🔴 **Off**" }, a.action, a.timeout_min, a.protected_users.len(), a.protected_roles.len()), true);
+            let nuke = CreateEmbed::new()
+                .color(theme::palette::INFERNO)
+                .title("☢️  CONFIGURATION • ANTI-NUKE")
+                .description(format!("Trips when one person does this much inside **{}ms**.", CONFIG.nuke_window_ms))
+                .field("📁 Channels del / new", format!("≥ **{}** / **{}**", CONFIG.nuke_channel_threshold, CONFIG.nuke_channel_create_thresh), true)
+                .field("🎭 Roles del / new", format!("≥ **{}** / **{}**", CONFIG.nuke_role_threshold, CONFIG.nuke_role_create_thresh), true)
+                .field("🔨 Bans / 👢 Kicks", format!("≥ **{}** / **{}**", CONFIG.nuke_ban_threshold, CONFIG.nuke_kick_threshold), true)
+                .field("🪝 Webhooks", format!("≥ **{}**", CONFIG.nuke_webhook_threshold), true)
+                .field("🤖 Bot added", format!("`{}`", CONFIG.nuke_bot_add_action), true)
+                .field("🧮 Any mix", if CONFIG.nuke_total_threshold > 0 { format!("≥ **{}**", CONFIG.nuke_total_threshold) } else { "off".to_string() }, true);
+            let moderation = CreateEmbed::new()
+                .color(theme::palette::VIOLET)
+                .title("🔨  CONFIGURATION • MODERATION")
+                .field("📈 Warn escalation", format!("mute @ **{}** ({}m) · kick @ **{}** · ban @ **{}**", CONFIG.warn_mute_at, CONFIG.warn_mute_min, CONFIG.warn_kick_at, CONFIG.warn_ban_at), false)
+                .field(format!("⏱️ Limits per {window_hours}h"), format!(
+                    "🔨 Bans **{}** · 👢 Kicks **{}** · 🔇 Mutes **{}**\n⚠️ Warns **{}** · 🗑️ Purges **{}** · 🔒 Lockdowns **{}**\n*Whitelisted members are exempt.*",
+                    CONFIG.mod_ban_limit, CONFIG.mod_kick_limit, CONFIG.mod_mute_limit, CONFIG.mod_warn_limit, CONFIG.mod_purge_limit, CONFIG.mod_lockdown_limit
+                ), false)
+                .footer(theme::footer("Config • thresholds live in .env - edit and restart to change"))
                 .timestamp(Timestamp::now());
-            reply_embed(ctx, i, e, true).await;
+            reply_embeds(ctx, i, vec![infra, protection, nuke, moderation], true).await;
         }
 
         // ── /nuketest ──────────────────────────────────────────
@@ -1090,9 +1135,11 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 ctx,
                 i,
                 CreateEmbed::new()
-                    .color(colors::SUCCESS)
-                    .title("✅ Anti-Nuke Active")
-                    .description(format!("Anti-nuke is up and watching the audit log.\n\n**My permissions:**\n{status}"))
+                    .color(if need.iter().all(|(_, p)| my_perms.contains(*p)) { theme::palette::EMERALD } else { theme::palette::AMBER })
+                    .title("☢️  ANTI-NUKE • SYSTEM CHECK")
+                    .description("🟢 **Anti-nuke is armed and watching the audit log.**")
+                    .field("🔑 My permissions", status, false)
+                    .footer(theme::footer("Anti-Nuke"))
                     .timestamp(Timestamp::now()),
                 true,
             )
@@ -1106,28 +1153,41 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
             let uptime = crate::START_TIME.get().map(|t| now_ms() - t).unwrap_or(0);
             let latency = crate::shard_latency(ctx.shard_id).await;
+            let my_avatar = ctx.cache.current_user().face();
             reply_embed(
                 ctx,
                 i,
                 CreateEmbed::new()
-                    .color(colors::INFO)
-                    .title("📊 Guardian Bot - Status")
-                    .field("Uptime", format_uptime(uptime), true)
-                    .field("WS Ping", latency, true)
-                    .field("Shard", ctx.shard_id.to_string(), true)
-                    .field("Guilds", ctx.cache.guild_count().to_string(), true)
-                    .field("Memory (RSS)", format!("{} MB", rss_mb()), true)
-                    .field("Guilds in lockdown", locked_count().to_string(), true)
-                    .field("Build", concat!("Guardian v", env!("CARGO_PKG_VERSION"), " · Rust"), true)
+                    .color(theme::palette::AZURE)
+                    .title("📊  GUARDIAN • SYSTEM STATUS")
+                    .description(match (locked_count(), crate::common::db::write_failures()) {
+                        (0, 0) => "🟢 **All systems operational.**".to_string(),
+                        _ => "🟠 **Running, with something that needs a look below.**".to_string(),
+                    })
+                    .thumbnail(my_avatar)
+                    .field("⏱️ Uptime", format!("`{}`", format_uptime(uptime)), true)
+                    .field("📡 WS Ping", format!("`{latency}`"), true)
+                    .field("🧩 Shard", format!("`#{}`", ctx.shard_id), true)
+                    .field("🌐 Guilds", format!("`{}`", ctx.cache.guild_count()), true)
+                    .field("🧠 Memory", format!("`{} MB`", rss_mb()), true)
                     .field(
-                        "Saving",
-                        match crate::common::db::write_failures() {
-                            0 => "working".to_string(),
-                            n => format!("⚠️ {n} failed write{}", if n == 1 { "" } else { "s" }),
+                        "🔒 In lockdown",
+                        match locked_count() {
+                            0 => "`none`".to_string(),
+                            n => format!("**{n}** guild{}", plural(n)),
                         },
                         true,
                     )
-                    .footer(CreateEmbedFooter::new("Use /nuketest to check my permissions in this server."))
+                    .field(
+                        "💾 Saving",
+                        match crate::common::db::write_failures() {
+                            0 => "🟢 working".to_string(),
+                            n => format!("🔴 {n} failed write{}", if n == 1 { "" } else { "s" }),
+                        },
+                        true,
+                    )
+                    .field("🦀 Build", concat!("`v", env!("CARGO_PKG_VERSION"), " · Rust`"), true)
+                    .footer(theme::footer("Status • /nuketest checks my permissions here"))
                     .timestamp(Timestamp::now()),
                 true,
             )
@@ -1210,7 +1270,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 _ => {
                     let e = CreateEmbed::new()
                         .color(if off { colors::WARN } else { colors::SUCCESS })
-                        .title("Anti-Raid")
+                        .title("🚪  ANTI-RAID")
                         .description(if off {
                             "**Off** for this server. Joins aren't being counted, so nothing will trigger a lockdown."
                         } else {
@@ -1801,36 +1861,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
         // ── /help ──────────────────────────────────────────────
         "help" => {
             let window_hours = CONFIG.mod_window_ms / 3_600_000;
-            let e = CreateEmbed::new()
-                .color(colors::INFO)
-                .title("🛡️ Guardian Bot - Commands")
-                .field("🔇 /mute", "`@user [minutes] [reason]` - Mute (roles stashed & restored on unmute)", false)
-                .field("🔊 /unmute", "`@user` - Unmute & restore stashed roles", false)
-                .field("👢 /kick", "`@user [reason]` - Kick a member", false)
-                .field("🔨 /ban", "`@user [reason] [delete_days]` - Ban a member", false)
-                .field("♻️ /unban", "`user_id [reason]` - Unban by ID", false)
-                .field("🗑️ /purge", "`count [user]` - Bulk-delete messages", false)
-                .field("🔒 /lockdown", "`lock|unlock [channel]` - Lock or unlock a channel", false)
-                .field("🚨 /panic", "Emergency lock **all** text channels *(owner only)*", false)
-                .field("⚠️ /warn", "`@user [reason]` - Warn (auto-escalates to mute/kick/ban)", false)
-                .field("📋 /warnings", "`@user` - View a member's warnings", false)
-                .field("🧹 /clearwarns", "`@user` - Clear a member's warnings", false)
-                .field("📡 /antiping", "Configure ping protection - `status`, `toggle`, `action`, `protect`, etc. *(bot owner only)*", false)
-                .field("📊 /limits", "Check your remaining mod action limits today", false)
-                .field("⚙️ /config", "View configuration *(bot owner only)*", false)
-                .field("🔧 /setup", "`quick` auto-provisions a mute role + log channels in one step; `logs` creates a 🗃️│ channel for every ProBot-style log type; `view`/`roles`/`channels`/`whitelist`/`failsafe` configure individual fields *(bot/server owner only)*", false)
-                .field("🎫 /tickets", "`addtype`/`removetype`/`listtypes`/`support`/`typecategory`/`category`/`panel` - ticket types, each with its own support roles, category and panel *(bot/server owner only)*", false)
-                .field("📝 /applications", "`open`/`close` (accepts a key or `all`), `list`/`panel`/`setreview`/`setpanelchannel`/`addrole`/`removerole`/`setquestions` - configure the application system *(bot/server owner only)*", false)
-                .field("👮 /police", "`manual setup [channel]` - post the officer guide & procedures manual *(bot/server owner only)*", false)
-                .field("📋 /chainofcommand", "`setroles`/`setgroup`/`removegroup`/`setup [channel]`/`refresh`/`view`/`list` - auto-updating role hierarchy boards, each keyed by `key` (defaults to `default`) *(bot/server owner only)*", false)
-                .field("🧪 /nuketest", "Confirm anti-nuke + check my permissions *(owner only)*", false)
-                .field("📈 /status", "Bot health: uptime, latency, guild count, memory *(owner only)*", false)
-                .field("🌐 /servers", "DM me an invite to every server I'm in *(owner only)*", false)
-                .field("🛡️ /antiraid", "`status`/`disable`/`enable` - turn the raid protection on or off for this server *(bot/server owner only)*", false)
-                .field("⏱️ Rate Limits", format!("Mod actions are capped over a rolling **{window_hours}h**. `/limits` shows where you are."), false)
-                .footer(CreateEmbedFooter::new("Guardian Bot v3 • Security Suite"))
-                .timestamp(Timestamp::now());
-            reply_embed(ctx, i, e, true).await;
+            let avatar = { Some(ctx.cache.current_user().face()) };
+            reply_embeds(ctx, i, theme::help_cards(window_hours, avatar), true).await;
         }
 
         _ => {}
