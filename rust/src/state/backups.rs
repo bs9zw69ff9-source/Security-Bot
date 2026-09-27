@@ -21,6 +21,7 @@ const INTERVAL_TABLE: &str = "backup_intervals";
 /// Per-user cap on manual backups. Also keeps `/backup list` and the
 /// autocomplete inside Discord's 25 entries.
 pub const MAX_PER_USER: usize = 25;
+pub const MESSAGES_PER_CHANNEL: usize = 250;
 pub const INTERVAL_HOURS: (i64, i64) = (6, 168);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -73,6 +74,28 @@ pub struct BChannel {
     pub bitrate: Option<u32>,
     pub user_limit: Option<u32>,
     pub overwrites: Vec<BOverwrite>,
+    /// Oldest first.
+    #[serde(default)]
+    pub messages: Vec<BMessage>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BMessage {
+    pub author: String,
+    pub avatar: String,
+    pub content: String,
+    pub embeds: Vec<serenity::model::channel::Embed>,
+    pub attachments: Vec<BAttachment>,
+    pub at: i64,
+    pub pinned: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BAttachment {
+    pub name: String,
+    pub url: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -106,6 +129,8 @@ pub struct Counts {
     pub emojis: usize,
     pub bans: usize,
     pub members: usize,
+    #[serde(default)]
+    pub messages: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -360,6 +385,7 @@ mod tests {
                 bitrate: None,
                 user_limit: None,
                 overwrites: vec![],
+                messages: vec![],
             }],
             emojis: vec![],
             bans: vec![],

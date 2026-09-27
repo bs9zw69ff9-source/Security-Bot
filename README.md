@@ -212,7 +212,14 @@ bot owners get no exception.
 - `/backup interval enabled:true hours:24` backs the server up on a
   schedule (every 6 to 168 hours). Each one replaces the last, and the
   schedule stops if the server changes owner.
-- Messages aren't backed up.
+- Backups also keep the last 250 messages in each text channel.
+  `messages:true` on a load replays them through a temporary webhook, under
+  each author's name and avatar and with the original date underneath. They
+  only go into channels the load creates, since a kept channel still has its
+  history. Nobody is pinged, pins are re-pinned, and reactions and threads
+  aren't restored. Attachments come back as links, which Discord expires
+  after about a day. A webhook posts about 5 messages every 2 seconds, so a
+  big server takes a while.
 
 ## Security systems
 

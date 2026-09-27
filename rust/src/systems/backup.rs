@@ -8,13 +8,13 @@
 use once_cell::sync::Lazy;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel, CreateEmbed,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateInvite, CreateMessage, EditChannel, EditGuild, EditInteractionResponse,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateAllowedMentions, CreateInvite, CreateMessage, CreateWebhook, ExecuteWebhook, GetMessages, EditChannel, EditGuild, EditInteractionResponse,
     EditMember, EditRole,
 };
 use serenity::client::Context;
 use serenity::collector::ComponentInteractionCollector;
 use serenity::model::application::{ButtonStyle, CommandInteraction, ResolvedOption, ResolvedValue};
-use serenity::model::channel::{PermissionOverwrite, PermissionOverwriteType};
+use serenity::model::channel::{MessageType, PermissionOverwrite, PermissionOverwriteType};
 use serenity::model::guild::{AfkTimeout, DefaultMessageNotificationLevel, ExplicitContentFilter, VerificationLevel};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use serenity::model::Permissions;
@@ -52,6 +52,73 @@ fn overwrites_of(ows: &[PermissionOverwrite]) -> Vec<BOverwrite> {
             Some(BOverwrite { id, kind, allow: o.allow.bits().to_string(), deny: o.deny.bits().to_string() })
         })
         .collect()
+}
+
+/// The last `MESSAGES_PER_CHANNEL` user messages in a channel, oldest first.
+async fn recent_messages(ctx: &Context, channel: ChannelId) -> serenity::Result<Vec<BMessage>> {
+    let mut out = Vec::new();
+    let mut before = None;
+    while out.len() < MESSAGES_PER_CHANNEL {
+        let mut req = GetMessages::new().limit(100);
+        if let Some(b) = before {
+            req = req.before(b);
+        }
+        let page = channel.messages(&ctx.http, req).await?;
+        let last_page = page.len() < 100;
+        before = page.last().map(|m| m.id);
+        for m in page {
+            if !matches!(m.kind, MessageType::Regular | MessageType::InlineReply) {
+                continue;
+            }
+            let embeds: Vec<_> = m.embeds.into_iter().filter(|e| e.kind.as_deref() == Some("rich")).collect();
+            if m.content.is_empty() && embeds.is_empty() && m.attachments.is_empty() {
+                continue;
+            }
+            out.push(BMessage {
+                author: m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone()),
+                avatar: m.author.face(),
+                content: m.content,
+                embeds,
+                attachments: m.attachments.into_iter().map(|a| BAttachment { name: a.filename, url: a.url }).collect(),
+                at: m.timestamp.unix_timestamp(),
+                pinned: m.pinned,
+            });
+            if out.len() == MESSAGES_PER_CHANNEL {
+                break;
+            }
+        }
+        if last_page {
+            break;
+        }
+    }
+    out.reverse();
+    Ok(out)
+}
+
+/// Webhook names can't contain "discord" or "clyde" and must be 1-80 chars.
+fn webhook_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let clean = if lower.contains("discord") || lower.contains("clyde") || name.trim().is_empty() {
+        "Former member".to_string()
+    } else {
+        name.trim().to_string()
+    };
+    clean.chars().take(80).collect()
+}
+
+/// Message text as it's replayed: the original, its attachments as links
+/// (the files themselves aren't kept), and the original date underneath.
+fn replay_text(m: &BMessage) -> String {
+    let stamp = format!("\n-# <t:{}:f>", m.at);
+    let mut body = m.content.clone();
+    for a in &m.attachments {
+        body.push_str(&format!("\n📎 [{}]({})", a.name, a.url));
+    }
+    let room = 2000 - stamp.chars().count();
+    if body.chars().count() > room {
+        body = body.chars().take(room - 1).collect::<String>() + "…";
+    }
+    body + &stamp
 }
 
 /// Read a server into a backup. Channels are required; bans and role
@@ -111,9 +178,21 @@ pub async fn capture(ctx: &Context, guild_id: GuildId, owner: UserId, interval: 
             bitrate: c.bitrate,
             user_limit: c.user_limit,
             overwrites: overwrites_of(&c.permission_overwrites),
+            messages: Vec::new(),
         })
         .collect();
     chans.sort_by_key(|c| c.position);
+
+    let mut unreadable = 0;
+    for c in chans.iter_mut().filter(|c| matches!(c.kind, 0 | 5)) {
+        match recent_messages(ctx, ChannelId::new(id_of(&c.id).unwrap_or(1))).await {
+            Ok(m) => c.messages = m,
+            Err(_) => unreadable += 1,
+        }
+    }
+    if unreadable > 0 {
+        warnings.push(format!("Messages weren't saved from {unreadable} channel(s) I can't read."));
+    }
 
     let mut bans = Vec::new();
     let mut after = None;
@@ -158,6 +237,7 @@ pub async fn capture(ctx: &Context, guild_id: GuildId, owner: UserId, interval: 
         emojis: emojis.len(),
         bans: bans.len(),
         members: members.len(),
+        messages: chans.iter().map(|c| c.messages.len()).sum(),
     };
     let backup = Backup {
         id: new_id(),
@@ -190,6 +270,7 @@ pub struct LoadOptions {
     pub bans: bool,
     pub members: bool,
     pub dm_invite: bool,
+    pub messages: bool,
 }
 
 #[derive(Default)]
@@ -325,6 +406,7 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     };
 
     // Channels.
+    let mut created_channels: HashSet<ChannelId> = HashSet::new();
     let mut chan_map: HashMap<String, ChannelId> =
         plan.reuse_channels.iter().map(|(k, v)| (k.clone(), ChannelId::new(*v))).collect();
     let mut t = Tally::default();
@@ -396,6 +478,7 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
                     match gid.create_channel(&ctx.http, e.audit_log_reason(&reason)).await {
                         Ok(ch) => {
                             t.created += 1;
+                            created_channels.insert(ch.id);
                             chan_map.insert(c.id.clone(), ch.id);
                         }
                         Err(_) => t.failed += 1,
@@ -485,6 +568,57 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
             }
         }
         l.lines.push(format!("✅ **Bans:** {done} restored{}", if failed > 0 { format!(", **{failed} failed**") } else { String::new() }));
+    }
+
+    if o.messages {
+        // Only into channels this load created: a channel that was matched and
+        // kept still has its own history, and replaying into it would double it.
+        let targets: Vec<(&BChannel, ChannelId)> = b
+            .channels
+            .iter()
+            .filter(|c| !c.messages.is_empty())
+            .filter_map(|c| chan_map.get(&c.id).filter(|id| created_channels.contains(id)).map(|id| (c, *id)))
+            .collect();
+        let (mut sent, mut failed) = (0usize, 0usize);
+        for (n, (c, channel)) in targets.iter().enumerate() {
+            l.progress(&format!("Restoring messages in #{} ({}/{})", c.name, n + 1, targets.len())).await;
+            let hook = match channel.create_webhook(&ctx.http, CreateWebhook::new("Backup restore")).await {
+                Ok(h) => h,
+                Err(_) => {
+                    failed += c.messages.len();
+                    continue;
+                }
+            };
+            for m in &c.messages {
+                if l.cancelled() {
+                    let _ = hook.delete(&ctx.http).await;
+                    return;
+                }
+                let mut exec = ExecuteWebhook::new()
+                    .username(webhook_name(&m.author))
+                    .avatar_url(m.avatar.clone())
+                    .content(replay_text(m))
+                    .allowed_mentions(CreateAllowedMentions::new());
+                if !m.embeds.is_empty() {
+                    exec = exec.embeds(m.embeds.iter().take(10).cloned().map(CreateEmbed::from).collect());
+                }
+                match hook.execute(&ctx.http, m.pinned, exec).await {
+                    Ok(posted) => {
+                        sent += 1;
+                        if let Some(msg) = posted {
+                            let _ = channel.pin(&ctx.http, msg.id).await;
+                        }
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+            let _ = hook.delete(&ctx.http).await;
+        }
+        l.lines.push(format!(
+            "✅ **Messages:** {sent} replayed into {} new channel(s){}",
+            targets.len(),
+            if failed > 0 { format!(", **{failed} failed**") } else { String::new() }
+        ));
     }
 
     if (!o.members && !o.dm_invite) || b.members.is_empty() {
@@ -599,6 +733,9 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     if o.dm_invite {
         need |= Permissions::CREATE_INSTANT_INVITE;
     }
+    if o.messages {
+        need |= Permissions::MANAGE_WEBHOOKS;
+    }
     if !my_perms.administrator() && !my_perms.contains(need) {
         let missing = need - my_perms;
         return respond(ctx, i, Tone::Error, None, &format!("I'm missing permissions for this load: `{missing}`.")).await;
@@ -653,6 +790,12 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     }
     if o.members {
         what.push(format!("• Give **{}** members their saved roles and nicknames", b.members.len()));
+    }
+    if o.messages {
+        what.push(format!(
+            "• Replay **{}** saved messages into the channels this load creates",
+            b.counts.messages
+        ));
     }
     if o.dm_invite {
         what.push("• **DM an invite** to every saved member who isn't in this server (one a second)".to_string());
@@ -781,8 +924,8 @@ fn ago(ms: i64) -> String {
 
 fn contents(c: &Counts) -> String {
     format!(
-        "{} roles · {} channels · {} emojis · {} bans · {} members",
-        c.roles, c.channels, c.emojis, c.bans, c.members
+        "{} roles · {} channels · {} emojis · {} bans · {} members · {} messages",
+        c.roles, c.channels, c.emojis, c.bans, c.members, c.messages
     )
 }
 
@@ -856,6 +999,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
                 bans: bool_opt("bans", false),
                 members: bool_opt("members", false),
                 dm_invite: bool_opt("dm_invite", false),
+                messages: bool_opt("messages", false),
             };
             load(ctx, i, info, b, o).await;
         }
@@ -983,4 +1127,30 @@ pub async fn autocomplete(ctx: &Context, i: &CommandInteraction) {
         resp = resp.add_string_choice(label, m.id);
     }
     let _ = i.create_response(&ctx.http, CreateInteractionResponse::Autocomplete(resp)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(content: &str) -> BMessage {
+        BMessage { author: "a".into(), avatar: String::new(), content: content.into(), embeds: vec![], attachments: vec![], at: 1_700_000_000, pinned: false }
+    }
+
+    #[test]
+    fn replayed_text_keeps_the_date_and_fits_discord() {
+        let short = replay_text(&msg("hello"));
+        assert_eq!(short, "hello\n-# <t:1700000000:f>");
+        let long = replay_text(&msg(&"x".repeat(5000)));
+        assert!(long.chars().count() <= 2000);
+        assert!(long.ends_with("<t:1700000000:f>"));
+    }
+
+    #[test]
+    fn webhook_names_follow_discords_rules() {
+        assert_eq!(webhook_name("Alice"), "Alice");
+        assert_eq!(webhook_name("DiscordMod"), "Former member");
+        assert_eq!(webhook_name("  "), "Former member");
+        assert_eq!(webhook_name(&"n".repeat(100)).len(), 80);
+    }
 }
