@@ -187,8 +187,8 @@ invocation of a hidden owner command is written to the local
 
 ### Backups
 
-`/backup` works like Xenon's backups. Only the server's owner can use it,
-bot owners included.
+`/backup` works like Xenon's backups. Only the server's owner can use it;
+bot owners get no exception.
 
 - `/backup create` saves the server's name, icon and settings, its roles,
   channels with their permission overwrites, emojis, bans, and each member's
