@@ -8,7 +8,7 @@
 use once_cell::sync::Lazy;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel, CreateEmbed,
-    CreateInteractionResponse, CreateInteractionResponseMessage, EditChannel, EditGuild, EditInteractionResponse,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateInvite, CreateMessage, EditChannel, EditGuild, EditInteractionResponse,
     EditMember, EditRole,
 };
 use serenity::client::Context;
@@ -145,7 +145,6 @@ pub async fn capture(ctx: &Context, guild_id: GuildId, owner: UserId, interval: 
                 nick: m.nick,
                 roles: m.roles.iter().map(|r| r.to_string()).filter(|r| role_ids.contains(r)).collect(),
             })
-            .filter(|m| m.nick.is_some() || !m.roles.is_empty())
             .collect(),
         Err(e) => {
             warnings.push(format!("Role assignments weren't saved: {e}"));
@@ -190,6 +189,7 @@ pub struct LoadOptions {
     pub emojis: bool,
     pub bans: bool,
     pub members: bool,
+    pub dm_invite: bool,
 }
 
 #[derive(Default)]
@@ -487,15 +487,20 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
         l.lines.push(format!("✅ **Bans:** {done} restored{}", if failed > 0 { format!(", **{failed} failed**") } else { String::new() }));
     }
 
-    if o.members && !b.members.is_empty() {
+    if (!o.members && !o.dm_invite) || b.members.is_empty() {
+        return;
+    }
+    l.progress("Reading the member list").await;
+    let live = match all_members(ctx, gid).await {
+        Ok(m) => m,
+        Err(e) => {
+            l.lines.push(format!("⚠️ **Members:** skipped, I couldn't read the member list: {e}"));
+            return;
+        }
+    };
+
+    if o.members {
         l.progress("Restoring members' roles and nicknames").await;
-        let live = match all_members(ctx, gid).await {
-            Ok(m) => m,
-            Err(e) => {
-                l.lines.push(format!("⚠️ **Members:** skipped, I couldn't read the member list: {e}"));
-                return;
-            }
-        };
         let owner = ctx.cache.guild(gid).map(|g| g.owner_id);
         let wanted: HashMap<&str, &BMember> = b.members.iter().map(|m| (m.user_id.as_str(), m)).collect();
         let (mut updated, mut failed) = (0, 0);
@@ -526,6 +531,52 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
             if failed > 0 { format!(", **{failed} failed**") } else { String::new() }
         ));
     }
+
+    if o.dm_invite {
+        let here: HashSet<UserId> = live.iter().map(|m| m.user.id).collect();
+        let banned: HashSet<&str> = b.bans.iter().map(|b| b.user_id.as_str()).collect();
+        let missing: Vec<UserId> = b
+            .members
+            .iter()
+            .filter(|m| !banned.contains(m.user_id.as_str()))
+            .filter_map(|m| id_of(&m.user_id).map(UserId::new))
+            .filter(|u| !here.contains(u))
+            .collect();
+        if missing.is_empty() {
+            l.lines.push("✅ **Invites:** everyone in the backup is already here".to_string());
+            return;
+        }
+        let invite = match l.i.channel_id.create_invite(&ctx.http, CreateInvite::new().max_age(7 * 86_400).max_uses(0).unique(true)).await {
+            Ok(inv) => inv.url(),
+            Err(e) => {
+                l.lines.push(format!("⚠️ **Invites:** not sent, I couldn't make an invite: {e}"));
+                return;
+            }
+        };
+        let server = ctx.cache.guild(gid).map(|g| g.name.to_string()).unwrap_or_default();
+        let card = theme::card(
+            Tone::Info,
+            Some("You're invited back"),
+            format!("**{}** has been restored as **{server}**. You were a member, so here's an invite (valid for 7 days):\n{invite}", b.guild_name),
+        );
+        l.progress(&format!("DMing {} members an invite (about {} min)", missing.len(), missing.len().div_ceil(60))).await;
+        let (mut sent, mut failed) = (0, 0);
+        for user in missing {
+            if l.cancelled() {
+                return;
+            }
+            match user.direct_message(&ctx.http, CreateMessage::new().embed(card.clone())).await {
+                Ok(_) => sent += 1,
+                Err(_) => failed += 1,
+            }
+            // Slow on purpose: a burst of DMs is what gets a bot flagged as spam.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        l.lines.push(format!(
+            "✅ **Invites:** DMed {sent} members an invite{}",
+            if failed > 0 { format!(", **{failed} couldn't be reached** (DMs closed or no shared server)") } else { String::new() }
+        ));
+    }
 }
 
 async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup, o: LoadOptions) {
@@ -544,6 +595,9 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     }
     if o.emojis {
         need |= Permissions::MANAGE_GUILD_EXPRESSIONS;
+    }
+    if o.dm_invite {
+        need |= Permissions::CREATE_INSTANT_INVITE;
     }
     if !my_perms.administrator() && !my_perms.contains(need) {
         let missing = need - my_perms;
@@ -599,6 +653,9 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     }
     if o.members {
         what.push(format!("• Give **{}** members their saved roles and nicknames", b.members.len()));
+    }
+    if o.dm_invite {
+        what.push("• **DM an invite** to every saved member who isn't in this server (one a second)".to_string());
     }
     let body = format!(
         "Loading **{}** (`{}`) from <t:{}:f> into **{}**. This will:\n{}\n\nThis can't be undone. Take a `/backup create` first if you might want this server back.",
@@ -798,6 +855,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
                 emojis: bool_opt("emojis", true),
                 bans: bool_opt("bans", false),
                 members: bool_opt("members", false),
+                dm_invite: bool_opt("dm_invite", false),
             };
             load(ctx, i, info, b, o).await;
         }

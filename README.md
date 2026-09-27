@@ -202,7 +202,10 @@ bot owners get no exception.
   off.
 - Each part is its own option: `settings`, `roles`, `channels`,
   `delete_roles`, `delete_channels` and `emojis` default on; `bans` and
-  `members` default off.
+  `members` default off. `dm_invite:true` also DMs every saved member who
+  isn't in the server a 7-day invite, one a second; it never runs unless you
+  set it to `true`. It only reaches people who still share a server with the
+  bot and have DMs open.
 - `/backup cancel` stops a load after the current step.
 - `/backup list`, `info` and `delete` manage your backups. You can keep up
   to 25 manual backups.
