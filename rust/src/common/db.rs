@@ -32,7 +32,20 @@ pub const TABLES: &[&str] = &[
 /// Where the database lives, so it can be named in an error rather than left
 /// for the reader to guess.
 pub fn db_path() -> std::path::PathBuf {
-    std::env::var("GUARDIAN_DB_FILE").map(std::path::PathBuf::from).unwrap_or_else(|_| root_file("guardian.db"))
+    resolve_db_path(std::env::var("GUARDIAN_DB_FILE").ok())
+}
+
+/// An unset *or blank* `GUARDIAN_DB_FILE` means the default file.
+///
+/// `.env.example` ships `GUARDIAN_DB_FILE=` with nothing after it, and SQLite
+/// reads an empty path as "a private temporary database, deleted when the
+/// connection closes". Passing that through meant every setting lived only
+/// until the next restart, with no error anywhere.
+fn resolve_db_path(var: Option<String>) -> std::path::PathBuf {
+    match var.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        Some(v) => std::path::PathBuf::from(v),
+        None => root_file("guardian.db"),
+    }
 }
 
 static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
@@ -289,4 +302,18 @@ fn iso_now() -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blank_db_path_falls_back_to_the_default_file() {
+        let default = root_file("guardian.db");
+        assert_eq!(resolve_db_path(None), default);
+        assert_eq!(resolve_db_path(Some(String::new())), default);
+        assert_eq!(resolve_db_path(Some("  ".into())), default);
+        assert_eq!(resolve_db_path(Some("/data/g.db".into())), std::path::PathBuf::from("/data/g.db"));
+    }
 }
