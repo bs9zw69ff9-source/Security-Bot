@@ -186,6 +186,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
     let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else {
         return reply_text(ctx, i, "I couldn't look up your membership in this server just now. Please try again.").await;
     };
+    if i.data.name == "backup" {
+        return crate::systems::backup::handle(ctx, i, &info).await;
+    }
     let (group, subcmd, opts) = dissect(i.data.options());
     let gid = guild_id.to_string();
     let nuke = guild_settings::nuke(&gid);

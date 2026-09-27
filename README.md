@@ -183,6 +183,33 @@ invocation of a hidden owner command is written to the local
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
 | 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/chainofcommand` `/config` `/status` `/antiping` `/nuketest` |
+| 👑 Server owner only | `/backup` |
+
+### Backups
+
+`/backup` works like Xenon's backups. Only the server's owner can use it,
+bot owners included.
+
+- `/backup create` saves the server's name, icon and settings, its roles,
+  channels with their permission overwrites, emojis, bans, and each member's
+  roles and nickname. It replies with an ID.
+- The backup belongs to you, not the server. `/backup load id:<id>` restores
+  it into any server you own, so it also clones servers.
+- A load asks you to confirm first and shows what it's about to delete.
+  Roles and channels whose names match the backup are edited in place, so
+  members keep their roles and channels keep their messages. Everything else
+  is created, and anything not in the backup is deleted unless you turn that
+  off.
+- Each part is its own option: `settings`, `roles`, `channels`,
+  `delete_roles`, `delete_channels` and `emojis` default on; `bans` and
+  `members` default off.
+- `/backup cancel` stops a load after the current step.
+- `/backup list`, `info` and `delete` manage your backups. You can keep up
+  to 25 manual backups.
+- `/backup interval enabled:true hours:24` backs the server up on a
+  schedule (every 6 to 168 hours). Each one replaces the last, and the
+  schedule stops if the server changes owner.
+- Messages aren't backed up.
 
 ## Security systems
 
@@ -459,7 +486,7 @@ never overwrite a later manual change.
 ## Data
 
 Runtime state (guild settings, anti-ping config, warnings, muted-role
-stashes, snapshots, failsafe backups, ticket config, open-ticket tracking,
+stashes, snapshots, failsafe backups, `/backup` backups and schedules, ticket config, open-ticket tracking,
 application config) lives in `guardian.db`, a SQLite database (via
 `rusqlite`, WAL mode) created automatically on first boot. Legacy
 JSON files (`antiping.json`, `mutedroles.json`, `warnings.json`, etc.) are

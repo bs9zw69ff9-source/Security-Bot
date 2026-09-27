@@ -27,6 +27,8 @@ pub const TABLES: &[&str] = &[
     "ticket_channels",
     "applications",
     "chain_of_command",
+    "backups",
+    "backup_intervals",
 ];
 
 /// Where the database lives, so it can be named in an error rather than left
@@ -159,6 +161,24 @@ pub fn load_all<T: DeserializeOwned>(table: &str) -> HashMap<String, T> {
         }
     }
     out
+}
+
+/// One row, for tables too large to keep in memory.
+pub fn get<T: DeserializeOwned>(table: &str, guild_id: &str) -> Option<T> {
+    let conn = match DB.lock() {
+        Ok(c) => c,
+        Err(e) => e.into_inner(),
+    };
+    let sql = format!("SELECT data FROM {table} WHERE guild_id = ?1");
+    let json: String = match conn.query_row(&sql, rusqlite::params![guild_id], |r| r.get(0)) {
+        Ok(j) => j,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return None,
+        Err(e) => {
+            eprintln!("⚠️ db read {table}/{guild_id} failed: {e}");
+            return None;
+        }
+    };
+    serde_json::from_str(&json).map_err(|e| eprintln!("⚠️ {table}/{guild_id} doesn't parse: {e}")).ok()
 }
 
 /// How many writes have failed since the process started.

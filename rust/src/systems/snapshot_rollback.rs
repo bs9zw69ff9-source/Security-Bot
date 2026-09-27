@@ -85,7 +85,7 @@ pub fn list_snapshots(guild_id: &str) -> Vec<(i64, usize, usize)> {
         .unwrap_or_default()
 }
 
-fn channel_kind_num(kind: ChannelType) -> u8 {
+pub fn channel_kind_num(kind: ChannelType) -> u8 {
     match kind {
         ChannelType::Text => 0,
         ChannelType::Private => 1,
@@ -99,7 +99,7 @@ fn channel_kind_num(kind: ChannelType) -> u8 {
     }
 }
 
-fn kind_from_num(n: u8) -> ChannelType {
+pub fn kind_from_num(n: u8) -> ChannelType {
     match n {
         2 => ChannelType::Voice,
         4 => ChannelType::Category,

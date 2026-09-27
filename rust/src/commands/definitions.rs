@@ -35,6 +35,10 @@ fn tunable_sub(name: &str, desc: &str, module: Module) -> CreateCommandOption {
         .add_sub_option(opt(CommandOptionType::Integer, "value", "New value (0/1 for off/on). Leave out to see the current values"))
 }
 
+fn backup_id() -> CreateCommandOption {
+    req(CommandOptionType::String, "id", "Backup ID (see /backup list)").set_autocomplete(true)
+}
+
 /// Mark a command as usable in servers only.
 ///
 /// Every command in here needs a guild: the handler's first act is to read
@@ -299,6 +303,28 @@ pub fn all() -> Vec<CreateCommand> {
                 .add_sub_option(opt(CommandOptionType::String, "key", "Board id (defaults to 'default')")))
             .add_option(sub("list", "List every board configured for this server")),
 
+        CreateCommand::new("backup")
+            .description("Back up this server, or load a backup into it (server owner only)")
+            .add_option(sub("create", "Save this server's settings, roles, channels, emojis, bans and role assignments"))
+            .add_option(sub("load", "Load one of your backups into this server")
+                .add_sub_option(backup_id())
+                .add_sub_option(opt(CommandOptionType::Boolean, "settings", "Name, icon, verification, AFK and system channel (default on)"))
+                .add_sub_option(opt(CommandOptionType::Boolean, "roles", "Restore roles (default on)"))
+                .add_sub_option(opt(CommandOptionType::Boolean, "channels", "Restore channels and their permissions (default on)"))
+                .add_sub_option(opt(CommandOptionType::Boolean, "delete_roles", "Delete roles that aren't in the backup (default on)"))
+                .add_sub_option(opt(CommandOptionType::Boolean, "delete_channels", "Delete channels that aren't in the backup (default on)"))
+                .add_sub_option(opt(CommandOptionType::Boolean, "emojis", "Add missing emojis (default on)"))
+                .add_sub_option(opt(CommandOptionType::Boolean, "bans", "Re-apply saved bans (default off)"))
+                .add_sub_option(opt(CommandOptionType::Boolean, "members", "Give members their saved roles and nicknames (default off)")))
+            .add_option(sub("list", "Your backups"))
+            .add_option(sub("info", "What's in a backup").add_sub_option(backup_id()))
+            .add_option(sub("delete", "Delete one of your backups").add_sub_option(backup_id()))
+            .add_option(sub("interval", "Back this server up automatically")
+                .add_sub_option(opt(CommandOptionType::Boolean, "enabled", "On or off. Leave out to see the current schedule"))
+                .add_sub_option(opt(CommandOptionType::Integer, "hours", "Hours between backups (6-168, default 24)")
+                    .min_int_value(6)
+                    .max_int_value(168)))
+            .add_option(sub("cancel", "Stop a backup that's loading here")),
         CreateCommand::new("help").description("Show all Guardian Bot commands"),
     ]
     .into_iter()

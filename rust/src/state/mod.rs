@@ -1,5 +1,6 @@
 pub mod anti_ping;
 pub mod applications;
+pub mod backups;
 pub mod chain_of_command;
 pub mod guild_settings;
 pub mod lockdown;

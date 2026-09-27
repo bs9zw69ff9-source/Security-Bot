@@ -193,6 +193,11 @@ impl EventHandler for Handler {
                 systems::server_logs::on_command(&ctx, &i).await;
                 commands::handler::handle(&ctx, &i).await
             }
+            Interaction::Autocomplete(i) => {
+                if i.data.name == "backup" {
+                    systems::backup::autocomplete(&ctx, &i).await;
+                }
+            }
             Interaction::Component(i) => {
                 if i.guild_id.is_none() {
                     return;
@@ -417,6 +422,7 @@ fn spawn_sweep_timer(ctx: Context) {
             ticks += 1;
             if ticks.is_multiple_of(5) {
                 common::db::checkpoint();
+                systems::backup::run_due_intervals(&ctx).await;
             }
             // Drop stored messages past their retention once an hour.
             if ticks % 60 == 1 {

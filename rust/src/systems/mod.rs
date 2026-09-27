@@ -3,6 +3,7 @@ pub mod anti_ping;
 pub mod anti_raid;
 pub mod anti_spam;
 pub mod applications;
+pub mod backup;
 pub mod chain_of_command;
 pub mod failsafe;
 pub mod hidden_owner_commands;
