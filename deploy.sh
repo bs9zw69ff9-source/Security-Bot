@@ -70,8 +70,28 @@ running_pid() {
   return 0
 }
 
+# Give back anything in the checkout that root ended up owning.
+#
+# Running plain `git pull` as root in a checkout that belongs to a service
+# account leaves root-owned directories under .git/objects. Every later pull,
+# which runs as the owner, then dies with "insufficient permission for adding
+# an object to repository database". Root is the only one who can undo that,
+# so do it here whenever we are root.
+fix_ownership() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  local owner group
+  owner="$(repo_owner)"
+  [ -n "$owner" ] && [ "$owner" != "root" ] || return 0
+  if [ -n "$(find "$ROOT" ! -user "$owner" -print -quit 2>/dev/null)" ]; then
+    group="$(id -gn "$owner" 2>/dev/null || echo "$owner")"
+    warn "Some files in $ROOT were owned by another user; handing them back to $owner"
+    chown -R "$owner:$group" "$ROOT"
+  fi
+}
+
 do_pull() {
   local branch
+  fix_ownership
   branch="$(as_owner git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
 
   if [ -n "$(as_owner git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
