@@ -214,9 +214,10 @@ bot owners get no exception.
   schedule stops if the server changes owner.
 - Backups also keep the last 250 messages in each text channel.
   `messages:true` on a load replays them through a temporary webhook, under
-  each author's name and avatar and with the original date underneath. They
-  only go into channels the load creates, since a kept channel still has its
-  history. Nobody is pinged, pins are re-pinned, and reactions and threads
+  each author's name and avatar and with the original date underneath. Into
+  a channel that already exists, only the messages that are missing are
+  posted (checked against its last 1000), so loading twice doesn't double
+  anything; restored ones land after the newer chat. Nobody is pinged, pins are re-pinned, and reactions and threads
   aren't restored. Attachments come back as links, which Discord expires
   after about a day. A webhook posts about 5 messages every 2 seconds, so a
   big server takes a while.

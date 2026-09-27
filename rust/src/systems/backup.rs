@@ -54,11 +54,11 @@ fn overwrites_of(ows: &[PermissionOverwrite]) -> Vec<BOverwrite> {
         .collect()
 }
 
-/// The last `MESSAGES_PER_CHANNEL` user messages in a channel, oldest first.
-async fn recent_messages(ctx: &Context, channel: ChannelId) -> serenity::Result<Vec<BMessage>> {
+/// The last `limit` user messages in a channel, oldest first.
+async fn recent_messages(ctx: &Context, channel: ChannelId, limit: usize) -> serenity::Result<Vec<BMessage>> {
     let mut out = Vec::new();
     let mut before = None;
-    while out.len() < MESSAGES_PER_CHANNEL {
+    while out.len() < limit {
         let mut req = GetMessages::new().limit(100);
         if let Some(b) = before {
             req = req.before(b);
@@ -83,7 +83,7 @@ async fn recent_messages(ctx: &Context, channel: ChannelId) -> serenity::Result<
                 at: m.timestamp.unix_timestamp(),
                 pinned: m.pinned,
             });
-            if out.len() == MESSAGES_PER_CHANNEL {
+            if out.len() == limit {
                 break;
             }
         }
@@ -110,16 +110,38 @@ fn webhook_name(name: &str) -> String {
 /// (the files themselves aren't kept), and the original date underneath.
 fn replay_text(m: &BMessage) -> String {
     let stamp = format!("\n-# <t:{}:f>", m.at);
-    let mut body = m.content.clone();
-    for a in &m.attachments {
-        body.push_str(&format!("\n📎 [{}]({})", a.name, a.url));
-    }
+    let mut body = replay_body(m);
     let room = 2000 - stamp.chars().count();
     if body.chars().count() > room {
         body = body.chars().take(room - 1).collect::<String>() + "…";
     }
     body + &stamp
 }
+
+fn replay_body(m: &BMessage) -> String {
+    let mut body = m.content.clone();
+    for a in &m.attachments {
+        body.push_str(&format!("\n📎 [{}]({})", a.name, a.url));
+    }
+    body
+}
+
+/// What identifies a message across a replay: its original second and the
+/// start of its text. A replayed copy carries the original second in its
+/// date line, so an original and its copy get the same key.
+fn message_key(m: &BMessage) -> (i64, String) {
+    let replayed = m.content.rfind("\n-# <t:").and_then(|at| {
+        let stamp = &m.content[at + "\n-# <t:".len()..];
+        let secs = stamp.split(':').next()?.parse::<i64>().ok()?;
+        Some((secs, m.content[..at].to_string()))
+    });
+    let (secs, body) = replayed.unwrap_or_else(|| (m.at, replay_body(m)));
+    (secs, body.chars().take(30).collect())
+}
+
+/// How far back to look for messages that are already there. Wider than
+/// what's saved, so chat since the backup doesn't hide the originals.
+const DEDUPE_DEPTH: usize = 1000;
 
 /// Read a server into a backup. Channels are required; bans and role
 /// assignments are best-effort and reported as warnings when they can't be read.
@@ -185,7 +207,7 @@ pub async fn capture(ctx: &Context, guild_id: GuildId, owner: UserId, interval: 
 
     let mut unreadable = 0;
     for c in chans.iter_mut().filter(|c| matches!(c.kind, 0 | 5)) {
-        match recent_messages(ctx, ChannelId::new(id_of(&c.id).unwrap_or(1))).await {
+        match recent_messages(ctx, ChannelId::new(id_of(&c.id).unwrap_or(1)), MESSAGES_PER_CHANNEL).await {
             Ok(m) => c.messages = m,
             Err(_) => unreadable += 1,
         }
@@ -571,17 +593,34 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     }
 
     if o.messages {
-        // Only into channels this load created: a channel that was matched and
-        // kept still has its own history, and replaying into it would double it.
         let targets: Vec<(&BChannel, ChannelId)> = b
             .channels
             .iter()
             .filter(|c| !c.messages.is_empty())
-            .filter_map(|c| chan_map.get(&c.id).filter(|id| created_channels.contains(id)).map(|id| (c, *id)))
+            .filter_map(|c| chan_map.get(&c.id).map(|id| (c, *id)))
             .collect();
-        let (mut sent, mut failed) = (0usize, 0usize);
+        let (mut sent, mut failed, mut kept) = (0usize, 0usize, 0usize);
         for (n, (c, channel)) in targets.iter().enumerate() {
             l.progress(&format!("Restoring messages in #{} ({}/{})", c.name, n + 1, targets.len())).await;
+            // A channel that already existed may still hold some or all of
+            // these, originals or copies from an earlier load. Only the
+            // missing ones are posted, so loading twice never doubles them.
+            let present: HashSet<(i64, String)> = if created_channels.contains(channel) {
+                HashSet::new()
+            } else {
+                match recent_messages(ctx, *channel, DEDUPE_DEPTH).await {
+                    Ok(ms) => ms.iter().map(message_key).collect(),
+                    Err(_) => {
+                        failed += c.messages.len();
+                        continue;
+                    }
+                }
+            };
+            let missing: Vec<&BMessage> = c.messages.iter().filter(|m| !present.contains(&message_key(m))).collect();
+            kept += c.messages.len() - missing.len();
+            if missing.is_empty() {
+                continue;
+            }
             let hook = match channel.create_webhook(&ctx.http, CreateWebhook::new("Backup restore")).await {
                 Ok(h) => h,
                 Err(_) => {
@@ -589,7 +628,7 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
                     continue;
                 }
             };
-            for m in &c.messages {
+            for m in missing {
                 if l.cancelled() {
                     let _ = hook.delete(&ctx.http).await;
                     return;
@@ -615,7 +654,7 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
             let _ = hook.delete(&ctx.http).await;
         }
         l.lines.push(format!(
-            "✅ **Messages:** {sent} replayed into {} new channel(s){}",
+            "✅ **Messages:** {sent} replayed across {} channel(s), {kept} skipped as already there{}",
             targets.len(),
             if failed > 0 { format!(", **{failed} failed**") } else { String::new() }
         ));
@@ -793,7 +832,7 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     }
     if o.messages {
         what.push(format!(
-            "• Replay **{}** saved messages into the channels this load creates",
+            "• Replay **{}** saved messages, skipping any that are still there",
             b.counts.messages
         ));
     }
@@ -1144,6 +1183,17 @@ mod tests {
         let long = replay_text(&msg(&"x".repeat(5000)));
         assert!(long.chars().count() <= 2000);
         assert!(long.ends_with("<t:1700000000:f>"));
+    }
+
+    #[test]
+    fn a_replayed_copy_matches_its_original() {
+        let mut original = msg("hello there");
+        original.attachments.push(BAttachment { name: "a.png".into(), url: "https://x/a.png".into() });
+        let copy = BMessage { content: replay_text(&original), at: 1_800_000_000, ..msg("") };
+        assert_eq!(message_key(&copy), message_key(&original));
+        let other = BMessage { at: original.at + 1, ..original.clone() };
+        assert_ne!(message_key(&other), message_key(&original));
+        assert_ne!(message_key(&msg("different")), message_key(&original));
     }
 
     #[test]

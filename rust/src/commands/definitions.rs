@@ -317,7 +317,7 @@ pub fn all() -> Vec<CreateCommand> {
                 .add_sub_option(opt(CommandOptionType::Boolean, "bans", "Re-apply saved bans (default off)"))
                 .add_sub_option(opt(CommandOptionType::Boolean, "members", "Give members their saved roles and nicknames (default off)"))
                 .add_sub_option(opt(CommandOptionType::Boolean, "dm_invite", "DM saved members who aren't here an invite. Only runs when set to true"))
-                .add_sub_option(opt(CommandOptionType::Boolean, "messages", "Replay saved messages into channels this load creates. Only runs when set to true")))
+                .add_sub_option(opt(CommandOptionType::Boolean, "messages", "Replay saved messages that are missing. Only runs when set to true")))
             .add_option(sub("list", "Your backups"))
             .add_option(sub("info", "What's in a backup").add_sub_option(backup_id()))
             .add_option(sub("delete", "Delete one of your backups").add_sub_option(backup_id()))
