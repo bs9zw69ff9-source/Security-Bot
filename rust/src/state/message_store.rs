@@ -88,7 +88,8 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
             deleted_at    INTEGER
         );
         CREATE INDEX IF NOT EXISTS message_store_created ON message_store (created_at);
-        CREATE INDEX IF NOT EXISTS message_store_deleted ON message_store (deleted_at);",
+        CREATE INDEX IF NOT EXISTS message_store_deleted ON message_store (deleted_at);
+        CREATE INDEX IF NOT EXISTS message_store_guild ON message_store (guild_id, message_id);",
     )
 }
 
@@ -143,29 +144,34 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
 const COLUMNS: &str =
     "message_id, guild_id, channel_id, author_id, author_tag, author_avatar, content, attachments, created_at, deleted_at";
 
-fn get_in(conn: &Connection, message_id: u64) -> Option<StoredMessage> {
+// Every lookup is scoped to the guild the event came from. Message ids are
+// globally unique, so this never changes an answer; it makes it impossible for
+// one guild's event to read back another guild's message.
+fn get_in(conn: &Connection, guild_id: u64, message_id: u64) -> Option<StoredMessage> {
     conn.query_row(
-        &format!("SELECT {COLUMNS} FROM message_store WHERE message_id = ?1"),
-        params![sql_id(message_id)],
+        &format!("SELECT {COLUMNS} FROM message_store WHERE message_id = ?1 AND guild_id = ?2"),
+        params![sql_id(message_id), sql_id(guild_id)],
         row_to_message,
     )
     .optional()
     .unwrap_or(None)
 }
 
-fn update_content_in(conn: &Connection, message_id: u64, content: &str) -> rusqlite::Result<usize> {
+fn update_content_in(conn: &Connection, guild_id: u64, message_id: u64, content: &str) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE message_store SET content = ?2 WHERE message_id = ?1",
-        params![sql_id(message_id), content],
+        "UPDATE message_store SET content = ?3 WHERE message_id = ?1 AND guild_id = ?2",
+        params![sql_id(message_id), sql_id(guild_id), content],
     )
 }
 
-fn mark_deleted_in(conn: &Connection, message_id: u64, now: i64) -> Option<StoredMessage> {
-    let _ = conn.execute(
-        "UPDATE message_store SET deleted_at = ?2 WHERE message_id = ?1 AND deleted_at IS NULL",
-        params![sql_id(message_id), now],
-    );
-    get_in(conn, message_id)
+fn mark_deleted_in(conn: &Connection, guild_id: u64, message_id: u64, now: i64) -> Option<StoredMessage> {
+    if let Err(e) = conn.execute(
+        "UPDATE message_store SET deleted_at = ?3 WHERE message_id = ?1 AND guild_id = ?2 AND deleted_at IS NULL",
+        params![sql_id(message_id), sql_id(guild_id), now],
+    ) {
+        eprintln!("⚠️ [{guild_id}] couldn't mark message {message_id} deleted: {e}");
+    }
+    get_in(conn, guild_id, message_id)
 }
 
 fn prune_in(conn: &Connection, now: i64) -> usize {
@@ -190,22 +196,24 @@ pub fn store(m: &StoredMessage) {
 }
 
 /// Look a message up.
-pub fn get(message_id: u64) -> Option<StoredMessage> {
-    db::with_conn(|conn| get_in(conn, message_id))
+pub fn get(guild_id: u64, message_id: u64) -> Option<StoredMessage> {
+    db::with_conn(|conn| get_in(conn, guild_id, message_id))
 }
 
 /// Keep the stored copy current after an edit.
-pub fn update_content(message_id: u64, content: &str) {
+pub fn update_content(guild_id: u64, message_id: u64, content: &str) {
     db::with_conn(|conn| {
-        let _ = update_content_in(conn, message_id, content);
+        if let Err(e) = update_content_in(conn, guild_id, message_id, content) {
+            eprintln!("⚠️ [{guild_id}] couldn't update stored message {message_id}: {e}");
+        }
     });
 }
 
 /// Stamp a message as deleted (so it is kept for the longer retention) and
 /// return what it said.
-pub fn mark_deleted(message_id: u64) -> Option<StoredMessage> {
+pub fn mark_deleted(guild_id: u64, message_id: u64) -> Option<StoredMessage> {
     let now = crate::common::config::now_ms();
-    db::with_conn(|conn| mark_deleted_in(conn, message_id, now))
+    db::with_conn(|conn| mark_deleted_in(conn, guild_id, message_id, now))
 }
 
 /// Drop rows past their retention. Returns how many went.
@@ -249,25 +257,25 @@ mod tests {
         let c = conn();
         let m = msg(1_234_567_890_123_456_789, "hello", 1_000);
         insert(&c, &m).unwrap();
-        assert_eq!(get_in(&c, m.message_id), Some(m));
+        assert_eq!(get_in(&c, 10, m.message_id), Some(m));
     }
 
     #[test]
     fn edits_replace_the_content_and_deletes_are_stamped() {
         let c = conn();
         insert(&c, &msg(1, "before", 1_000)).unwrap();
-        update_content_in(&c, 1, "after").unwrap();
-        let deleted = mark_deleted_in(&c, 1, 5_000).unwrap();
+        update_content_in(&c, 10, 1, "after").unwrap();
+        let deleted = mark_deleted_in(&c, 10, 1, 5_000).unwrap();
         assert_eq!(deleted.content, "after");
         assert_eq!(deleted.deleted_at, Some(5_000));
         // A second delete event doesn't move the stamp.
-        assert_eq!(mark_deleted_in(&c, 1, 9_000).unwrap().deleted_at, Some(5_000));
+        assert_eq!(mark_deleted_in(&c, 10, 1, 9_000).unwrap().deleted_at, Some(5_000));
     }
 
     #[test]
     fn unknown_messages_are_none() {
         let c = conn();
-        assert_eq!(mark_deleted_in(&c, 42, 1), None);
+        assert_eq!(mark_deleted_in(&c, 10, 42, 1), None);
     }
 
     #[test]
@@ -277,14 +285,28 @@ mod tests {
         insert(&c, &msg(1, "old live", now - (LIVE_RETENTION_DAYS + 1) * DAY_MS)).unwrap();
         insert(&c, &msg(2, "recent live", now - DAY_MS)).unwrap();
         insert(&c, &msg(3, "old but deleted recently", now - (LIVE_RETENTION_DAYS + 1) * DAY_MS)).unwrap();
-        mark_deleted_in(&c, 3, now - DAY_MS);
+        mark_deleted_in(&c, 10, 3, now - DAY_MS);
         insert(&c, &msg(4, "deleted long ago", now - 60 * DAY_MS)).unwrap();
-        mark_deleted_in(&c, 4, now - (DELETED_RETENTION_DAYS + 1) * DAY_MS);
+        mark_deleted_in(&c, 10, 4, now - (DELETED_RETENTION_DAYS + 1) * DAY_MS);
 
         assert_eq!(prune_in(&c, now), 2);
-        assert!(get_in(&c, 1).is_none());
-        assert!(get_in(&c, 2).is_some());
-        assert!(get_in(&c, 3).is_some());
-        assert!(get_in(&c, 4).is_none());
+        assert!(get_in(&c, 10, 1).is_none());
+        assert!(get_in(&c, 10, 2).is_some());
+        assert!(get_in(&c, 10, 3).is_some());
+        assert!(get_in(&c, 10, 4).is_none());
+    }
+
+    /// An event from another guild can't read, edit or delete this guild's
+    /// stored message, even given its id.
+    #[test]
+    fn lookups_are_scoped_to_the_guild() {
+        let c = conn();
+        insert(&c, &msg(7, "guild ten's secret", 1_000)).unwrap();
+        assert!(get_in(&c, 99, 7).is_none());
+        assert_eq!(update_content_in(&c, 99, 7, "overwritten").unwrap(), 0);
+        assert!(mark_deleted_in(&c, 99, 7, 5_000).is_none());
+        let still = get_in(&c, 10, 7).unwrap();
+        assert_eq!(still.content, "guild ten's secret");
+        assert_eq!(still.deleted_at, None);
     }
 }

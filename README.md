@@ -143,9 +143,13 @@ failsafe` (roles targeted by `!failsafe`).
 ## Configuration
 
 Behavioral thresholds (spam/raid/nuke detection, rate limits, warn
-escalation) are set via environment variables - see
+escalation) have bot-wide defaults set via environment variables - see
 [`.env.example`](.env.example) for the full list, all optional with
-sensible defaults.
+sensible defaults. Each server can override any of them for itself with
+`/config antinuke|antiraid|antispam|moderation`, switch anti-nuke,
+anti-raid, anti-spam and anti-ping on or off with `/config module`, and go
+back to the defaults with `/config reset`. Overrides are stored in that
+server's settings row only.
 
 Per-server identity settings (mod role, mute role, log channels, anti-nuke
 whitelist, failsafe roles) are configured live with `/setup` in each server
@@ -157,7 +161,8 @@ seconds long, so losing them on a restart is fine by design. Mod rate
 limits and active lockdown state (raid/panic) are also per guild **and**
 persisted to SQLite, so a restart mid-lockdown or mid-rate-limit-window
 doesn't silently drop protection or reset a mod's daily limits - see
-`recover_lockdowns()`/`recover_mutes()`, called from the `ready` handler in
+`recover_lockdown()`/`recover_mutes()`, run per guild as each one arrives
+(`guild_create`) in
 `rust/src/main.rs`.
 
 ### Owner override

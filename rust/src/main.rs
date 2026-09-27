@@ -12,7 +12,10 @@ mod common;
 mod state;
 mod systems;
 
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
 use serenity::model::application::Interaction;
@@ -53,70 +56,28 @@ struct Handler;
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        println!("✅ Guardian Bot online as {}", ready.user.tag());
+        println!("✅ Guardian Bot online as {} (shard {})", ready.user.tag(), ctx.shard_id);
         println!("👑 Owner(s): {}", common::config::BOT_OWNER_IDS.iter().cloned().collect::<Vec<_>>().join(", "));
         ctx.set_activity(Some(serenity::gateway::ActivityData::watching("Protecting the server 🛡️")));
 
-        // Global registration serves every server, present and future.
-        match serenity::model::application::Command::set_global_commands(&ctx.http, commands::definitions::all()).await {
-            Ok(_) => println!("✅ Global commands registered (available in every server; new servers may take up to ~1h)."),
-            Err(e) => eprintln!("❌ Global command registration failed: {e}"),
-        }
-
-        systems::mute::recover_mutes(&ctx).await;
-        systems::mute::recover_lockdowns(&ctx).await;
-
-        let guilds: Vec<GuildId> = ctx.cache.guilds();
-
-        // Post any configured ticket + application panels that aren't already
-        // up (idempotent), and refresh chain-of-command boards in case roles
-        // changed while offline.
-        for guild_id in &guilds {
-            systems::tickets::ensure_ticket_panel(&ctx, *guild_id).await;
-            systems::applications::ensure_application_panels(&ctx, *guild_id).await;
-            systems::chain_of_command::render_all_chains_of_command(&ctx, *guild_id).await;
-        }
-
-        // Then clear any earlier copies the bot left behind, so a channel ends
-        // up with exactly one of each. Only its own panels and boards are
-        // touched; everything else in those channels is left alone.
-        for guild_id in &guilds {
-            systems::tickets::sweep_duplicate_ticket_panels(&ctx, *guild_id).await;
-            systems::applications::sweep_duplicate_application_panels(&ctx, *guild_id).await;
-            systems::chain_of_command::sweep_duplicate_boards(&ctx, *guild_id).await;
-        }
-
-        // Permission self-audit
-        for guild_id in &guilds {
-            let Some(perms) = my_permissions(&ctx, *guild_id) else { continue };
-            let mut missing = Vec::new();
-            if !perms.contains(Permissions::VIEW_AUDIT_LOG) {
-                missing.push("View Audit Log (anti-nuke blind without this!)");
-            }
-            if !perms.contains(Permissions::BAN_MEMBERS) {
-                missing.push("Ban Members");
-            }
-            if !perms.contains(Permissions::MANAGE_ROLES) {
-                missing.push("Manage Roles");
-            }
-            if !perms.contains(Permissions::MANAGE_CHANNELS) {
-                missing.push("Manage Channels");
-            }
-            if !missing.is_empty() {
-                let name = guild_id.name(&ctx.cache).unwrap_or_else(|| guild_id.to_string());
-                eprintln!("⚠️ [{name}] missing permissions: {}", missing.join(", "));
+        // Ready arrives once per shard and again on every fresh session, so
+        // anything process-wide is guarded to happen once. Per-guild work is
+        // not done here at all: guilds aren't in the cache yet at this point.
+        // It runs from guild_create, once each guild has actually arrived.
+        if !COMMANDS_REGISTERED.load(Ordering::Acquire) {
+            // Global registration serves every server, present and future.
+            match serenity::model::application::Command::set_global_commands(&ctx.http, commands::definitions::all()).await {
+                Ok(_) => {
+                    COMMANDS_REGISTERED.store(true, Ordering::Release);
+                    println!("✅ Global commands registered (available in every server; new servers may take up to ~1h).");
+                }
+                Err(e) => eprintln!("❌ Global command registration failed: {e}"),
             }
         }
-
-        // Initial full-guild snapshot, then rolling snapshots for nuke recovery.
-        for guild_id in &guilds {
-            if let Some((roles, channels)) = systems::snapshot_rollback::snapshot_guild(&ctx, *guild_id).await {
-                let name = guild_id.name(&ctx.cache).unwrap_or_else(|| guild_id.to_string());
-                println!("📸 [{name}] snapshot: {roles} roles, {channels} channels");
-            }
+        if !TIMERS_STARTED.swap(true, Ordering::AcqRel) {
+            spawn_snapshot_timer(ctx.clone());
+            spawn_sweep_timer(ctx.clone());
         }
-        spawn_snapshot_timer(ctx.clone());
-        spawn_sweep_timer(ctx.clone());
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -129,6 +90,12 @@ impl EventHandler for Handler {
             return;
         }
         let Some(guild_id) = msg.guild_id else { return };
+        // Building GuildInfo copies the guild's whole role list; skip it for
+        // the common case of a server with neither check switched on.
+        let gid = guild_id.to_string();
+        if !state::guild_settings::spam(&gid).enabled && !state::anti_ping::ap(&gid).enabled {
+            return;
+        }
         let Some(info) = GuildInfo::from_cache(&ctx, guild_id) else { return };
         if systems::anti_spam::check_spam(&ctx, &msg, &info).await {
             return;
@@ -279,48 +246,132 @@ impl EventHandler for Handler {
         }
     }
 
-    // When added to a new server: snapshot it and notify the owner. (Global
-    // commands already cover new guilds - no per-guild registration needed.)
+    // Fires for every guild after connecting (is_new = false), when a guild
+    // comes back from an outage, and when the bot is added somewhere new.
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
-        if is_new != Some(true) {
+        if is_new == Some(true) {
+            println!("➕ Joined guild {} ({})", guild.name, guild.id);
+            notify_owners_of_join(&ctx, &guild).await;
+        }
+        if claim_boot(guild.id) {
+            boot_guild(&ctx, guild.id).await;
+        }
+    }
+
+    async fn guild_delete(&self, _ctx: Context, incomplete: serenity::model::guild::UnavailableGuild, _full: Option<Guild>) {
+        // `unavailable` means a Discord outage: the bot is still in the guild
+        // and it will come back. Otherwise the bot was removed.
+        if incomplete.unavailable {
             return;
         }
-        println!("➕ Joined guild {} ({})", guild.name, guild.id);
-        systems::snapshot_rollback::snapshot_guild(&ctx, guild.id).await;
-        systems::tickets::ensure_ticket_panel(&ctx, guild.id).await;
-        systems::applications::ensure_application_panels(&ctx, guild.id).await;
-        systems::chain_of_command::render_all_chains_of_command(&ctx, guild.id).await;
+        println!("➖ Removed from guild {}", incomplete.id);
+        forget_guild(incomplete.id);
+    }
+}
 
-        if CONFIG.owner_dm {
-            for id in common::config::BOT_OWNER_IDS.iter() {
-                let Ok(raw) = id.parse::<u64>() else { continue };
-                let user_id = serenity::model::id::UserId::new(raw);
-                if let Ok(user) = user_id.to_user(&ctx.http).await {
-                    let _ = user
-                        .direct_message(
-                            &ctx.http,
-                            serenity::builder::CreateMessage::new().embed(
-                                serenity::builder::CreateEmbed::new()
-                                    .color(common::theme::palette::MAGENTA)
-                                    .author(serenity::builder::CreateEmbedAuthor::new("➕ NEW SERVER"))
-                                    .title(format!("🛡️  Guardian joined {}", guild.name))
-                                    .description(
-                                        "Three steps and it's protected:\n\n\
-                                         **1️⃣  `/setup quick`** - mute role + log channels\n\
-                                         **2️⃣  `/setup logs`** - a 🗃️│ channel for every log type\n\
-                                         **3️⃣  `/setup roles mod_role:@Staff`** - who can moderate",
-                                    )
-                                    .field("🏠 Server", guild.name.clone(), true)
-                                    .field("🆔 ID", format!("`{}`", guild.id), true)
-                                    .field("👥 Members", format!("`{}`", guild.member_count), true)
-                                    .footer(common::theme::footer("Welcome"))
-                                    .timestamp(serenity::model::Timestamp::now()),
-                            ),
-                        )
-                        .await;
-                }
-            }
+/// Global commands are registered once per process, on the first Ready.
+static COMMANDS_REGISTERED: AtomicBool = AtomicBool::new(false);
+static TIMERS_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Guilds whose boot work has run in this process. Discord re-sends every
+/// guild on each new gateway session; this keeps that from recovering mutes,
+/// reposting panels and snapshotting all over again.
+static BOOTED: Lazy<Mutex<HashSet<GuildId>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// At most this many guilds boot at once. On startup every guild arrives
+/// within seconds, and each boot is a handful of API calls plus a full member
+/// read; running them all together is one large burst against the rate limit.
+static BOOT_SLOTS: Lazy<tokio::sync::Semaphore> = Lazy::new(|| tokio::sync::Semaphore::new(4));
+
+fn claim_boot(guild_id: GuildId) -> bool {
+    BOOTED.lock().unwrap_or_else(|e| e.into_inner()).insert(guild_id)
+}
+
+/// Everything that has to happen once per guild after connecting: pick up
+/// where timed mutes and lockdowns left off, put panels and boards back,
+/// check permissions, take a first snapshot.
+async fn boot_guild(ctx: &Context, guild_id: GuildId) {
+    let Ok(_slot) = BOOT_SLOTS.acquire().await else { return };
+    let name = guild_id.name(&ctx.cache).unwrap_or_else(|| guild_id.to_string());
+
+    systems::mute::recover_mutes(ctx, guild_id).await;
+    systems::mute::recover_lockdown(ctx, guild_id).await;
+
+    // Post any configured ticket + application panels that aren't already up
+    // (idempotent), refresh chain-of-command boards in case roles changed
+    // while offline, then clear any earlier copies left behind so a channel
+    // ends up with exactly one of each.
+    systems::tickets::ensure_ticket_panel(ctx, guild_id).await;
+    systems::applications::ensure_application_panels(ctx, guild_id).await;
+    systems::chain_of_command::render_all_chains_of_command(ctx, guild_id).await;
+    systems::tickets::sweep_duplicate_ticket_panels(ctx, guild_id).await;
+    systems::applications::sweep_duplicate_application_panels(ctx, guild_id).await;
+    systems::chain_of_command::sweep_duplicate_boards(ctx, guild_id).await;
+
+    if let Some(perms) = my_permissions(ctx, guild_id) {
+        let missing = missing_core_permissions(perms);
+        if !missing.is_empty() {
+            eprintln!("⚠️ [{name}] missing permissions: {}", missing.join(", "));
         }
+    }
+
+    if let Some((roles, channels)) = systems::snapshot_rollback::snapshot_guild(ctx, guild_id).await {
+        println!("📸 [{name}] snapshot: {roles} roles, {channels} channels");
+    }
+}
+
+/// The bot left a guild: drop everything held in memory for it. Saved
+/// configuration stays, so re-adding the bot picks up where it was.
+fn forget_guild(guild_id: GuildId) {
+    BOOTED.lock().unwrap_or_else(|e| e.into_inner()).remove(&guild_id);
+    systems::anti_spam::forget_guild(guild_id);
+    systems::anti_raid::forget_guild(guild_id);
+    systems::anti_ping::forget_guild(guild_id);
+    systems::anti_nuke::forget_guild(&guild_id.to_string());
+}
+
+fn missing_core_permissions(perms: Permissions) -> Vec<&'static str> {
+    [
+        (Permissions::VIEW_AUDIT_LOG, "View Audit Log (anti-nuke blind without this!)"),
+        (Permissions::BAN_MEMBERS, "Ban Members"),
+        (Permissions::MANAGE_ROLES, "Manage Roles"),
+        (Permissions::MANAGE_CHANNELS, "Manage Channels"),
+    ]
+    .into_iter()
+    .filter(|(p, _)| !perms.contains(*p))
+    .map(|(_, name)| name)
+    .collect()
+}
+
+async fn notify_owners_of_join(ctx: &Context, guild: &Guild) {
+    if !CONFIG.owner_dm {
+        return;
+    }
+    for id in common::config::BOT_OWNER_IDS.iter() {
+        let Ok(raw) = id.parse::<u64>() else { continue };
+        let user_id = serenity::model::id::UserId::new(raw);
+        let _ = user_id
+            .direct_message(
+                &ctx.http,
+                serenity::builder::CreateMessage::new().embed(
+                    serenity::builder::CreateEmbed::new()
+                        .color(common::theme::palette::MAGENTA)
+                        .author(serenity::builder::CreateEmbedAuthor::new("➕ NEW SERVER"))
+                        .title(format!("🛡️  Guardian joined {}", guild.name))
+                        .description(
+                            "Three steps and it's protected:\n\n\
+                             **1️⃣  `/setup quick`** - mute role + log channels\n\
+                             **2️⃣  `/setup logs`** - a 🗃️│ channel for every log type\n\
+                             **3️⃣  `/setup roles mod_role:@Staff`** - who can moderate",
+                        )
+                        .field("🏠 Server", guild.name.clone(), true)
+                        .field("🆔 ID", format!("`{}`", guild.id), true)
+                        .field("👥 Members", format!("`{}`", guild.member_count), true)
+                        .footer(common::theme::footer("Welcome"))
+                        .timestamp(serenity::model::Timestamp::now()),
+                ),
+            )
+            .await;
     }
 }
 
@@ -356,6 +407,7 @@ fn spawn_sweep_timer(ctx: Context) {
             systems::anti_spam::sweep();
             systems::anti_raid::sweep();
             systems::anti_nuke::sweep();
+            systems::anti_ping::sweep();
 
             // Fold the write-ahead log into the database file every five
             // minutes. The shutdown path does this too, but a host that kills
@@ -376,7 +428,9 @@ fn spawn_sweep_timer(ctx: Context) {
 
             // If I lose the permissions anti-nuke needs, alert the owner (once
             // per state change).
-            for guild_id in ctx.cache.guilds() {
+            let guilds = ctx.cache.guilds();
+            health.retain(|g, _| guilds.contains(g));
+            for guild_id in guilds {
                 let Some(perms) = my_permissions(&ctx, guild_id) else { continue };
                 let ok = perms.contains(Permissions::VIEW_AUDIT_LOG)
                     && perms.contains(Permissions::BAN_MEMBERS)

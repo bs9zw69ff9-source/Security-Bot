@@ -2,13 +2,14 @@
 
 use serenity::builder::{CreateEmbed, CreateMessage};
 use serenity::client::Context;
-use serenity::model::id::{ChannelId, GuildId};
+use serenity::model::id::{GuildId, UserId};
 use serenity::model::Timestamp;
 
 use super::config::{BOT_OWNER_IDS, CONFIG};
 use super::db::append_forensic;
+use super::guildinfo::guild_channel;
 use super::theme;
-use crate::state::guild_settings::gc;
+use crate::state::guild_settings::with;
 
 /// The bot-wide colours, mapped onto the bold palette in `theme.rs`. Kept as
 /// names so every existing call site picks up the new look unchanged.
@@ -51,14 +52,30 @@ pub async fn sec_log(ctx: &Context, guild_id: GuildId, title: &str, desc: &str, 
         "log",
         serde_json::json!({ "title": title, "desc": desc }),
     );
-    let log_id = gc(&guild_id.to_string()).log_channel_id;
+    let log_id = with(&guild_id.to_string(), |g| g.log_channel_id.clone());
     if log_id.is_empty() {
         return;
     }
-    let Ok(id) = log_id.parse::<u64>() else { return };
-    let _ = ChannelId::new(id)
-        .send_message(&ctx.http, CreateMessage::new().embed(theme::log_card(title, desc, color)))
-        .await;
+    let Some(ch) = guild_channel(ctx, guild_id, &log_id) else { return };
+    if let Err(e) = ch.send_message(&ctx.http, CreateMessage::new().embed(theme::log_card(title, desc, color))).await {
+        eprintln!("⚠️ [{guild_id}] couldn't post \"{title}\" to the security log {ch}: {e}");
+    }
+}
+
+/// Who an alert is for: this server's owner, plus any bot owner who is a
+/// member here. A bot owner who isn't in the server gets the DM but not a
+/// mention they can't see.
+fn alert_recipients(ctx: &Context, guild_id: GuildId) -> (Option<UserId>, Vec<UserId>) {
+    let bot_owners: Vec<UserId> =
+        BOT_OWNER_IDS.iter().filter_map(|s| s.parse::<u64>().ok()).map(UserId::new).collect();
+    match ctx.cache.guild(guild_id) {
+        Some(g) => {
+            let mut ping = vec![g.owner_id];
+            ping.extend(bot_owners.iter().copied().filter(|u| g.members.contains_key(u) && *u != g.owner_id));
+            (Some(g.owner_id), ping)
+        }
+        None => (None, Vec::new()),
+    }
 }
 
 /// Critical alert: forensic trail + channel ping + owner DM (so a nuked log
@@ -69,15 +86,15 @@ pub async fn alert_owner(ctx: &Context, guild_id: GuildId, desc: &str, color: u3
         "alert",
         serde_json::json!({ "title": title, "desc": desc }),
     );
-    let g = gc(&guild_id.to_string());
-    let ch_id = if !g.alert_channel_id.is_empty() { g.alert_channel_id } else { g.log_channel_id };
-    let owner_ids: Vec<String> = BOT_OWNER_IDS.iter().cloned().collect();
+    let ch_id = with(&guild_id.to_string(), |g| {
+        if !g.alert_channel_id.is_empty() { g.alert_channel_id.clone() } else { g.log_channel_id.clone() }
+    });
+    let (guild_owner, ping) = alert_recipients(ctx, guild_id);
 
-    if let Ok(id) = ch_id.parse::<u64>() {
-        let content = owner_ids.iter().map(|id| format!("<@{id}>")).collect::<Vec<_>>().join(" ");
-        let mentions = serenity::builder::CreateAllowedMentions::new()
-            .users(owner_ids.iter().filter_map(|s| s.parse::<u64>().ok()).map(serenity::model::id::UserId::new).collect::<Vec<_>>());
-        let _ = ChannelId::new(id)
+    if let Some(ch) = guild_channel(ctx, guild_id, &ch_id) {
+        let content = ping.iter().map(|id| format!("<@{id}>")).collect::<Vec<_>>().join(" ");
+        let mentions = serenity::builder::CreateAllowedMentions::new().users(ping.clone());
+        let sent = ch
             .send_message(
                 &ctx.http,
                 CreateMessage::new()
@@ -86,22 +103,23 @@ pub async fn alert_owner(ctx: &Context, guild_id: GuildId, desc: &str, color: u3
                     .allowed_mentions(mentions),
             )
             .await;
+        if let Err(e) = sent {
+            eprintln!("⚠️ [{guild_id}] couldn't post alert \"{title}\" to {ch}: {e}");
+        }
     }
 
     if CONFIG.owner_dm {
         let guild_name = guild_id.name(&ctx.cache).unwrap_or_else(|| guild_id.to_string());
-        for id in &owner_ids {
-            let Ok(uid) = id.parse::<u64>() else { continue };
-            let user_id = serenity::model::id::UserId::new(uid);
-            if let Ok(user) = user_id.to_user(&ctx.http).await {
-                let _ = user
-                    .direct_message(
-                        &ctx.http,
-                        CreateMessage::new()
-                            .embed(theme::alert_card(title, desc, color, Some(&guild_name))),
-                    )
-                    .await;
+        let mut dm: Vec<UserId> =
+            BOT_OWNER_IDS.iter().filter_map(|s| s.parse::<u64>().ok()).map(UserId::new).collect();
+        if let Some(o) = guild_owner {
+            if !dm.contains(&o) {
+                dm.push(o);
             }
+        }
+        for user_id in dm {
+            let card = CreateMessage::new().embed(theme::alert_card(title, desc, color, Some(&guild_name)));
+            let _ = user_id.direct_message(&ctx.http, card).await;
         }
     }
 }
@@ -128,13 +146,13 @@ pub fn usage_footer(action: &str, used: usize, limit: usize) -> String {
     format!("`{bar}` **{used}/{limit}** {action}s used today{warning}")
 }
 
-pub fn limit_denied_embed(action: &str, used: usize, limit: usize, resets_in_min: i64) -> CreateEmbed {
+pub fn limit_denied_embed(action: &str, used: usize, limit: usize, resets_in_min: i64, window_hours: i64) -> CreateEmbed {
     embed(
         colors::DANGER,
         format!(
             "You've hit your `/{action}` limit for now.\n\nThat's **{used}/{limit}** {action}s in the last {}h. \
              You'll be able to use it again in about **{resets_in_min} minute{}**.",
-            CONFIG.mod_window_ms / 3_600_000,
+            window_hours,
             if resets_in_min == 1 { "" } else { "s" }
         ),
         Some("⏳ Rate Limit Reached"),

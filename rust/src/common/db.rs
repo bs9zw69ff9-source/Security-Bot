@@ -48,9 +48,21 @@ fn resolve_db_path(var: Option<String>) -> std::path::PathBuf {
     }
 }
 
-static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
+#[cfg(not(test))]
+fn open() -> Connection {
     let path = db_path();
-    let conn = Connection::open(&path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
+    Connection::open(&path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()))
+}
+
+// Tests exercise the real read/write paths, so they get a private database
+// rather than the deployment's file.
+#[cfg(test)]
+fn open() -> Connection {
+    Connection::open_in_memory().expect("in-memory database")
+}
+
+static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
+    let conn = open();
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     let _ = conn.pragma_update(None, "busy_timeout", 5000);
     for t in TABLES {

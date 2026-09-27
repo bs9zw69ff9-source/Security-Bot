@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use crate::common::config::{now_ms, root_file};
 use crate::common::db;
 use crate::common::embeds::{alert_owner, colors};
-use crate::common::guildinfo::GuildInfo;
+use crate::common::guildinfo::{all_members, GuildInfo};
 use crate::state::guild_settings::gc;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -74,9 +74,17 @@ pub async fn run_failsafe(ctx: &Context, msg: &Message) {
     }
 
     let _ = msg.reply(&ctx.http, "🛡️ **FAILSAFE engaged** - backing up, then purging roles & bots…").await;
-    // Full cache for accurate membership + bot list.
-    let members = guild_id.members(&ctx.http, None, None).await.unwrap_or_default();
-    let channels = guild_id.channels(&ctx.http).await.unwrap_or_default();
+    // Every member, for accurate membership and the full bot list. The backup
+    // is what !restore rebuilds from, so it isn't taken from a partial read.
+    let (members, channels) = match (all_members(ctx, guild_id).await, guild_id.channels(&ctx.http).await) {
+        (Ok(m), Ok(c)) => (m, c),
+        (Err(e), _) | (_, Err(e)) => {
+            let _ = msg
+                .reply(&ctx.http, format!("⚠️ Failsafe stopped before changing anything: I couldn't read the server ({e})."))
+                .await;
+            return;
+        }
+    };
     let Some(info) = GuildInfo::from_cache(ctx, guild_id) else { return };
 
     // 1) Snapshot target roles BEFORE deletion (so !restore can rebuild them).

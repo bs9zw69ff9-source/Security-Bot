@@ -68,10 +68,10 @@ pub fn remove(guild_id: &str, user_id: &str) {
     db::put("muted_roles", guild_id, &snapshot);
 }
 
-/// Every stored mute, for boot recovery.
-pub fn all() -> Vec<(String, Vec<(String, MuteStash)>)> {
+/// Every stored mute in one guild, for boot recovery.
+pub fn for_guild(guild_id: &str) -> Vec<(String, MuteStash)> {
     lock()
-        .iter()
-        .map(|(gid, users)| (gid.clone(), users.iter().map(|(uid, s)| (uid.clone(), s.clone())).collect()))
-        .collect()
+        .get(guild_id)
+        .map(|users| users.iter().map(|(uid, s)| (uid.clone(), s.clone())).collect())
+        .unwrap_or_default()
 }

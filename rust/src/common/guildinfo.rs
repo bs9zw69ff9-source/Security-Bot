@@ -6,7 +6,7 @@
 
 use serenity::client::Context;
 use serenity::model::guild::Member;
-use serenity::model::id::{GuildId, RoleId, UserId};
+use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use serenity::model::Permissions;
 use std::collections::HashMap;
 
@@ -118,4 +118,40 @@ pub async fn fetch_member(ctx: &Context, guild_id: GuildId, user_id: UserId) -> 
         return cached;
     }
     guild_id.member(&ctx.http, user_id).await.ok()
+}
+
+/// Whether `channel_id` is one of `guild_id`'s channels or threads, per the
+/// cache.
+///
+/// Every channel the bot posts to because a setting names it is checked with
+/// this first. A stored id can be stale (the channel was deleted) or foreign
+/// (seeded, imported or hand-edited from another server), and without the
+/// check the second case sends one server's logs into another.
+pub fn channel_in_guild(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> bool {
+    ctx.cache
+        .guild(guild_id)
+        .map(|g| g.channels.contains_key(&channel_id) || g.threads.iter().any(|t| t.id == channel_id))
+        .unwrap_or(false)
+}
+
+/// A stored channel id, if it parses and belongs to this guild.
+pub fn guild_channel(ctx: &Context, guild_id: GuildId, raw: &str) -> Option<ChannelId> {
+    let id = raw.parse::<u64>().ok().filter(|v| *v != 0).map(ChannelId::new)?;
+    channel_in_guild(ctx, guild_id, id).then_some(id)
+}
+
+/// Every member of the guild, paging through the API 1000 at a time.
+///
+/// `GuildId::members` returns one page and says nothing about the rest, which
+/// on a large server meant snapshots and the failsafe only ever saw the first
+/// thousand members. An error is returned rather than a partial list, because
+/// the callers go on to add and remove roles based on who is missing.
+pub async fn all_members(ctx: &Context, guild_id: GuildId) -> serenity::Result<Vec<Member>> {
+    use futures::StreamExt;
+    let mut stream = Box::pin(guild_id.members_iter(&ctx.http));
+    let mut out = Vec::new();
+    while let Some(m) = stream.next().await {
+        out.push(m?);
+    }
+    Ok(out)
 }

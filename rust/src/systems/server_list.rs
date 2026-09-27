@@ -9,11 +9,6 @@ use serenity::builder::{CreateEmbed, CreateInvite, CreateMessage};
 
 use crate::colors;
 
-/// Where the list is sent. This is the bot owner, kept separate from
-/// BOT_OWNER_IDS on purpose: that set is a trust list and can hold several
-/// people, while this is the one inbox the list belongs in.
-pub const REPORT_TO: u64 = 1014251293159731310;
-
 /// How many channels to try before giving up on a server. A server that says no
 /// to the first few is going to say no to the rest, and every attempt is another
 /// request against the rate limit.

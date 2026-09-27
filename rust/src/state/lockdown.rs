@@ -73,24 +73,33 @@ pub fn locked_count() -> usize {
     lock().len()
 }
 
-/// Snapshot of every active lockdown, for boot recovery.
-pub fn all() -> Vec<(String, LockdownState)> {
-    lock().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+/// The active lockdown, if any.
+pub fn get(guild_id: &str) -> Option<LockdownState> {
+    lock().get(guild_id).cloned()
 }
 
-pub fn set_lockdown(guild_id: &str, reason: &str, expires_at: Option<i64>) {
-    set_lockdown_with_changes(guild_id, reason, expires_at, Vec::new());
-}
-
-pub fn set_lockdown_with_changes(
-    guild_id: &str,
-    reason: &str,
-    expires_at: Option<i64>,
-    changed: Vec<LockedChannel>,
-) {
-    let state = LockdownState { reason: reason.to_string(), locked_at: now_ms(), expires_at, changed };
-    lock().insert(guild_id.to_string(), state.clone());
+/// Mark the guild locked unless it already is, and return the new lock's
+/// `locked_at`. The check and the set happen under one lock, so two raid
+/// triggers arriving together can't both start a lockdown pass.
+pub fn try_set_lockdown(guild_id: &str, reason: &str, expires_at: Option<i64>) -> Option<i64> {
+    let mut map = lock();
+    if map.contains_key(guild_id) {
+        return None;
+    }
+    let state = LockdownState { reason: reason.to_string(), locked_at: now_ms(), expires_at, changed: Vec::new() };
+    let locked_at = state.locked_at;
+    map.insert(guild_id.to_string(), state.clone());
+    drop(map);
     db::put("lockdown_state", guild_id, &state);
+    Some(locked_at)
+}
+
+/// Whether the lockdown a timer was started for is still the one in force.
+///
+/// Auto-lift timers sleep for minutes. In that time the lock can be lifted by
+/// hand and a new one started, and the old timer must not lift the new one.
+pub fn is_same_lock(guild_id: &str, locked_at: i64) -> bool {
+    lock().get(guild_id).map(|s| s.locked_at == locked_at).unwrap_or(false)
 }
 
 /// What the active lockdown changed, if anything is on record.
@@ -117,4 +126,43 @@ pub fn record_changes(guild_id: &str, changed: Vec<LockedChannel>) {
 pub fn clear_lockdown(guild_id: &str) {
     lock().remove(guild_id);
     db::delete("lockdown_state", guild_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_first_claim_starts_a_lockdown() {
+        let g = "test-ld-claim";
+        let first = try_set_lockdown(g, "raid", Some(now_ms() + 60_000));
+        assert!(first.is_some());
+        assert!(try_set_lockdown(g, "raid", Some(now_ms() + 60_000)).is_none());
+        assert!(is_lockdown(g));
+        clear_lockdown(g);
+    }
+
+    #[test]
+    fn a_stale_timer_does_not_match_a_newer_lock() {
+        let g = "test-ld-stale";
+        let old = try_set_lockdown(g, "raid", Some(0)).unwrap();
+        clear_lockdown(g);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let new = try_set_lockdown(g, "raid", Some(0)).unwrap();
+        assert_ne!(old, new);
+        assert!(!is_same_lock(g, old));
+        assert!(is_same_lock(g, new));
+        clear_lockdown(g);
+    }
+
+    #[test]
+    fn lockdowns_are_per_guild() {
+        try_set_lockdown("test-ld-a", "raid", None).unwrap();
+        assert!(!is_lockdown("test-ld-b"));
+        assert!(try_set_lockdown("test-ld-b", "panic", None).is_some());
+        assert_eq!(lockdown_reason("test-ld-a").as_deref(), Some("raid"));
+        assert_eq!(lockdown_reason("test-ld-b").as_deref(), Some("panic"));
+        clear_lockdown("test-ld-a");
+        clear_lockdown("test-ld-b");
+    }
 }

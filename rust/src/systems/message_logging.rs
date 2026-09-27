@@ -13,12 +13,23 @@ use serenity::model::event::MessageUpdateEvent;
 use serenity::model::id::{ChannelId, GuildId, MessageId};
 
 use crate::state::message_store::{self, StoredMessage};
-use crate::systems::server_logs::{build, is_log_channel, log_channel_for, server_of, Who};
+use crate::systems::server_logs::{build, deliverable_log_channel, is_log_channel, log_channel_for, server_of, Who};
+
+/// Discord's upload limit for a bot's message in an unboosted server is
+/// 10 MiB. Re-uploads are kept under that so one large attachment can't make
+/// the whole log post fail.
+const REUPLOAD_BUDGET: u64 = 8 * 1024 * 1024;
 
 /// Remember a new guild message so its content can be logged if it is later
 /// deleted or edited, even across a restart.
+///
+/// Only for guilds that log deletes or edits: a server that hasn't asked for
+/// message logs doesn't have its messages written to disk.
 pub fn on_message(ctx: &Context, msg: &Message) {
     let Some(guild_id) = msg.guild_id else { return };
+    if log_channel_for(guild_id, "messageDelete").is_none() && log_channel_for(guild_id, "messageEdit").is_none() {
+        return;
+    }
     if msg.author.id == ctx.cache.current_user().id || is_log_channel(guild_id, msg.channel_id) {
         return;
     }
@@ -38,11 +49,11 @@ fn who_of(m: &StoredMessage) -> Who {
 
 /// Resolve where a message log goes (its `/setup logs` channel, else the
 /// legacy message-log channel), skipping anything that is itself a log channel.
-fn log_channel(guild_id: GuildId, source: ChannelId, key: &str) -> Option<ChannelId> {
+fn log_channel(ctx: &Context, guild_id: GuildId, source: ChannelId, key: &str) -> Option<ChannelId> {
     if is_log_channel(guild_id, source) {
         return None; // don't log the log channels themselves
     }
-    log_channel_for(guild_id, key)
+    deliverable_log_channel(ctx, guild_id, key)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -51,11 +62,11 @@ fn truncate(s: &str, max: usize) -> String {
 
 pub async fn on_message_delete(ctx: &Context, channel_id: ChannelId, message_id: MessageId, guild_id: Option<GuildId>) {
     let Some(guild_id) = guild_id else { return };
-    let Some(log_ch) = log_channel(guild_id, channel_id, "messageDelete") else { return };
+    let Some(log_ch) = log_channel(ctx, guild_id, channel_id, "messageDelete") else { return };
 
     // The database copy is what survives a restart; the cache is only a
     // fallback for anything that arrived before the store existed.
-    let stored = message_store::mark_deleted(message_id.get()).or_else(|| {
+    let stored = message_store::mark_deleted(guild_id.get(), message_id.get()).or_else(|| {
         ctx.cache.message(channel_id, message_id).map(|m| StoredMessage::from_message(&m, guild_id.get()))
     });
     if let Some(m) = &stored {
@@ -74,13 +85,18 @@ pub async fn on_message_delete(ctx: &Context, channel_id: ChannelId, message_id:
     let mut files = Vec::new();
     let mut lines = Vec::new();
     let mut first_image: Option<String> = None;
+    let mut budget = REUPLOAD_BUDGET;
     if let Some(m) = &stored {
         for (idx, att) in m.attachments.iter().enumerate() {
             let safe: String = format!(
                 "{idx}_{}",
                 att.filename.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' }).collect::<String>()
             );
-            let downloaded = download(&att.url).await;
+            let size = u64::from(att.size);
+            let downloaded = if size <= budget { download(&att.url).await } else { None };
+            if downloaded.is_some() {
+                budget -= size;
+            }
             let got_file = downloaded.is_some();
             if let Some(data) = downloaded {
                 files.push(CreateAttachment::bytes(data, safe.clone()));
@@ -124,12 +140,12 @@ pub async fn on_message_delete_bulk(
     guild_id: Option<GuildId>,
 ) {
     let Some(guild_id) = guild_id else { return };
-    let Some(log_ch) = log_channel(guild_id, channel_id, "messageDelete") else { return };
+    let Some(log_ch) = log_channel(ctx, guild_id, channel_id, "messageDelete") else { return };
 
     let cached: Vec<StoredMessage> = ids
         .iter()
         .filter_map(|id| {
-            message_store::mark_deleted(id.get()).or_else(|| {
+            message_store::mark_deleted(guild_id.get(), id.get()).or_else(|| {
                 ctx.cache.message(channel_id, *id).map(|m| StoredMessage::from_message(&m, guild_id.get()))
             })
         })
@@ -146,7 +162,7 @@ pub async fn on_message_delete_bulk(
 
     let more = if cached.len() > 15 { format!("\n…and {} more stored", cached.len() - 15) } else { String::new() };
     let e = build::message_bulk_delete(&server_of(ctx, guild_id), channel_id.get(), ids.len(), &format!("{lines}{more}"));
-    report(guild_id, "messageEdit", log_ch, log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await);
+    report(guild_id, "messageDelete", log_ch, log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await);
 }
 
 pub async fn on_message_update(ctx: &Context, old: Option<&Message>, new: Option<&Message>, event: &MessageUpdateEvent) {
@@ -159,13 +175,13 @@ pub async fn on_message_update(ctx: &Context, old: Option<&Message>, new: Option
 
     // What it said before: the database first, since the cache is empty after
     // a restart.
-    let stored = message_store::get(event.id.get());
+    let stored = message_store::get(guild_id.get(), event.id.get());
     let before = stored.as_ref().map(|m| m.content.clone()).or_else(|| old.map(|o| o.content.clone()));
     if before.as_deref() == Some(after.as_str()) {
         return;
     }
     if stored.is_some() {
-        message_store::update_content(event.id.get(), &after);
+        message_store::update_content(guild_id.get(), event.id.get(), &after);
     }
 
     let author = event
@@ -178,7 +194,7 @@ pub async fn on_message_update(ctx: &Context, old: Option<&Message>, new: Option
     if author.id == me.get() {
         return;
     }
-    let Some(log_ch) = log_channel(guild_id, channel_id, "messageEdit") else { return };
+    let Some(log_ch) = log_channel(ctx, guild_id, channel_id, "messageEdit") else { return };
 
     let before = before.unwrap_or_else(|| "_not stored (sent before logging was set up)_".to_string());
     let url = format!("https://discord.com/channels/{}/{}/{}", guild_id, channel_id, event.id);

@@ -13,30 +13,30 @@ use serenity::model::Permissions;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::common::config::{now_ms, CONFIG, DANGER_PERMS};
+use crate::common::config::{now_ms, DANGER_PERMS};
 use crate::common::embeds::{alert_owner, colors, sec_log};
 use crate::common::guildinfo::{fetch_member, GuildInfo};
 use crate::common::permissions::is_whitelisted;
+use crate::state::guild_settings;
+use crate::state::tunables::NukeConfig;
 
-/// "gid:uid" -> per-action-kind timestamp lists
-type NukeCounts = HashMap<String, HashMap<String, Vec<i64>>>;
-pub static NUKE_TRACKER: Lazy<Mutex<NukeCounts>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// (guild, user) -> per-action-kind timestamp lists
+type NukeCounts = HashMap<(String, String), HashMap<String, Vec<i64>>>;
+static NUKE_TRACKER: Lazy<Mutex<NukeCounts>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// "gid:uid" for every user with a nuke response currently running.
-static RESPONDING: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+/// (guild, user) for every user with a nuke response currently running.
+static RESPONDING: Lazy<Mutex<HashSet<(String, String)>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 fn nuke_lock() -> std::sync::MutexGuard<'static, NukeCounts> {
-    match NUKE_TRACKER.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    }
+    NUKE_TRACKER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn responding_lock() -> std::sync::MutexGuard<'static, HashSet<String>> {
-    match RESPONDING.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    }
+fn responding_lock() -> std::sync::MutexGuard<'static, HashSet<(String, String)>> {
+    RESPONDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn key(guild_id: &str, user_id: &str) -> (String, String) {
+    (guild_id.to_string(), user_id.to_string())
 }
 
 /// True while a response for this user is already running.
@@ -46,23 +46,23 @@ fn responding_lock() -> std::sync::MutexGuard<'static, HashSet<String>> {
 /// counter and trip a second, third, fourth response for a user who is already
 /// being dealt with: duplicate bans, duplicate alerts, duplicate role strips.
 pub fn response_in_flight(guild_id: &str, user_id: &str) -> bool {
-    responding_lock().contains(&format!("{guild_id}:{user_id}"))
+    responding_lock().contains(&key(guild_id, user_id))
 }
 
 /// Claim the right to respond. False means someone else already has it.
 fn begin_response(guild_id: &str, user_id: &str) -> bool {
-    responding_lock().insert(format!("{guild_id}:{user_id}"))
+    responding_lock().insert(key(guild_id, user_id))
 }
 
 fn end_response(guild_id: &str, user_id: &str) {
-    responding_lock().remove(&format!("{guild_id}:{user_id}"));
+    responding_lock().remove(&key(guild_id, user_id));
 }
 
 /// Drop expired timestamps, add one for now, and report whether the threshold
 /// is met. Caller holds the lock.
-fn push_and_check(entry: &mut HashMap<String, Vec<i64>>, key: &str, threshold: usize, now: i64) -> bool {
+fn push_and_check(entry: &mut HashMap<String, Vec<i64>>, key: &str, threshold: usize, now: i64, window_ms: i64) -> bool {
     let arr = entry.entry(key.to_string()).or_default();
-    arr.retain(|t| now - *t < CONFIG.nuke_window_ms);
+    arr.retain(|t| now - *t < window_ms);
     arr.push(now);
     arr.len() >= threshold
 }
@@ -89,15 +89,14 @@ pub enum Trip {
 /// concurrently-arriving event could push, also see the threshold met, and
 /// trip as well. A nuke bot firing actions in parallel produces exactly that
 /// pattern, so one burst fired several overlapping responses.
-pub fn bump_destructive(guild_id: &str, user_id: &str, key: &str, threshold: usize) -> Option<Trip> {
+pub fn bump_destructive(guild_id: &str, user_id: &str, key: &str, threshold: usize, cfg: &NukeConfig) -> Option<Trip> {
     let now = now_ms();
     let mut map = nuke_lock();
-    let entry = map.entry(format!("{guild_id}:{user_id}")).or_default();
+    let entry = map.entry(self::key(guild_id, user_id)).or_default();
 
-    let over_category = push_and_check(entry, key, threshold, now);
+    let over_category = push_and_check(entry, key, threshold, now, cfg.window_ms);
     // A total threshold of 0 disables the aggregate check entirely.
-    let over_total = CONFIG.nuke_total_threshold > 0
-        && push_and_check(entry, TOTAL_KEY, CONFIG.nuke_total_threshold, now);
+    let over_total = cfg.total > 0 && push_and_check(entry, TOTAL_KEY, cfg.total, now, cfg.window_ms);
 
     if !over_category && !over_total {
         return None;
@@ -107,24 +106,27 @@ pub fn bump_destructive(guild_id: &str, user_id: &str, key: &str, threshold: usi
     Some(if over_category { Trip::Category } else { Trip::Total })
 }
 
-pub fn total_reason() -> String {
-    format!(
-        "{}+ destructive actions in {}s",
-        CONFIG.nuke_total_threshold,
-        CONFIG.nuke_window_ms / 1000
-    )
+pub fn total_reason(cfg: &NukeConfig) -> String {
+    format!("{}+ destructive actions in {}s", cfg.total, cfg.window_ms / 1000)
 }
 
 pub fn sweep() {
     let now = now_ms();
+    let mut windows: HashMap<String, i64> = HashMap::new();
     let mut map = nuke_lock();
-    map.retain(|_, entry| {
+    map.retain(|(gid, _), entry| {
+        let window = *windows.entry(gid.clone()).or_insert_with(|| guild_settings::nuke(gid).window_ms);
         entry.retain(|_, arr| {
-            arr.retain(|t| now - *t < CONFIG.nuke_window_ms);
+            arr.retain(|t| now - *t < window);
             !arr.is_empty()
         });
         !entry.is_empty()
     });
+}
+
+/// Forget a guild's counters (the bot left it).
+pub fn forget_guild(guild_id: &str) {
+    nuke_lock().retain(|(g, _), _| g != guild_id);
 }
 
 /// Ban the executor immediately; if that is refused, fall back to stripping
@@ -281,7 +283,11 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
 
     let gid = guild_id.to_string();
     let uid = executor_id.to_string();
-    let win = CONFIG.nuke_window_ms / 1000;
+    let cfg = guild_settings::nuke(&gid);
+    if !cfg.enabled {
+        return;
+    }
+    let win = cfg.window_ms / 1000;
 
     // Already dealing with this one. Their remaining entries describe actions
     // that have already happened; counting them again only produces duplicate
@@ -308,44 +314,44 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
     let simple: Option<(&str, usize, String)> = match entry.action {
         Action::Channel(ChannelAction::Delete) => Some((
             "chDel",
-            CONFIG.nuke_channel_threshold,
-            format!("Deleted {}+ channels in {win}s", CONFIG.nuke_channel_threshold),
+            cfg.channel_delete,
+            format!("Deleted {}+ channels in {win}s", cfg.channel_delete),
         )),
         Action::Channel(ChannelAction::Create) => Some((
             "chCreate",
-            CONFIG.nuke_channel_create_thresh,
-            format!("Created {}+ channels in {win}s", CONFIG.nuke_channel_create_thresh),
+            cfg.channel_create,
+            format!("Created {}+ channels in {win}s", cfg.channel_create),
         )),
         Action::Role(RoleAction::Delete) => Some((
             "roleDel",
-            CONFIG.nuke_role_threshold,
-            format!("Deleted {}+ roles in {win}s", CONFIG.nuke_role_threshold),
+            cfg.role_delete,
+            format!("Deleted {}+ roles in {win}s", cfg.role_delete),
         )),
         Action::Role(RoleAction::Create) => Some((
             "roleCreate",
-            CONFIG.nuke_role_create_thresh,
-            format!("Created {}+ roles in {win}s", CONFIG.nuke_role_create_thresh),
+            cfg.role_create,
+            format!("Created {}+ roles in {win}s", cfg.role_create),
         )),
         Action::Member(MemberAction::BanAdd) => Some((
             "bans",
-            CONFIG.nuke_ban_threshold,
-            format!("Issued {}+ bans in {win}s", CONFIG.nuke_ban_threshold),
+            cfg.ban,
+            format!("Issued {}+ bans in {win}s", cfg.ban),
         )),
         Action::Member(MemberAction::Kick) | Action::Member(MemberAction::Prune) => Some((
             "kicks",
-            CONFIG.nuke_kick_threshold,
-            format!("Removed {}+ members in {win}s", CONFIG.nuke_kick_threshold),
+            cfg.kick,
+            format!("Removed {}+ members in {win}s", cfg.kick),
         )),
         Action::Emoji(EmojiAction::Delete) | Action::Sticker(StickerAction::Delete) => Some((
             "emojiDel",
-            CONFIG.nuke_emoji_threshold,
-            format!("Deleted {}+ emojis/stickers in {win}s", CONFIG.nuke_emoji_threshold),
+            cfg.emoji,
+            format!("Deleted {}+ emojis/stickers in {win}s", cfg.emoji),
         )),
         _ => None,
     };
     if let Some((key, threshold, reason)) = simple {
-        if let Some(trip) = bump_destructive(&gid, &uid, key, threshold) {
-            let reason = if trip == Trip::Category { reason } else { total_reason() };
+        if let Some(trip) = bump_destructive(&gid, &uid, key, threshold, &cfg) {
+            let reason = if trip == Trip::Category { reason } else { total_reason(&cfg) };
             nuke_response(ctx, guild_id, executor_id, &reason).await;
         }
         return;
@@ -357,21 +363,21 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
 
     match entry.action {
         Action::Webhook(WebhookAction::Create) => {
-            if let Some(trip) = bump_destructive(&gid, &uid, "webhooks", CONFIG.nuke_webhook_threshold) {
-                // Clean up whatever this user's webhooks were, best effort.
-                if let Ok(channels) = guild_id.channels(&ctx.http).await {
-                    for (cid, _) in channels {
-                        if let Ok(hooks) = cid.webhooks(&ctx.http).await {
-                            for wh in hooks.iter().filter(|w| w.user.as_ref().map(|u| u.id) == Some(executor_id)) {
-                                let _ = wh.delete(&ctx.http).await;
-                            }
+            if let Some(trip) = bump_destructive(&gid, &uid, "webhooks", cfg.webhook, &cfg) {
+                // Clean up whatever this user's webhooks were, best effort. One
+                // request for the whole guild, rather than one per channel.
+                match guild_id.webhooks(&ctx.http).await {
+                    Ok(hooks) => {
+                        for wh in hooks.iter().filter(|w| w.user.as_ref().map(|u| u.id) == Some(executor_id)) {
+                            let _ = wh.delete(&ctx.http).await;
                         }
                     }
+                    Err(e) => eprintln!("⚠️ [{guild_id}] couldn't list webhooks to clean up after {executor_id}: {e}"),
                 }
                 let reason = if trip == Trip::Category {
-                    format!("Created {}+ webhooks in {win}s", CONFIG.nuke_webhook_threshold)
+                    format!("Created {}+ webhooks in {win}s", cfg.webhook)
                 } else {
-                    total_reason()
+                    total_reason(&cfg)
                 };
                 nuke_response(ctx, guild_id, executor_id, &reason).await;
             }
@@ -386,7 +392,7 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
             }
             // Counted before the revert, for the same reason as everything
             // else: the revert and the alert are both round trips.
-            let trip = bump_destructive(&gid, &uid, "permEsc", 3);
+            let trip = bump_destructive(&gid, &uid, "permEsc", cfg.perm_escalation, &cfg);
 
             // Whitelisted people are allowed to hand out permissions, and this
             // is the one place that stopped being true. The check used to sit
@@ -408,7 +414,7 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
                 let reason = if trip == Trip::Category {
                     "Repeated permission escalation".to_string()
                 } else {
-                    total_reason()
+                    total_reason(&cfg)
                 };
                 nuke_response(ctx, guild_id, executor_id, &reason).await;
                 return;
@@ -429,7 +435,7 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
                 return;
             }
             let target_id = entry.target_id.map(|t| t.get()).unwrap_or(0);
-            if CONFIG.nuke_bot_add_action == "kick" && target_id != 0 {
+            if cfg.kick_added_bots && target_id != 0 {
                 let _ = guild_id
                     .kick_with_reason(&ctx.http, UserId::new(target_id), "Anti-nuke: unauthorized bot add")
                     .await;
@@ -472,7 +478,7 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
                 guild_id,
                 &format!(
                     "<@{executor_id}> added the bot <@{target_id}> - {}\nI also pulled **{}** role{} off <@{executor_id}>: {stripped_list}{unstrippable_note}",
-                    if CONFIG.nuke_bot_add_action == "kick" {
+                    if cfg.kick_added_bots {
                         "I've kicked it back out."
                     } else {
                         "you'll want to review this."
@@ -549,16 +555,21 @@ mod tests {
         format!("u{}", N.fetch_add(1, Ordering::SeqCst))
     }
 
+    fn defaults() -> NukeConfig {
+        crate::state::tunables::nuke(&Default::default(), true)
+    }
+
     fn categories() -> Vec<(&'static str, usize)> {
+        let c = defaults();
         vec![
-            ("chDel", CONFIG.nuke_channel_threshold),
-            ("chCreate", CONFIG.nuke_channel_create_thresh),
-            ("roleDel", CONFIG.nuke_role_threshold),
-            ("roleCreate", CONFIG.nuke_role_create_thresh),
-            ("bans", CONFIG.nuke_ban_threshold),
-            ("kicks", CONFIG.nuke_kick_threshold),
-            ("webhooks", CONFIG.nuke_webhook_threshold),
-            ("emojiDel", CONFIG.nuke_emoji_threshold),
+            ("chDel", c.channel_delete),
+            ("chCreate", c.channel_create),
+            ("roleDel", c.role_delete),
+            ("roleCreate", c.role_create),
+            ("bans", c.ban),
+            ("kicks", c.kick),
+            ("webhooks", c.webhook),
+            ("emojiDel", c.emoji),
         ]
     }
 
@@ -574,13 +585,13 @@ mod tests {
         for i in 0..100 {
             let (key, threshold) = cats[i % cats.len()];
             landed += 1;
-            trip = bump_destructive("g", &user, key, threshold);
+            trip = bump_destructive("g", &user, key, threshold, &defaults());
             if trip.is_some() {
                 break;
             }
         }
         assert!(trip == Some(Trip::Total), "a rotating attack must trip the shared counter");
-        assert_eq!(landed, CONFIG.nuke_total_threshold, "no more actions may land than the shared threshold allows");
+        assert_eq!(landed, defaults().total, "no more actions may land than the shared threshold allows");
     }
 
     /// Hammering one category still trips that category, not the shared one.
@@ -591,13 +602,13 @@ mod tests {
         let mut trip = None;
         for _ in 0..100 {
             landed += 1;
-            trip = bump_destructive("g", &user, "chDel", CONFIG.nuke_channel_threshold);
+            trip = bump_destructive("g", &user, "chDel", defaults().channel_delete, &defaults());
             if trip.is_some() {
                 break;
             }
         }
         assert!(trip.is_some());
-        assert_eq!(landed, CONFIG.nuke_channel_threshold.min(CONFIG.nuke_total_threshold));
+        assert_eq!(landed, defaults().channel_delete.min(defaults().total));
     }
 
     /// The aggregate binds even when a category is effectively unlimited.
@@ -607,12 +618,12 @@ mod tests {
         let mut landed = 0;
         for _ in 0..100 {
             landed += 1;
-            if let Some(trip) = bump_destructive("g", &user, "chDel", usize::MAX) {
+            if let Some(trip) = bump_destructive("g", &user, "chDel", usize::MAX, &defaults()) {
                 assert_eq!(trip, Trip::Total);
                 break;
             }
         }
-        assert_eq!(landed, CONFIG.nuke_total_threshold);
+        assert_eq!(landed, defaults().total);
     }
 
     /// A nuke bot fires in parallel, so many events reach the counter at once.
@@ -632,7 +643,7 @@ mod tests {
                     let trips = std::sync::Arc::clone(&trips);
                     let user = user.clone();
                     std::thread::spawn(move || {
-                        if bump_destructive("g", &user, "chDel", threshold).is_some() {
+                        if bump_destructive("g", &user, "chDel", threshold, &defaults()).is_some() {
                             trips.fetch_add(1, Ordering::SeqCst);
                         }
                     })
@@ -679,14 +690,58 @@ mod tests {
     #[test]
     fn counters_are_scoped_per_guild() {
         let user = fresh_user();
-        for _ in 0..CONFIG.nuke_total_threshold.saturating_sub(1) {
-            assert!(bump_destructive("guild-a", &user, "chDel", 99).is_none());
+        for _ in 0..defaults().total.saturating_sub(1) {
+            assert!(bump_destructive("guild-a", &user, "chDel", 99, &defaults()).is_none());
         }
         // The same user acting in a different guild starts from zero.
         assert!(
-            bump_destructive("guild-b", &user, "chDel", 99).is_none(),
+            bump_destructive("guild-b", &user, "chDel", 99, &defaults()).is_none(),
             "another guild's count must not carry over"
         );
+    }
+
+    /// Guild A trips at 2 channel deletes, guild B at 5. The same user doing
+    /// the same thing in both is judged by each guild's own threshold.
+    #[test]
+    fn each_guild_is_judged_by_its_own_thresholds() {
+        use crate::state::tunables::Tunable;
+        let (a, b) = ("test-an-a", "test-an-b");
+        guild_settings::update(a, |s| {
+            s.thresholds.insert(Tunable::NukeChannelDelete.key().into(), 2);
+            s.thresholds.insert(Tunable::NukeTotal.key().into(), 0);
+        });
+        guild_settings::update(b, |s| {
+            s.thresholds.insert(Tunable::NukeChannelDelete.key().into(), 5);
+            s.thresholds.insert(Tunable::NukeTotal.key().into(), 0);
+        });
+        let (ca, cb) = (guild_settings::nuke(a), guild_settings::nuke(b));
+        let user = fresh_user();
+
+        assert!(bump_destructive(a, &user, "chDel", ca.channel_delete, &ca).is_none());
+        assert!(bump_destructive(b, &user, "chDel", cb.channel_delete, &cb).is_none());
+        assert_eq!(bump_destructive(a, &user, "chDel", ca.channel_delete, &ca), Some(Trip::Category));
+        for _ in 0..3 {
+            assert!(bump_destructive(b, &user, "chDel", cb.channel_delete, &cb).is_none());
+        }
+        assert_eq!(bump_destructive(b, &user, "chDel", cb.channel_delete, &cb), Some(Trip::Category));
+    }
+
+    #[test]
+    fn anti_nuke_can_be_off_in_one_guild_and_on_in_another() {
+        guild_settings::update("test-an-off", |s| s.antinuke_disabled = true);
+        assert!(!guild_settings::nuke("test-an-off").enabled);
+        assert!(guild_settings::nuke("test-an-on").enabled);
+    }
+
+    #[test]
+    fn forgetting_a_guild_drops_only_its_counters() {
+        let user = fresh_user();
+        bump_destructive("test-an-leave", &user, "chDel", 99, &defaults());
+        bump_destructive("test-an-stay", &user, "chDel", 99, &defaults());
+        forget_guild("test-an-leave");
+        let map = nuke_lock();
+        assert!(!map.contains_key(&key("test-an-leave", &user)));
+        assert!(map.contains_key(&key("test-an-stay", &user)));
     }
 
     /// The whitelist fast path is what removes the last round trip in front of

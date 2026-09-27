@@ -7,12 +7,14 @@ pub mod message_store;
 pub mod mod_rates;
 pub mod muted_roles;
 pub mod tickets;
+pub mod tunables;
 pub mod warnings;
 
 /// Run every one-time home-guild seed / backfill, in the same order the JS
 /// bot ran them at module load. Safe to call on every boot: each is guarded.
 pub fn run_migrations() {
     guild_settings::migrate_env_to_home_guild();
+    anti_ping::migrate_env_to_home_guild();
     tickets::migrate_tickets_to_home_guild();
     tickets::migrate_ticket_category();
     tickets::migrate_wasteland_tickets();

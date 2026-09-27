@@ -4,6 +4,8 @@ use serenity::builder::{CreateCommand, CreateCommandOption};
 use serenity::model::application::{CommandOptionType, InteractionContext};
 use serenity::model::channel::ChannelType;
 
+use crate::state::tunables::{Module, Tunable};
+
 const TEXT_LIKE: [ChannelType; 2] = [ChannelType::Text, ChannelType::News];
 
 fn opt(kind: CommandOptionType, name: &str, desc: &str) -> CreateCommandOption {
@@ -19,6 +21,18 @@ fn add_remove(name: &str, desc: &str) -> CreateCommandOption {
     req(CommandOptionType::String, name, desc)
         .add_string_choice("add", "add")
         .add_string_choice("remove", "remove")
+}
+
+/// `/config <module> setting:<choice> [value]`: one subcommand per module so
+/// each choice list stays within Discord's 25.
+fn tunable_sub(name: &str, desc: &str, module: Module) -> CreateCommandOption {
+    let mut setting = req(CommandOptionType::String, "setting", "Which setting");
+    for t in Tunable::ALL.iter().filter(|t| t.module() == module) {
+        setting = setting.add_string_choice(t.label(), t.key());
+    }
+    sub(name, desc)
+        .add_sub_option(setting)
+        .add_sub_option(opt(CommandOptionType::Integer, "value", "New value (0/1 for off/on). Leave out to see the current values"))
 }
 
 /// Mark a command as usable in servers only.
@@ -97,7 +111,24 @@ pub fn all() -> Vec<CreateCommand> {
             .description("Clear all warnings for a member")
             .add_option(req(CommandOptionType::User, "user", "Member to clear")),
 
-        CreateCommand::new("config").description("View Guardian configuration (bot owner only)"),
+        CreateCommand::new("config")
+            .description("This server's protection settings (server owner / bot owner)")
+            .add_option(sub("view", "Show every setting for this server"))
+            .add_option(tunable_sub("antinuke", "Anti-nuke thresholds", Module::AntiNuke))
+            .add_option(tunable_sub("antiraid", "Anti-raid thresholds", Module::AntiRaid))
+            .add_option(tunable_sub("antispam", "Anti-spam thresholds", Module::AntiSpam))
+            .add_option(tunable_sub("moderation", "Mod rate limits and warn escalation", Module::Moderation))
+            .add_option(sub("module", "Turn a protection module on or off for this server")
+                .add_sub_option(
+                    req(CommandOptionType::String, "module", "Which module")
+                        .add_string_choice("anti-nuke", "antinuke")
+                        .add_string_choice("anti-raid", "antiraid")
+                        .add_string_choice("anti-spam", "antispam")
+                        .add_string_choice("anti-ping", "antiping"),
+                )
+                .add_sub_option(req(CommandOptionType::Boolean, "enabled", "On or off")))
+            .add_option(sub("reset", "Put a setting back to the bot-wide default")
+                .add_sub_option(req(CommandOptionType::String, "setting", "Setting key, e.g. nuke.ban, or 'all'"))),
         CreateCommand::new("nuketest").description("Confirm anti-nuke system is active (owner only)"),
         CreateCommand::new("status").description("Bot health: uptime, latency, guild count, memory (bot owner only)"),
         CreateCommand::new("servers").description("DM the bot owner an invite to every server I'm in (owner only)"),
@@ -139,7 +170,17 @@ pub fn all() -> Vec<CreateCommand> {
             .add_option(sub("protectrole", "Add/remove a protected role")
                 .add_sub_option(add_remove("action", "add or remove"))
                 .add_sub_option(req(CommandOptionType::Role, "role", "Role to protect")))
-            .add_option(sub("list", "List protected users and roles")),
+            .add_option(sub("list", "List protected users and roles"))
+            .add_option(sub("exemptchannel", "Add/remove a channel where pings aren't policed")
+                .add_sub_option(add_remove("action", "add or remove"))
+                .add_sub_option(req(CommandOptionType::Channel, "channel", "Channel").channel_types(TEXT_LIKE.into())))
+            .add_option(sub("exemptrole", "Add/remove a role that may ping protected targets")
+                .add_sub_option(add_remove("action", "add or remove"))
+                .add_sub_option(req(CommandOptionType::Role, "role", "Role")))
+            .add_option(sub("cooldown", "Seconds before the same member can be punished again (0 = off)")
+                .add_sub_option(
+                    req(CommandOptionType::Integer, "seconds", "Seconds").min_int_value(0).max_int_value(3600),
+                )),
 
         CreateCommand::new("setup")
             .description("Configure Guardian for this server")

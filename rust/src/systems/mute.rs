@@ -183,49 +183,59 @@ pub async fn unmute_user(ctx: &Context, guild_id: GuildId, user_id: UserId, reas
     muted_roles::remove(&guild_id.to_string(), &user_id.to_string());
 }
 
+/// Whether a timer that was set for a mute should still act on it.
+///
+/// Every mute starts its own timer, and nothing cancels one. A member muted for
+/// ten minutes and then re-muted permanently would otherwise be unmuted by the
+/// first timer. So the timer acts only if the stored mute is still there and
+/// has actually run out.
+fn unmute_due(stash: Option<&MuteStash>, now: i64) -> bool {
+    // A second's slack for the sleep waking a hair early.
+    matches!(stash.and_then(|s| s.expires_at), Some(at) if at <= now + 1000)
+}
+
 /// `setTimeout` in JS silently overflows past ~24.8 days; tokio sleeps take a
 /// real Duration, so a long mute just sleeps the whole span in one task.
 pub fn schedule_unmute(ctx: Context, guild_id: GuildId, user_id: UserId, delay_ms: i64, reason: &'static str) {
     let delay = Duration::from_millis(delay_ms.max(0) as u64);
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        unmute_user(&ctx, guild_id, user_id, reason).await;
+        let stash = muted_roles::get(&guild_id.to_string(), &user_id.to_string());
+        if unmute_due(stash.as_ref(), now_ms()) {
+            unmute_user(&ctx, guild_id, user_id, reason).await;
+        }
     });
 }
 
-/// Boot recovery: re-apply the mute role if it was lost during downtime, then
-/// reschedule or immediately expire each timed mute.
-pub async fn recover_mutes(ctx: &Context) {
-    for (guild_id_str, users) in muted_roles::all() {
-        let Ok(raw) = guild_id_str.parse::<u64>() else { continue };
-        let guild_id = GuildId::new(raw);
-        if ctx.cache.guild(guild_id).is_none() {
-            continue;
-        }
-        let mute_role = gc(&guild_id_str).mute_role_id.parse::<u64>().ok().map(RoleId::new);
+/// Boot recovery for one guild: re-apply the mute role if it was lost during
+/// downtime, then reschedule or immediately expire each timed mute.
+pub async fn recover_mutes(ctx: &Context, guild_id: GuildId) {
+    let gid = guild_id.to_string();
+    let mute_role = gc(&gid).mute_role_id.parse::<u64>().ok().map(RoleId::new);
 
-        for (user_id_str, data) in users {
-            let Ok(uid) = user_id_str.parse::<u64>() else { continue };
-            let user_id = UserId::new(uid);
+    for (user_id_str, data) in muted_roles::for_guild(&gid) {
+        let Ok(uid) = user_id_str.parse::<u64>() else { continue };
+        let user_id = UserId::new(uid);
 
-            if let Some(mr) = mute_role {
-                let still_muted = data.expires_at.map(|e| e > now_ms()).unwrap_or(true);
-                if still_muted {
-                    if let Ok(m) = guild_id.member(&ctx.http, user_id).await {
-                        if !m.roles.contains(&mr) {
-                            let _ = m.add_role(&ctx.http, mr).await;
+        if let Some(mr) = mute_role {
+            let still_muted = data.expires_at.map(|e| e > now_ms()).unwrap_or(true);
+            if still_muted {
+                if let Some(m) = crate::common::guildinfo::fetch_member(ctx, guild_id, user_id).await {
+                    if !m.roles.contains(&mr) {
+                        if let Err(e) = m.add_role(&ctx.http, mr).await {
+                            eprintln!("⚠️ [{guild_id}] couldn't re-apply the mute role to {user_id}: {e}");
                         }
                     }
                 }
             }
+        }
 
-            let Some(expires_at) = data.expires_at else { continue }; // permanent - leave for manual /unmute
-            let remaining = expires_at - now_ms();
-            if remaining <= 0 {
-                unmute_user(ctx, guild_id, user_id, "Auto-unmute (expired during downtime)").await;
-            } else {
-                schedule_unmute(ctx.clone(), guild_id, user_id, remaining, "Auto-unmute (timer, resumed post-restart)");
-            }
+        let Some(expires_at) = data.expires_at else { continue }; // permanent - leave for manual /unmute
+        let remaining = expires_at - now_ms();
+        if remaining <= 0 {
+            unmute_user(ctx, guild_id, user_id, "Auto-unmute (expired during downtime)").await;
+        } else {
+            schedule_unmute(ctx.clone(), guild_id, user_id, remaining, "Auto-unmute (timer, resumed post-restart)");
         }
     }
 }
@@ -308,27 +318,35 @@ pub async fn lift_lockdown_channels(ctx: &Context, guild_id: GuildId, note: &str
     sec_log(ctx, guild_id, "Lockdown Lifted", note, colors::SUCCESS).await;
 }
 
-/// Boot recovery: reschedule / expire raid lockdowns; leave every other kind
-/// active (they have no auto-expiry, same as before a restart).
-pub async fn recover_lockdowns(ctx: &Context) {
-    for (guild_id_str, state) in lockdown::all() {
-        let Ok(raw) = guild_id_str.parse::<u64>() else { continue };
-        let guild_id = GuildId::new(raw);
-        if ctx.cache.guild(guild_id).is_none() {
-            continue;
+/// Lift a timed lockdown when its timer runs out, unless it has since been
+/// lifted or replaced by another one.
+pub fn schedule_lockdown_lift(ctx: Context, guild_id: GuildId, locked_at: i64, delay_ms: i64, note: String) {
+    let delay = Duration::from_millis(delay_ms.max(0) as u64);
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if lockdown::is_same_lock(&guild_id.to_string(), locked_at) {
+            lift_lockdown_channels(&ctx, guild_id, &note).await;
         }
-        let Some(expires_at) = state.expires_at else { continue }; // manual - stays locked
-        let remaining = expires_at - now_ms();
-        if remaining <= 0 {
-            lift_lockdown_channels(ctx, guild_id, "Auto-lifted (timer expired during downtime).").await;
-        } else {
-            let ctx2 = ctx.clone();
-            let delay = Duration::from_millis(remaining as u64);
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                lift_lockdown_channels(&ctx2, guild_id, "Auto-lifted (timer, resumed post-restart).").await;
-            });
-        }
+    });
+}
+
+/// Boot recovery for one guild: reschedule or expire a timed lockdown; leave
+/// every other kind active (they have no auto-expiry, same as before a
+/// restart).
+pub async fn recover_lockdown(ctx: &Context, guild_id: GuildId) {
+    let Some(state) = lockdown::get(&guild_id.to_string()) else { return };
+    let Some(expires_at) = state.expires_at else { return }; // manual - stays locked
+    let remaining = expires_at - now_ms();
+    if remaining <= 0 {
+        lift_lockdown_channels(ctx, guild_id, "Auto-lifted (timer expired during downtime).").await;
+    } else {
+        schedule_lockdown_lift(
+            ctx.clone(),
+            guild_id,
+            state.locked_at,
+            remaining,
+            "Auto-lifted (timer, resumed post-restart).".to_string(),
+        );
     }
 }
 
@@ -628,5 +646,22 @@ mod tests {
         assert!(p.contains(Permissions::SEND_MESSAGES_IN_THREADS));
         assert!(p.contains(Permissions::CREATE_PUBLIC_THREADS));
         assert!(p.contains(Permissions::CREATE_PRIVATE_THREADS));
+    }
+
+    fn stash(expires_at: Option<i64>) -> MuteStash {
+        MuteStash { roles: vec![], reason: String::new(), muted_at: 0, expires_at }
+    }
+
+    /// A timer from an earlier, shorter mute must not lift a later one.
+    #[test]
+    fn an_old_timer_does_not_unmute_a_newer_mute() {
+        let now = 1_000_000;
+        assert!(unmute_due(Some(&stash(Some(now))), now));
+        // Re-muted for longer: the stored expiry moved past this timer.
+        assert!(!unmute_due(Some(&stash(Some(now + 600_000))), now));
+        // Re-muted permanently.
+        assert!(!unmute_due(Some(&stash(None)), now));
+        // Already unmuted by hand.
+        assert!(!unmute_due(None, now));
     }
 }

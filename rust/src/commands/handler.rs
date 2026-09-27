@@ -9,19 +9,20 @@ use serenity::model::application::{CommandInteraction, ResolvedOption, ResolvedV
 use serenity::model::id::{ChannelId, RoleId, UserId};
 use serenity::model::{Permissions, Timestamp};
 
-use crate::common::config::{now_ms, BOT_OWNER_IDS, CONFIG};
+use crate::common::config::{now_ms, BOT_OWNER_IDS};
 use crate::common::embeds::{
     alert_owner, build_bar, colors, embed, format_uptime, limit_denied_embed, render_anti_ping_response, sec_log,
     usage_footer,
 };
-use crate::common::guildinfo::{fetch_member, GuildInfo};
+use crate::common::guildinfo::{channel_in_guild, fetch_member, GuildInfo};
 use crate::common::theme::{self, ModAction, Subject};
 use crate::common::permissions::{can_act_on, is_mod, is_owner, is_whitelisted, try_dm_embed};
 use crate::state::anti_ping::{ap, AntiPing};
 use crate::state::applications::{get_application, get_applications, update_application};
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
-use crate::state::guild_settings::{gc, update as update_guild};
-use crate::state::lockdown::{clear_lockdown, is_lockdown, locked_count, lockdown_reason, record_changes, set_lockdown};
+use crate::state::guild_settings::{self, gc, update as update_guild};
+use crate::state::tunables::{Module, Tunable};
+use crate::state::lockdown::{clear_lockdown, is_lockdown, locked_count, lockdown_reason, record_changes, try_set_lockdown};
 use crate::state::mod_rates::{check_mod_limit, record_mod_action};
 use crate::state::muted_roles::stashed_count;
 use crate::state::tickets::{get_ticket_config, update_ticket_config, TicketType};
@@ -177,10 +178,19 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
     let Some(guild_id) = i.guild_id else {
         return reply_text(ctx, i, "You can only use this in a server.").await;
     };
-    let Some(info) = GuildInfo::from_cache(ctx, guild_id) else { return };
-    let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else { return };
+    // Silence here shows the user "The application did not respond", which says
+    // nothing about why. Both of these clear up on their own within moments.
+    let Some(info) = GuildInfo::from_cache(ctx, guild_id) else {
+        return reply_text(ctx, i, "I'm still loading this server's details. Give it a few seconds and try again.").await;
+    };
+    let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else {
+        return reply_text(ctx, i, "I couldn't look up your membership in this server just now. Please try again.").await;
+    };
     let (group, subcmd, opts) = dissect(i.data.options());
     let gid = guild_id.to_string();
+    let nuke = guild_settings::nuke(&gid);
+    let modcfg = guild_settings::moderation(&gid);
+    let window_hours = modcfg.window_hours();
     let staff = is_mod(&member, info.owner_id);
     let exempt = is_whitelisted(&member, info.owner_id);
     let privileged = is_privileged(i.user.id, info.owner_id);
@@ -212,7 +222,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if !exempt {
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "mute");
                 if !c.allowed {
-                    return reply_embed(ctx, i, limit_denied_embed("mute", c.used, c.limit, c.resets_in_min), true).await;
+                    return reply_embed(ctx, i, limit_denied_embed("mute", c.used, c.limit, c.resets_in_min, window_hours), true).await;
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "mute");
             }
@@ -280,27 +290,25 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return reply_text(ctx, i, &why).await;
             }
             if !exempt {
-                if let Some(trip) = bump_destructive(&gid, &i.user.id.to_string(), "kicks", CONFIG.nuke_kick_threshold) {
+                if let Some(trip) = nuke_trip(&gid, i.user.id, "kicks", nuke.kick, &nuke) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
                     let reason = if trip == Trip::Category {
-                        format!(
-                            "Issued {}+ kicks via commands in {}s",
-                            CONFIG.nuke_kick_threshold,
-                            CONFIG.nuke_window_ms / 1000
-                        )
+                        format!("Issued {}+ kicks via commands in {}s", nuke.kick, nuke.window_ms / 1000)
                     } else {
-                        total_reason()
+                        total_reason(&nuke)
                     };
                     return nuke_response(ctx, guild_id, i.user.id, &reason).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "kick");
                 if !c.allowed {
-                    return reply_embed(ctx, i, limit_denied_embed("kick", c.used, c.limit, c.resets_in_min), true).await;
+                    return reply_embed(ctx, i, limit_denied_embed("kick", c.used, c.limit, c.resets_in_min, window_hours), true).await;
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "kick");
             }
             try_dm_embed(&ctx.http, target_id, theme::dm_notice(ModAction::Kick, &info.name, &reason, None)).await;
-            let _ = guild_id.kick_with_reason(&ctx.http, target_id, &reason).await;
+            if let Err(e) = guild_id.kick_with_reason(&ctx.http, target_id, &reason).await {
+                return reply_text(ctx, i, &format!("Discord wouldn't let me kick them: {e}")).await;
+            }
             sec_log(
                 ctx,
                 guild_id,
@@ -339,27 +347,25 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return reply_text(ctx, i, &why).await;
             }
             if !exempt {
-                if let Some(trip) = bump_destructive(&gid, &i.user.id.to_string(), "bans", CONFIG.nuke_ban_threshold) {
+                if let Some(trip) = nuke_trip(&gid, i.user.id, "bans", nuke.ban, &nuke) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
                     let reason = if trip == Trip::Category {
-                        format!(
-                            "Issued {}+ bans via commands in {}s",
-                            CONFIG.nuke_ban_threshold,
-                            CONFIG.nuke_window_ms / 1000
-                        )
+                        format!("Issued {}+ bans via commands in {}s", nuke.ban, nuke.window_ms / 1000)
                     } else {
-                        total_reason()
+                        total_reason(&nuke)
                     };
                     return nuke_response(ctx, guild_id, i.user.id, &reason).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "ban");
                 if !c.allowed {
-                    return reply_embed(ctx, i, limit_denied_embed("ban", c.used, c.limit, c.resets_in_min), true).await;
+                    return reply_embed(ctx, i, limit_denied_embed("ban", c.used, c.limit, c.resets_in_min, window_hours), true).await;
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "ban");
             }
             try_dm_embed(&ctx.http, target_id, theme::dm_notice(ModAction::Ban, &info.name, &reason, None)).await;
-            let _ = guild_id.ban_with_reason(&ctx.http, target_id, delete_days, &reason).await;
+            if let Err(e) = guild_id.ban_with_reason(&ctx.http, target_id, delete_days, &reason).await {
+                return reply_text(ctx, i, &format!("Discord wouldn't let me ban them: {e}")).await;
+            }
             let c = check_mod_limit(&gid, &i.user.id.to_string(), "ban");
             sec_log(
                 ctx,
@@ -402,7 +408,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if guild_id.bans(&ctx.http, None, None).await.map(|b| !b.iter().any(|x| x.user.id == uid)).unwrap_or(true) {
                 return reply_text(ctx, i, "That user isn't banned.").await;
             }
-            let _ = guild_id.unban(&ctx.http, uid).await;
+            if let Err(e) = guild_id.unban(&ctx.http, uid).await {
+                return reply_text(ctx, i, &format!("Discord wouldn't let me lift that ban: {e}")).await;
+            }
             sec_log(
                 ctx,
                 guild_id,
@@ -436,7 +444,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if !exempt {
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "purge");
                 if !c.allowed {
-                    return reply_embed(ctx, i, limit_denied_embed("purge", c.used, c.limit, c.resets_in_min), true).await;
+                    return reply_embed(ctx, i, limit_denied_embed("purge", c.used, c.limit, c.resets_in_min, window_hours), true).await;
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "purge");
             }
@@ -489,30 +497,37 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
             let lock = opts.str("action").unwrap_or("lock") == "lock";
             let channel_id = opts.channel("channel").unwrap_or(i.channel_id);
+            if !channel_in_guild(ctx, guild_id, channel_id) {
+                return reply_text(ctx, i, "That channel isn't part of this server.").await;
+            }
             if lock && !exempt {
-                if let Some(trip) = bump_destructive(&gid, &i.user.id.to_string(), "chLock", CONFIG.nuke_channel_threshold) {
+                if let Some(trip) = nuke_trip(&gid, i.user.id, "chLock", nuke.channel_delete, &nuke) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
                     let reason = if trip == Trip::Category {
-                        format!(
-                            "Locked {}+ channels via commands in {}s",
-                            CONFIG.nuke_channel_threshold,
-                            CONFIG.nuke_window_ms / 1000
-                        )
+                        format!("Locked {}+ channels via commands in {}s", nuke.channel_delete, nuke.window_ms / 1000)
                     } else {
-                        total_reason()
+                        total_reason(&nuke)
                     };
                     return nuke_response(ctx, guild_id, i.user.id, &reason).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "lockdown");
                 if !c.allowed {
-                    return reply_embed(ctx, i, limit_denied_embed("lockdown", c.used, c.limit, c.resets_in_min), true).await;
+                    return reply_embed(ctx, i, limit_denied_embed("lockdown", c.used, c.limit, c.resets_in_min, window_hours), true).await;
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "lockdown");
             }
-            if let Ok(channels) = guild_id.channels(&ctx.http).await {
-                if let Some(ch) = channels.get(&channel_id) {
-                    set_send_messages(ctx, ch, RoleId::new(guild_id.get()), if lock { Some(false) } else { None }).await;
-                }
+            // One channel, so fetch just that one rather than the whole list.
+            let cached = ctx.cache.guild(guild_id).and_then(|g| g.channels.get(&channel_id).cloned());
+            let channel = match cached {
+                Some(c) => Some(c),
+                None => channel_id.to_channel(&ctx.http).await.ok().and_then(|c| c.guild()),
+            };
+            let changed = match channel {
+                Some(ch) => set_send_messages(ctx, &ch, RoleId::new(guild_id.get()), if lock { Some(false) } else { None }).await,
+                None => false,
+            };
+            if !changed {
+                return reply_text(ctx, i, &format!("I couldn't change the permissions on <#{channel_id}>. Check that I have Manage Channels there.")).await;
             }
             sec_log(
                 ctx,
@@ -565,7 +580,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 )
                 .await;
             }
-            set_lockdown(&gid, "panic", None);
+            if try_set_lockdown(&gid, "panic", None).is_none() {
+                return edit_text(ctx, i, "A lockdown started at the same moment. Run `/panic` again to lift it.").await;
+            }
             let outcome = lock_all_text_channels(ctx, guild_id).await;
             let locked = outcome.locked;
             record_changes(&gid, outcome.changes);
@@ -599,7 +616,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if !exempt {
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "warn");
                 if !c.allowed {
-                    return reply_embed(ctx, i, limit_denied_embed("warn", c.used, c.limit, c.resets_in_min), true).await;
+                    return reply_embed(ctx, i, limit_denied_embed("warn", c.used, c.limit, c.resets_in_min, window_hours), true).await;
                 }
                 record_mod_action(&gid, &i.user.id.to_string(), "warn");
             }
@@ -626,7 +643,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
             // Escalation
             let mut escalation = String::new();
-            if CONFIG.warn_ban_at > 0 && total >= CONFIG.warn_ban_at {
+            if modcfg.warn_ban_at > 0 && total >= modcfg.warn_ban_at {
                 let _ = guild_id
                     .ban_with_reason(&ctx.http, target_id, 0, &format!("Auto-escalation: reached {total} warnings"))
                     .await;
@@ -639,7 +656,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     colors::DANGER,
                 )
                 .await;
-            } else if CONFIG.warn_kick_at > 0 && total >= CONFIG.warn_kick_at {
+            } else if modcfg.warn_kick_at > 0 && total >= modcfg.warn_kick_at {
                 let _ = guild_id
                     .kick_with_reason(&ctx.http, target_id, &format!("Auto-escalation: reached {total} warnings"))
                     .await;
@@ -652,18 +669,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     colors::DANGER,
                 )
                 .await;
-            } else if CONFIG.warn_mute_at > 0 && total >= CONFIG.warn_mute_at {
+            } else if modcfg.warn_mute_at > 0 && total >= modcfg.warn_mute_at {
                 mute_user(
                     ctx,
                     &info,
                     &target,
-                    CONFIG.warn_mute_min,
+                    modcfg.warn_mute_min,
                     &format!("Auto-escalation: reached {total} warnings"),
                 )
                 .await;
                 escalation = format!(
                     "\n🔇 That hit **{total}** warnings, so they've been auto-muted for {} min.",
-                    CONFIG.warn_mute_min
+                    modcfg.warn_mute_min
                 );
             }
 
@@ -717,7 +734,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     .description(format!("<@{target_id}> has **{} warning{}** on record.\n\n{lines}", list.len(), plural(list.len())))
                     .footer(CreateEmbedFooter::new(format!(
                         "Auto-actions kick in at: mute@{} · kick@{} · ban@{}",
-                        CONFIG.warn_mute_at, CONFIG.warn_kick_at, CONFIG.warn_ban_at
+                        modcfg.warn_mute_at, modcfg.warn_kick_at, modcfg.warn_ban_at
                     )))
                     .timestamp(Timestamp::now()),
                 true,
@@ -759,7 +776,6 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if !staff {
                 return reply_text(ctx, i, STAFF_ONLY).await;
             }
-            let window_hours = CONFIG.mod_window_ms / 3_600_000;
             if exempt {
                 return reply_embed(
                     ctx,
@@ -829,6 +845,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             .field("Delete message", if a.delete_message { "Yes" } else { "No" }, true)
                             .field("Ignore replies", if a.ignore_replies { "Yes" } else { "No" }, true)
                             .field("Channel notice", if a.notify_channel { "On" } else { "Off" }, true)
+                            .field("Cooldown", format!("{}s", a.cooldown_sec), true)
                             .field("Response", format!("```{}```", a.response_template), false)
                             .field("Protected users", id_list(&a.protected_users, "<@"), false)
                             .field("Protected roles", id_list(&a.protected_roles, "<@&"), false)
@@ -912,6 +929,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 "protectrole" => {
                     let action = opts.str("action").unwrap_or("add");
                     let Some(role) = opts.role("role") else { return };
+                    if action == "add" && !role_here(&info, role) {
+                        return reply_text(ctx, i, "That role isn't part of this server.").await;
+                    }
                     let id = role.to_string();
                     if action == "add" && a.protected_roles.contains(&id) {
                         return reply_text(ctx, i, &format!("⚠️ <@&{id}> is already protected.")).await;
@@ -934,10 +954,47 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             .title("📡 Anti-Ping - Protected")
                             .field("Users", newline_list(&a.protected_users, "<@"), true)
                             .field("Roles", newline_list(&a.protected_roles, "<@&"), true)
+                            .field("Exempt channels", newline_list(&a.exempt_channels, "<#"), true)
+                            .field("Exempt roles", newline_list(&a.exempt_roles, "<@&"), true)
                             .timestamp(Timestamp::now()),
                         true,
                     )
                     .await;
+                }
+                "exemptchannel" => {
+                    let action = opts.str("action").unwrap_or("add");
+                    let Some(ch) = opts.channel("channel") else { return };
+                    if action == "add" && !channel_in_guild(ctx, guild_id, ch) {
+                        return reply_text(ctx, i, "That channel isn't part of this server.").await;
+                    }
+                    let id = ch.to_string();
+                    let saved = crate::state::anti_ping::update(&gid, |c| {
+                        c.exempt_channels.retain(|x| *x != id);
+                        if action == "add" {
+                            c.exempt_channels.push(id.clone());
+                        }
+                    });
+                    reply_text(ctx, i, &format!("Pings in <#{ch}> {}.{}", if action == "add" { "are no longer policed" } else { "are policed again" }, save_note(saved))).await;
+                }
+                "exemptrole" => {
+                    let action = opts.str("action").unwrap_or("add");
+                    let Some(role) = opts.role("role") else { return };
+                    if action == "add" && !role_here(&info, role) {
+                        return reply_text(ctx, i, "That role isn't part of this server.").await;
+                    }
+                    let id = role.to_string();
+                    let saved = crate::state::anti_ping::update(&gid, |c| {
+                        c.exempt_roles.retain(|x| *x != id);
+                        if action == "add" {
+                            c.exempt_roles.push(id.clone());
+                        }
+                    });
+                    reply_text(ctx, i, &format!("<@&{role}> {} protected targets.{}", if action == "add" { "can now ping" } else { "can no longer ping" }, save_note(saved))).await;
+                }
+                "cooldown" => {
+                    let secs = opts.int("seconds").unwrap_or(10);
+                    let saved = crate::state::anti_ping::update(&gid, |c| c.cooldown_sec = secs);
+                    reply_text(ctx, i, &format!("After a punishment, the same member won't be punished again for **{secs}s**.{}", save_note(saved))).await;
                 }
                 _ => {}
             }
@@ -968,6 +1025,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 }
                 "view" => reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &[]), true).await,
                 "roles" => {
+                    if [opts.role("mod_role"), opts.role("mute_role")].into_iter().flatten().any(|r| !role_here(&info, r)) {
+                        return reply_text(ctx, i, "That role isn't part of this server.").await;
+                    }
                     let mut changes = Vec::new();
                     if let Some(r) = opts.role("mod_role") {
                         update_guild(&gid, |s| s.mod_role_id = r.to_string());
@@ -983,6 +1043,10 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes), true).await;
                 }
                 "channels" => {
+                    let picked = [opts.channel("log_channel"), opts.channel("alert_channel"), opts.channel("msg_log_channel")];
+                    if picked.into_iter().flatten().any(|c| !channel_in_guild(ctx, guild_id, c)) {
+                        return reply_text(ctx, i, "That channel isn't part of this server.").await;
+                    }
                     let mut changes = Vec::new();
                     if let Some(c) = opts.channel("log_channel") {
                         update_guild(&gid, |s| s.log_channel_id = c.to_string());
@@ -1007,6 +1071,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let role = opts.role("role");
                     if user.is_none() && role.is_none() {
                         return reply_text(ctx, i, "Give me a user or a role.").await;
+                    }
+                    if role.is_some_and(|r| !role_here(&info, r)) {
+                        return reply_text(ctx, i, "That role isn't part of this server.").await;
                     }
                     let mut changes = Vec::new();
                     if let Some(u) = user {
@@ -1040,6 +1107,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 "failsafe" => {
                     let action = opts.str("action").unwrap_or("add");
                     let Some(r) = opts.role("role") else { return };
+                    if !role_here(&info, r) {
+                        return reply_text(ctx, i, "That role isn't part of this server.").await;
+                    }
                     let id = r.to_string();
                     update_guild(&gid, |s| {
                         if action == "add" {
@@ -1061,50 +1131,137 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
         // ── /config ────────────────────────────────────────────
         "config" => {
             if !privileged {
-                return reply_text(ctx, i, "Only the bot owner or the server owner can view the config.").await;
+                return reply_text(ctx, i, "Only the bot owner or the server owner can view or change the config.").await;
             }
-            let window_hours = CONFIG.mod_window_ms / 3_600_000;
-            let g = gc(&gid);
-            let a = ap(&gid);
-            let infra = CreateEmbed::new()
-                .color(theme::palette::BLURPLE)
-                .title("⚙️  CONFIGURATION • INFRASTRUCTURE")
-                .field("👑 Owner(s)", BOT_OWNER_IDS.iter().map(|id| format!("<@{id}>")).collect::<Vec<_>>().join(", "), false)
-                .field("📜 Log Channel", opt_channel(&g.log_channel_id), true)
-                .field("🚨 Alert Channel", if g.alert_channel_id.is_empty() { "(uses log)".into() } else { format!("<#{}>", g.alert_channel_id) }, true)
-                .field("💬 Msg Log", opt_channel(&g.msg_log_channel_id), true)
-                .field("🔇 Mute Role", opt_role(&g.mute_role_id), true)
-                .field("🛡️ Mod Role", opt_role(&g.mod_role_id), true)
-                .field("🗃️ Server Logs", format!("{}/{} types", g.log_channels.len(), crate::systems::server_logs::LOG_TYPES.len()), true)
-                .field("🏅 Whitelisted Roles", id_list(&g.nuke_whitelist_role_ids, "<@&"), false)
-                .field("🏅 Whitelisted Users", id_list(&g.nuke_whitelist_user_ids, "<@"), false);
-            let protection = CreateEmbed::new()
-                .color(theme::palette::MAGENTA)
-                .title("🚨  CONFIGURATION • PROTECTION")
-                .field("🧹 Anti-Spam", format!("**{}** msgs / {}ms\nmentions ≥ {} · dupes ≥ {}\ninvites {} → **{} min** mute", CONFIG.spam_threshold, CONFIG.spam_window_ms, CONFIG.spam_mention_limit, CONFIG.spam_duplicate_limit, if CONFIG.spam_block_invites { "blocked" } else { "allowed" }, CONFIG.spam_mute_min), true)
-                .field("🚪 Anti-Raid", format!("**{}** joins / {}ms\n→ **{} min** lockdown\nnew-account kick: {}", CONFIG.raid_join_threshold, CONFIG.raid_window_ms, CONFIG.raid_lockdown_min, if CONFIG.raid_kick_new_on_lock { format!("<{}m", CONFIG.raid_min_account_age_min) } else { "off".into() }), true)
-                .field("📵 Anti-Ping", format!("{}\naction `{}` · {} min\n{} users / {} roles", if a.enabled { "🟢 **On**" } else { "🔴 **Off**" }, a.action, a.timeout_min, a.protected_users.len(), a.protected_roles.len()), true);
-            let nuke = CreateEmbed::new()
-                .color(theme::palette::INFERNO)
-                .title("☢️  CONFIGURATION • ANTI-NUKE")
-                .description(format!("Trips when one person does this much inside **{}ms**.", CONFIG.nuke_window_ms))
-                .field("📁 Channels del / new", format!("≥ **{}** / **{}**", CONFIG.nuke_channel_threshold, CONFIG.nuke_channel_create_thresh), true)
-                .field("🎭 Roles del / new", format!("≥ **{}** / **{}**", CONFIG.nuke_role_threshold, CONFIG.nuke_role_create_thresh), true)
-                .field("🔨 Bans / 👢 Kicks", format!("≥ **{}** / **{}**", CONFIG.nuke_ban_threshold, CONFIG.nuke_kick_threshold), true)
-                .field("🪝 Webhooks", format!("≥ **{}**", CONFIG.nuke_webhook_threshold), true)
-                .field("🤖 Bot added", format!("`{}`", CONFIG.nuke_bot_add_action), true)
-                .field("🧮 Any mix", if CONFIG.nuke_total_threshold > 0 { format!("≥ **{}**", CONFIG.nuke_total_threshold) } else { "off".to_string() }, true);
-            let moderation = CreateEmbed::new()
-                .color(theme::palette::VIOLET)
-                .title("🔨  CONFIGURATION • MODERATION")
-                .field("📈 Warn escalation", format!("mute @ **{}** ({}m) · kick @ **{}** · ban @ **{}**", CONFIG.warn_mute_at, CONFIG.warn_mute_min, CONFIG.warn_kick_at, CONFIG.warn_ban_at), false)
-                .field(format!("⏱️ Limits per {window_hours}h"), format!(
-                    "🔨 Bans **{}** · 👢 Kicks **{}** · 🔇 Mutes **{}**\n⚠️ Warns **{}** · 🗑️ Purges **{}** · 🔒 Lockdowns **{}**\n*Whitelisted members are exempt.*",
-                    CONFIG.mod_ban_limit, CONFIG.mod_kick_limit, CONFIG.mod_mute_limit, CONFIG.mod_warn_limit, CONFIG.mod_purge_limit, CONFIG.mod_lockdown_limit
-                ), false)
-                .footer(theme::footer("Config • thresholds live in .env - edit and restart to change"))
-                .timestamp(Timestamp::now());
-            reply_embeds(ctx, i, vec![infra, protection, nuke, moderation], true).await;
+            let sub = subcmd.as_deref().unwrap_or("view");
+            let module = match sub {
+                "antinuke" => Some(Module::AntiNuke),
+                "antiraid" => Some(Module::AntiRaid),
+                "antispam" => Some(Module::AntiSpam),
+                "moderation" => Some(Module::Moderation),
+                _ => None,
+            };
+            if let Some(module) = module {
+                let Some(t) = opts.str("setting").and_then(Tunable::from_key).filter(|t| t.module() == module) else {
+                    return reply_text(ctx, i, "I don't know that setting.").await;
+                };
+                let Some(value) = opts.int("value") else {
+                    return reply_embed(ctx, i, module_card(&gc(&gid), module), true).await;
+                };
+                let (lo, hi) = t.range();
+                if value < lo || value > hi {
+                    let hint = if t.is_bool() { "0 (off) or 1 (on)".to_string() } else { format!("between {lo} and {hi}") };
+                    return reply_text(ctx, i, &format!("**{}** has to be {hint}.", t.label())).await;
+                }
+                let saved = update_guild(&gid, |s| {
+                    s.thresholds.insert(t.key().to_string(), value);
+                });
+                sec_log(
+                    ctx,
+                    guild_id,
+                    "Configuration Changed",
+                    &format!("<@{}> set **{}** (`{}`) to **{}**.", i.user.id, t.label(), t.key(), t.format(value)),
+                    colors::INFO,
+                )
+                .await;
+                let e = module_card(&gc(&gid), module)
+                    .description(format!("**{}** is now **{}** in this server.{}", t.label(), t.format(value), save_note(saved)));
+                return reply_embed(ctx, i, e, true).await;
+            }
+            match sub {
+                "reset" => {
+                    let raw = opts.str("setting").unwrap_or("").trim().to_lowercase();
+                    let saved = if raw == "all" {
+                        update_guild(&gid, |s| s.thresholds.clear())
+                    } else if let Some(t) = Tunable::from_key(&raw) {
+                        update_guild(&gid, |s| {
+                            s.thresholds.remove(t.key());
+                        })
+                    } else {
+                        return reply_text(ctx, i, "Give me a setting key like `nuke.ban` (see `/config view`), or `all`.").await;
+                    };
+                    reply_text(
+                        ctx,
+                        i,
+                        &format!(
+                            "Back to the bot-wide default{} for `{raw}` in this server.{}",
+                            if raw == "all" { "s" } else { "" },
+                            save_note(saved)
+                        ),
+                    )
+                    .await;
+                }
+                "module" => {
+                    let name = opts.str("module").unwrap_or("");
+                    let Some(enabled) = opts.boolean("enabled") else { return };
+                    let saved = match name {
+                        "antinuke" => update_guild(&gid, |s| s.antinuke_disabled = !enabled),
+                        "antiraid" => update_guild(&gid, |s| s.antiraid_disabled = !enabled),
+                        "antispam" => update_guild(&gid, |s| s.antispam_disabled = !enabled),
+                        "antiping" => crate::state::anti_ping::update(&gid, |c| c.enabled = enabled),
+                        _ => return reply_text(ctx, i, "I don't know that module.").await,
+                    };
+                    // Same rule as `/antiraid disable`: a raid lockdown nobody is
+                    // watching any more is just a locked server.
+                    if name == "antiraid" && !enabled && lockdown_reason(&gid).as_deref() == Some("raid") {
+                        lift_lockdown_channels(
+                            ctx,
+                            guild_id,
+                            &format!("<@{}> turned anti-raid off, so I've reopened the channels it locked.", i.user.id),
+                        )
+                        .await;
+                    }
+                    let state = if enabled { "on" } else { "off" };
+                    sec_log(
+                        ctx,
+                        guild_id,
+                        "Module Toggled",
+                        &format!("<@{}> turned **{name}** {state} for this server.", i.user.id),
+                        if enabled { colors::SUCCESS } else { colors::WARN },
+                    )
+                    .await;
+                    reply_text(ctx, i, &format!("**{name}** is now **{state}** in this server.{}", save_note(saved))).await;
+                }
+                _ => {
+                    let g = gc(&gid);
+                    let a = ap(&gid);
+                    let infra = CreateEmbed::new()
+                        .color(theme::palette::BLURPLE)
+                        .title("⚙️  CONFIGURATION • INFRASTRUCTURE")
+                        .field("👑 Owner(s)", BOT_OWNER_IDS.iter().map(|id| format!("<@{id}>")).collect::<Vec<_>>().join(", "), false)
+                        .field("📜 Log Channel", opt_channel(&g.log_channel_id), true)
+                        .field("🚨 Alert Channel", if g.alert_channel_id.is_empty() { "(uses log)".into() } else { format!("<#{}>", g.alert_channel_id) }, true)
+                        .field("💬 Msg Log", opt_channel(&g.msg_log_channel_id), true)
+                        .field("🔇 Mute Role", opt_role(&g.mute_role_id), true)
+                        .field("🛡️ Mod Role", opt_role(&g.mod_role_id), true)
+                        .field("🗃️ Server Logs", format!("{}/{} types", g.log_channels.len(), crate::systems::server_logs::LOG_TYPES.len()), true)
+                        .field("🏅 Whitelisted Roles", id_list(&g.nuke_whitelist_role_ids, "<@&"), false)
+                        .field("🏅 Whitelisted Users", id_list(&g.nuke_whitelist_user_ids, "<@"), false)
+                        .field(
+                            "📵 Anti-Ping",
+                            format!(
+                                "{} · action `{}` · {} min\n{} users / {} roles protected",
+                                if a.enabled { "🟢 **On**" } else { "🔴 **Off**" },
+                                a.action,
+                                a.timeout_min,
+                                a.protected_users.len(),
+                                a.protected_roles.len()
+                            ),
+                            false,
+                        );
+                    let mut embeds = vec![infra];
+                    for m in [Module::AntiNuke, Module::AntiRaid, Module::AntiSpam, Module::Moderation] {
+                        embeds.push(module_card(&g, m));
+                    }
+                    if let Some(last) = embeds.pop() {
+                        embeds.push(
+                            last.footer(theme::footer("Config • change with /config <module>, reset with /config reset"))
+                                .timestamp(Timestamp::now()),
+                        );
+                    }
+                    reply_embeds(ctx, i, embeds, true).await;
+                }
+            }
         }
 
         // ── /nuketest ──────────────────────────────────────────
@@ -1199,7 +1356,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if !privileged {
                 return reply_text(ctx, i, "Only the bot owner or the server owner can change the raid protection.").await;
             }
-            let off = gc(&gid).antiraid_disabled;
+            let raid = guild_settings::raid(&gid);
+            let off = !raid.enabled;
             match subcmd.as_deref().unwrap_or("status") {
                 "disable" => {
                     if off {
@@ -1260,9 +1418,9 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         i,
                         &format!(
                             "Anti-raid is back on. {} joins inside {} seconds will lock the server down for {} minutes.",
-                            CONFIG.raid_join_threshold,
-                            CONFIG.raid_window_ms / 1000,
-                            CONFIG.raid_lockdown_min
+                            raid.join_threshold,
+                            raid.window_ms / 1000,
+                            raid.lockdown_min
                         ),
                     )
                     .await;
@@ -1276,12 +1434,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         } else {
                             "**On** for this server."
                         })
-                        .field("Trigger", format!("{} joins in {}s", CONFIG.raid_join_threshold, CONFIG.raid_window_ms / 1000), true)
-                        .field("Lockdown length", format!("{} minutes", CONFIG.raid_lockdown_min), true)
+                        .field("Trigger", format!("{} joins in {}s", raid.join_threshold, raid.window_ms / 1000), true)
+                        .field("Lockdown length", format!("{} minutes", raid.lockdown_min), true)
                         .field(
                             "New accounts during a lockdown",
-                            if CONFIG.raid_kick_new_on_lock {
-                                format!("turned away under {} minutes old", CONFIG.raid_min_account_age_min)
+                            if raid.kick_new_accounts {
+                                format!("turned away under {} minutes old", raid.min_account_age_min)
                             } else {
                                 "let through".to_string()
                             },
@@ -1289,7 +1447,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         )
                         .field("Locked down right now", if is_lockdown(&gid) { "yes" } else { "no" }, true)
                         .footer(CreateEmbedFooter::new(
-                            "The trigger and lockdown length come from the .env and apply to every server. On or off is per server.",
+                            "All of these are this server's own. Change them with /config antiraid.",
                         ));
                     reply_embed(ctx, i, e, true).await;
                 }
@@ -1306,11 +1464,10 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             // Creating invites across every server takes well past the three
             // seconds Discord gives an interaction, so defer first.
             defer(ctx, i).await;
-            let result = crate::systems::server_list::dm_server_list(
-                ctx,
-                UserId::new(crate::systems::server_list::REPORT_TO),
-            )
-            .await;
+            // To the owner who asked. It used to go to one hardcoded account,
+            // which meant a deployment with different owners mailed invites to
+            // every one of its servers to somebody else.
+            let result = crate::systems::server_list::dm_server_list(ctx, i.user.id).await;
             edit_text(ctx, i, result).await;
         }
 
@@ -1775,7 +1932,14 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
             match sub {
                 "setroles" => {
-                    let role_ids = extract_ids(opts.str("roles").unwrap_or(""));
+                    // Free text, so every id is checked against this server's
+                    // roles before it is stored.
+                    let (role_ids, foreign): (Vec<String>, Vec<String>) = extract_ids(opts.str("roles").unwrap_or(""))
+                        .into_iter()
+                        .partition(|id| id.parse::<u64>().is_ok_and(|r| role_here(&info, RoleId::new(r))));
+                    if !foreign.is_empty() {
+                        return reply_text(ctx, i, &format!("These aren't roles in this server: {}", foreign.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", "))).await;
+                    }
                     if role_ids.is_empty() {
                         return reply_text(ctx, i, "Give at least one role, mentioned or by ID.").await;
                     }
@@ -1785,7 +1949,14 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 }
                 "setgroup" => {
                     let label = opts.str("label").unwrap_or("").trim().to_string();
-                    let role_ids = extract_ids(opts.str("roles").unwrap_or(""));
+                    // Free text, so every id is checked against this server's
+                    // roles before it is stored.
+                    let (role_ids, foreign): (Vec<String>, Vec<String>) = extract_ids(opts.str("roles").unwrap_or(""))
+                        .into_iter()
+                        .partition(|id| id.parse::<u64>().is_ok_and(|r| role_here(&info, RoleId::new(r))));
+                    if !foreign.is_empty() {
+                        return reply_text(ctx, i, &format!("These aren't roles in this server: {}", foreign.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", "))).await;
+                    }
                     if role_ids.is_empty() {
                         return reply_text(ctx, i, "Give at least one role, mentioned or by ID.").await;
                     }
@@ -1860,13 +2031,63 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /help ──────────────────────────────────────────────
         "help" => {
-            let window_hours = CONFIG.mod_window_ms / 3_600_000;
             let avatar = { Some(ctx.cache.current_user().face()) };
             reply_embeds(ctx, i, theme::help_cards(window_hours, avatar), true).await;
         }
 
         _ => {}
     }
+}
+
+/// Anti-nuke's counters, when anti-nuke is on in this guild.
+fn nuke_trip(
+    gid: &str,
+    user: UserId,
+    key: &str,
+    threshold: usize,
+    cfg: &crate::state::tunables::NukeConfig,
+) -> Option<Trip> {
+    if !cfg.enabled {
+        return None;
+    }
+    bump_destructive(gid, &user.to_string(), key, threshold, cfg)
+}
+
+/// One module's thresholds as this guild sees them, marking which are its own
+/// and which are the bot-wide default.
+fn module_card(g: &crate::state::guild_settings::GuildSettings, module: Module) -> CreateEmbed {
+    let (color, icon, on) = match module {
+        Module::AntiNuke => (theme::palette::INFERNO, "☢️", Some(!g.antinuke_disabled)),
+        Module::AntiRaid => (theme::palette::MAGENTA, "🚪", Some(!g.antiraid_disabled)),
+        Module::AntiSpam => (theme::palette::AMBER, "🧹", Some(!g.antispam_disabled)),
+        Module::Moderation => (theme::palette::VIOLET, "🔨", None),
+    };
+    let lines = Tunable::ALL
+        .iter()
+        .filter(|t| t.module() == module)
+        .map(|t| {
+            let v = crate::state::tunables::resolve(&g.thresholds, *t);
+            let own = if g.thresholds.contains_key(t.key()) { " ✏️" } else { "" };
+            format!("`{}` {} → **{}**{own}", t.key(), t.label(), t.format(v))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let status = match on {
+        Some(true) => "🟢 **On**\n",
+        Some(false) => "🔴 **Off**\n",
+        None => "",
+    };
+    CreateEmbed::new()
+        .color(color)
+        .title(format!("{icon}  CONFIGURATION • {}", module.label().to_uppercase()))
+        .description(format!("{status}{lines}\n-# ✏️ = set for this server; the rest are bot-wide defaults."))
+}
+
+/// Whether a role id belongs to this guild. Slash-command options are
+/// resolved by Discord, but settings are checked here as well before they are
+/// saved, so nothing foreign can end up stored against this server.
+fn role_here(info: &GuildInfo, role: RoleId) -> bool {
+    info.roles.contains_key(&role)
 }
 
 fn opt_channel(id: &str) -> String {

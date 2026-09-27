@@ -375,7 +375,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
             ("/setup logs", "A 🗃️│ channel for every log type"),
             ("/setup view", "Everything that's configured here"),
             ("/setup roles · channels · whitelist · failsafe", "Set individual pieces"),
-            ("/config", "Bot-wide configuration *(owner)*"),
+            ("/config", "This server's thresholds & module switches *(owner)*"),
         ],
     },
     HelpSection {

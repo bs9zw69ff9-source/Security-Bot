@@ -29,7 +29,8 @@ use serenity::model::{Permissions, Timestamp};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::state::guild_settings::{gc, update};
+use crate::common::guildinfo::channel_in_guild;
+use crate::state::guild_settings::{gc, update, with};
 
 const GREEN: u32 = 0x43b581; // created / joined / given / unbanned
 const RED: u32 = 0xf04747; // deleted / left / banned / removed
@@ -608,20 +609,20 @@ pub mod build {
 /// The channel a log type posts to. Deleted/edited messages fall back to the
 /// older single message-log channel (`/setup channels msg_log_channel`).
 pub fn log_channel_for(guild_id: GuildId, key: &str) -> Option<ChannelId> {
-    let g = gc(&guild_id.to_string());
-    let id = match g.log_channels.get(key) {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ if key == "messageDelete" || key == "messageEdit" => g.msg_log_channel_id.clone(),
-        _ => return None,
-    };
-    id.parse::<u64>().ok().filter(|v| *v != 0).map(ChannelId::new)
+    with(&guild_id.to_string(), |g| {
+        let id = match g.log_channels.get(key) {
+            Some(id) if !id.is_empty() => id.as_str(),
+            _ if key == "messageDelete" || key == "messageEdit" => g.msg_log_channel_id.as_str(),
+            _ => return None,
+        };
+        id.parse::<u64>().ok().filter(|v| *v != 0).map(ChannelId::new)
+    })
 }
 
 /// True for any channel the bot logs into, so it never logs its own logs.
 pub fn is_log_channel(guild_id: GuildId, channel_id: ChannelId) -> bool {
-    let g = gc(&guild_id.to_string());
     let id = channel_id.to_string();
-    g.msg_log_channel_id == id || g.log_channels.values().any(|v| *v == id)
+    with(&guild_id.to_string(), |g| g.msg_log_channel_id == id || g.log_channels.values().any(|v| *v == id))
 }
 
 pub fn server_of(ctx: &Context, guild_id: GuildId) -> Server {
@@ -631,11 +632,18 @@ pub fn server_of(ctx: &Context, guild_id: GuildId) -> Server {
     }
 }
 
+/// The channel a log goes to, but only if it is still one of this guild's
+/// channels. A deleted channel, or an id that belongs to some other server,
+/// yields `None` rather than an error per event or a cross-server post.
+pub fn deliverable_log_channel(ctx: &Context, guild_id: GuildId, key: &str) -> Option<ChannelId> {
+    let ch = log_channel_for(guild_id, key)?;
+    channel_in_guild(ctx, guild_id, ch).then_some(ch)
+}
+
 pub async fn send(ctx: &Context, guild_id: GuildId, key: &str, embed: CreateEmbed) {
-    if let Some(ch) = log_channel_for(guild_id, key) {
-        if let Err(e) = ch.send_message(&ctx.http, CreateMessage::new().embed(embed)).await {
-            eprintln!("⚠️ [{guild_id}] couldn't post {key} log to channel {ch}: {e}");
-        }
+    let Some(ch) = deliverable_log_channel(ctx, guild_id, key) else { return };
+    if let Err(e) = ch.send_message(&ctx.http, CreateMessage::new().embed(embed)).await {
+        eprintln!("⚠️ [{guild_id}] couldn't post {key} log to channel {ch}: {e}");
     }
 }
 
@@ -676,7 +684,15 @@ pub async fn on_member_leave(ctx: &Context, guild_id: GuildId, user: &User, memb
 /// A mod move/disconnect only shows up in the audit log as an aggregated entry
 /// (channel + running count, no target), so a voice change is matched to an
 /// entry that is either brand new or whose count just went up.
+///
+/// Keyed by audit entry id, which is globally unique, so guilds can't collide.
+/// Entries older than a minute can't match a fresh voice change any more and
+/// are dropped as new ones come in, so this doesn't grow without end.
 static VOICE_AUDIT_COUNTS: Lazy<Mutex<HashMap<u64, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn prune_voice_audit_counts(counts: &mut HashMap<u64, u64>, now_secs: i64) {
+    counts.retain(|id, _| now_secs - serenity::model::id::AuditLogEntryId::new(*id).created_at().unix_timestamp() < 60);
+}
 
 async fn voice_moderator(ctx: &Context, guild_id: GuildId, action: MemberAction, channel: Option<ChannelId>) -> Option<Who> {
     // The audit entry lands slightly after the gateway event.
@@ -685,10 +701,8 @@ async fn voice_moderator(ctx: &Context, guild_id: GuildId, action: MemberAction,
     let now = Timestamp::now().unix_timestamp();
     let mut executor = None;
     {
-        let mut counts = match VOICE_AUDIT_COUNTS.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
+        let mut counts = VOICE_AUDIT_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        prune_voice_audit_counts(&mut counts, now);
         for entry in &logs.entries {
             let opts = entry.options.as_ref();
             if let Some(ch) = channel {
@@ -715,6 +729,22 @@ pub async fn on_voice_state(ctx: &Context, old: Option<&VoiceState>, new: &Voice
     let Some(guild_id) = new.guild_id else { return };
     let from = old.and_then(|o| o.channel_id);
     let to = new.channel_id;
+
+    // Work out which logs this change could produce before spending any
+    // requests: a guild without voice logs costs nothing, and the audit-log
+    // lookup (a delay plus a request) only runs when its log is configured.
+    let has = |k: &str| log_channel_for(guild_id, k).is_some();
+    let wanted = match (from, to) {
+        (None, Some(_)) => has("voiceJoin"),
+        (Some(_), None) => has("voiceLeave") || has("voiceDisconnect"),
+        (Some(a), Some(b)) if a != b => has("voiceSwitch") || has("voiceMove"),
+        (Some(_), Some(_)) => has("voiceState"),
+        (None, None) => false,
+    };
+    if !wanted {
+        return;
+    }
+
     let user = match new.member.as_ref() {
         Some(m) => Some(Who::from_user(&m.user)),
         None => who(ctx, new.user_id).await,
@@ -725,7 +755,11 @@ pub async fn on_voice_state(ctx: &Context, old: Option<&VoiceState>, new: &Voice
     match (from, to) {
         (None, Some(to)) => send(ctx, guild_id, "voiceJoin", build::voice_join(&s, &user, to.get())).await,
         (Some(from), None) => {
-            let m = voice_moderator(ctx, guild_id, MemberAction::MemberDisconnect, None).await;
+            let m = if has("voiceDisconnect") {
+                voice_moderator(ctx, guild_id, MemberAction::MemberDisconnect, None).await
+            } else {
+                None
+            };
             match m {
                 Some(m) if m.id != user.id => {
                     send(ctx, guild_id, "voiceDisconnect", build::voice_disconnect(&s, &user, Some(&m), from.get())).await
@@ -734,7 +768,11 @@ pub async fn on_voice_state(ctx: &Context, old: Option<&VoiceState>, new: &Voice
             }
         }
         (Some(from), Some(to)) if from != to => {
-            let m = voice_moderator(ctx, guild_id, MemberAction::MemberMove, Some(to)).await;
+            let m = if has("voiceMove") {
+                voice_moderator(ctx, guild_id, MemberAction::MemberMove, Some(to)).await
+            } else {
+                None
+            };
             match m {
                 Some(m) if m.id != user.id => {
                     send(ctx, guild_id, "voiceMove", build::voice_move(&s, &user, Some(&m), from.get(), to.get())).await
@@ -985,8 +1023,20 @@ pub async fn setup_log_channels(ctx: &Context, guild_id: GuildId, mod_role: Opti
     }
 
     // Fetched over HTTP rather than read from cache so a re-run always sees
-    // channels created moments ago.
-    let existing = guild_id.channels(&ctx.http).await.unwrap_or_default();
+    // channels created moments ago. Without the list every channel would look
+    // missing and get created again, so a failed fetch stops here.
+    let existing = match guild_id.channels(&ctx.http).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("⚠️ [{guild_id}] /setup logs couldn't read the channel list: {e}");
+            return LogSetupResult {
+                created: 0,
+                reused: 0,
+                failed: LOG_TYPES.iter().map(log_channel_name).collect(),
+                category: None,
+            };
+        }
+    };
 
     let category = match existing.values().find(|c| c.kind == ChannelType::Category && c.name.eq_ignore_ascii_case("logs")) {
         Some(c) => Some((c.id, c.name.clone())),
@@ -1200,5 +1250,49 @@ mod tests {
         assert_eq!(f[0].1, "**Old:** a\n**New:** b");
         assert_eq!(f[1].0, "Slowmode");
         assert_eq!(f[1].1, "**Old:** Off\n**New:** 10s");
+    }
+
+    /// Two guilds with log channels of their own: each routes to its own, and
+    /// neither ever sees the other's.
+    #[test]
+    fn log_routing_is_per_guild() {
+        let (a, b) = (GuildId::new(6_000_001), GuildId::new(6_000_002));
+        update(&a.to_string(), |s| {
+            s.log_channels.insert("memberBan".into(), "111".into());
+        });
+        update(&b.to_string(), |s| {
+            s.log_channels.insert("memberBan".into(), "222".into());
+            s.msg_log_channel_id = "333".into();
+        });
+        assert_eq!(log_channel_for(a, "memberBan"), Some(ChannelId::new(111)));
+        assert_eq!(log_channel_for(b, "memberBan"), Some(ChannelId::new(222)));
+        assert_eq!(log_channel_for(a, "messageDelete"), None);
+        assert_eq!(log_channel_for(b, "messageDelete"), Some(ChannelId::new(333)));
+        assert!(is_log_channel(b, ChannelId::new(222)));
+        assert!(!is_log_channel(a, ChannelId::new(222)));
+    }
+
+    #[test]
+    fn a_blank_or_garbage_log_channel_is_treated_as_unset() {
+        let g = GuildId::new(6_000_003);
+        update(&g.to_string(), |s| {
+            s.log_channels.insert("memberBan".into(), "".into());
+            s.log_channels.insert("memberKick".into(), "not-a-number".into());
+            s.log_channels.insert("memberJoin".into(), "0".into());
+        });
+        assert_eq!(log_channel_for(g, "memberBan"), None);
+        assert_eq!(log_channel_for(g, "memberKick"), None);
+        assert_eq!(log_channel_for(g, "memberJoin"), None);
+    }
+
+    #[test]
+    fn old_voice_audit_counts_are_dropped() {
+        let now = Timestamp::now().unix_timestamp();
+        let fresh = serenity::model::id::AuditLogEntryId::new(((now * 1000 - 1_420_070_400_000) as u64) << 22).get();
+        let stale = serenity::model::id::AuditLogEntryId::new((((now - 600) * 1000 - 1_420_070_400_000) as u64) << 22).get();
+        let mut counts = HashMap::from([(fresh, 1), (stale, 1)]);
+        prune_voice_audit_counts(&mut counts, now);
+        assert!(counts.contains_key(&fresh));
+        assert!(!counts.contains_key(&stale));
     }
 }

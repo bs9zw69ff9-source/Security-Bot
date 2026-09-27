@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use crate::common::config::{now_ms, root_file, CONFIG};
 use crate::common::db;
 use crate::common::embeds::{alert_owner, colors};
+use crate::common::guildinfo::all_members;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,8 +114,24 @@ fn kind_from_num(n: u8) -> ChannelType {
 pub async fn snapshot_guild(ctx: &Context, guild_id: GuildId) -> Option<(usize, usize)> {
     // A complete member list is required for accurate role membership; large
     // guilds don't get one from the gateway by default.
-    let members = guild_id.members(&ctx.http, None, None).await.unwrap_or_default();
-    let channels = guild_id.channels(&ctx.http).await.unwrap_or_default();
+    //
+    // A failed fetch skips the snapshot rather than saving what it has. A
+    // snapshot with no channels or no members in it is what a rollback would
+    // then restore to, deleting every channel or stripping every role.
+    let members = match all_members(ctx, guild_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("⚠️ [{guild_id}] snapshot skipped, couldn't read the member list: {e}");
+            return None;
+        }
+    };
+    let channels = match guild_id.channels(&ctx.http).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("⚠️ [{guild_id}] snapshot skipped, couldn't read the channel list: {e}");
+            return None;
+        }
+    };
     let (guild_name, roles_map) = {
         let g = ctx.cache.guild(guild_id)?;
         (g.name.to_string(), g.roles.clone())
@@ -189,8 +206,17 @@ pub async fn rollback_guild(ctx: &Context, guild_id: GuildId, msg: &Message) {
         return;
     };
 
-    let members = guild_id.members(&ctx.http, None, None).await.unwrap_or_default();
-    let live_channels = guild_id.channels(&ctx.http).await.unwrap_or_default();
+    // Rollback deletes whatever isn't in the snapshot and syncs role
+    // membership both ways, so it needs complete lists or nothing at all.
+    let (members, live_channels) = match (all_members(ctx, guild_id).await, guild_id.channels(&ctx.http).await) {
+        (Ok(m), Ok(c)) => (m, c),
+        (Err(e), _) | (_, Err(e)) => {
+            let _ = msg
+                .reply(&ctx.http, format!("⚠️ I couldn't read the server's current state ({e}), so I haven't touched anything."))
+                .await;
+            return;
+        }
+    };
     let live_roles = match ctx.cache.guild(guild_id) {
         Some(g) => g.roles.clone(),
         None => return,
