@@ -25,6 +25,13 @@ pub fn on_message(ctx: &Context, msg: &Message) {
     message_store::store(&StoredMessage::from_message(msg, guild_id.get()));
 }
 
+/// A log that doesn't arrive should say why in the bot's output, not vanish.
+fn report<T>(guild_id: GuildId, key: &str, ch: ChannelId, r: serenity::Result<T>) {
+    if let Err(e) = r {
+        eprintln!("⚠️ [{guild_id}] couldn't post {key} log to channel {ch}: {e}");
+    }
+}
+
 fn who_of(m: &StoredMessage) -> Who {
     Who { id: m.author_id, tag: m.author_tag.clone(), avatar: m.author_avatar.clone() }
 }
@@ -97,7 +104,7 @@ pub async fn on_message_delete(ctx: &Context, channel_id: ChannelId, message_id:
     for f in files {
         payload = payload.add_file(f);
     }
-    let _ = log_ch.send_message(&ctx.http, payload).await;
+    report(guild_id, "messageDelete", log_ch, log_ch.send_message(&ctx.http, payload).await);
 }
 
 /// Fetch an attachment's bytes. Discord pulls the file some time after the
@@ -139,7 +146,7 @@ pub async fn on_message_delete_bulk(
 
     let more = if cached.len() > 15 { format!("\n…and {} more stored", cached.len() - 15) } else { String::new() };
     let e = build::message_bulk_delete(&server_of(ctx, guild_id), channel_id.get(), ids.len(), &format!("{lines}{more}"));
-    let _ = log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await;
+    report(guild_id, "messageEdit", log_ch, log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await);
 }
 
 pub async fn on_message_update(ctx: &Context, old: Option<&Message>, new: Option<&Message>, event: &MessageUpdateEvent) {
@@ -176,5 +183,5 @@ pub async fn on_message_update(ctx: &Context, old: Option<&Message>, new: Option
     let before = before.unwrap_or_else(|| "_not stored (sent before logging was set up)_".to_string());
     let url = format!("https://discord.com/channels/{}/{}/{}", guild_id, channel_id, event.id);
     let e = build::message_edit(&server_of(ctx, guild_id), &author, channel_id.get(), &url, &before, &after);
-    let _ = log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await;
+    report(guild_id, "messageEdit", log_ch, log_ch.send_message(&ctx.http, CreateMessage::new().embed(e)).await);
 }

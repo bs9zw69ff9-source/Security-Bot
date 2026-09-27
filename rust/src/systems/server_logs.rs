@@ -633,7 +633,9 @@ pub fn server_of(ctx: &Context, guild_id: GuildId) -> Server {
 
 pub async fn send(ctx: &Context, guild_id: GuildId, key: &str, embed: CreateEmbed) {
     if let Some(ch) = log_channel_for(guild_id, key) {
-        let _ = ch.send_message(&ctx.http, CreateMessage::new().embed(embed)).await;
+        if let Err(e) = ch.send_message(&ctx.http, CreateMessage::new().embed(embed)).await {
+            eprintln!("⚠️ [{guild_id}] couldn't post {key} log to channel {ch}: {e}");
+        }
     }
 }
 
