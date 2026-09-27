@@ -407,6 +407,7 @@ dependencies = [
  "indexmap",
  "once_cell",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

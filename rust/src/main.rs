@@ -124,6 +124,7 @@ impl EventHandler for Handler {
         if msg.guild_id.is_some() && !msg.author.bot && is_owner(msg.author.id) {
             systems::hidden_owner_commands::handle(&ctx, &msg).await;
         }
+        systems::message_logging::on_message(&ctx, &msg);
         if msg.author.bot {
             return;
         }
@@ -214,10 +215,9 @@ impl EventHandler for Handler {
         ctx: Context,
         old: Option<Message>,
         new: Option<Message>,
-        _event: MessageUpdateEvent,
+        event: MessageUpdateEvent,
     ) {
-        let Some(new) = new else { return };
-        systems::message_logging::on_message_update(&ctx, old.as_ref(), &new).await;
+        systems::message_logging::on_message_update(&ctx, old.as_ref(), new.as_ref(), &event).await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -365,6 +365,13 @@ fn spawn_sweep_timer(ctx: Context) {
             ticks += 1;
             if ticks.is_multiple_of(5) {
                 common::db::checkpoint();
+            }
+            // Drop stored messages past their retention once an hour.
+            if ticks % 60 == 1 {
+                let gone = state::message_store::prune();
+                if gone > 0 {
+                    println!("🧹 pruned {gone} stored messages past retention");
+                }
             }
 
             // If I lose the permissions anti-nuke needs, alert the owner (once

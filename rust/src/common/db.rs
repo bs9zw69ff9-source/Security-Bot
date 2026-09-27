@@ -46,6 +46,7 @@ static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
         ))
         .unwrap_or_else(|e| panic!("failed to create table {t}: {e}"));
     }
+    crate::state::message_store::create_schema(&conn).unwrap_or_else(|e| panic!("failed to create message_store: {e}"));
     Mutex::new(conn)
 });
 
@@ -96,6 +97,16 @@ pub fn checkpoint() {
     if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
         eprintln!("⚠️ couldn't fold the write-ahead log back into the database: {e}");
     }
+}
+
+/// Run something against the connection directly, for the tables that aren't
+/// one JSON blob per guild (the message store).
+pub fn with_conn<R>(f: impl FnOnce(&Connection) -> R) -> R {
+    let conn = match DB.lock() {
+        Ok(c) => c,
+        Err(e) => e.into_inner(),
+    };
+    f(&conn)
 }
 
 pub fn load_all<T: DeserializeOwned>(table: &str) -> HashMap<String, T> {

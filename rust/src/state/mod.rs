@@ -3,6 +3,7 @@ pub mod applications;
 pub mod chain_of_command;
 pub mod guild_settings;
 pub mod lockdown;
+pub mod message_store;
 pub mod mod_rates;
 pub mod muted_roles;
 pub mod tickets;
