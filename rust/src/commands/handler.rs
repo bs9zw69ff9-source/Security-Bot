@@ -6,7 +6,7 @@ use serenity::builder::{
 };
 use serenity::client::Context;
 use serenity::model::application::{CommandInteraction, ResolvedOption, ResolvedValue};
-use serenity::model::id::{ChannelId, RoleId, UserId};
+use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use serenity::model::{Permissions, Timestamp};
 
 use crate::common::config::{now_ms, BOT_OWNER_IDS};
@@ -27,7 +27,7 @@ use crate::state::mod_rates::{check_mod_limit, record_mod_action};
 use crate::state::muted_roles::stashed_count;
 use crate::state::tickets::{get_ticket_config, update_ticket_config, TicketType};
 use crate::state::warnings::{add_warning, clear_warnings, get_warnings};
-use crate::systems::anti_nuke::{bump_destructive, nuke_response, total_reason, Trip};
+use crate::systems::anti_nuke::{bump_destructive, event_time, nuke_response, total_reason, Trip, Tripped};
 use crate::systems::applications::{apps_by_panel_channel, refresh_app_panel, render_channel_panel};
 use crate::systems::chain_of_command::render_chain_of_command;
 use crate::systems::mute::{
@@ -293,14 +293,14 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return reply_text(ctx, i, &why).await;
             }
             if !exempt {
-                if let Some(trip) = nuke_trip(&gid, i.user.id, "kicks", nuke.kick, &nuke) {
+                if let Some(tripped) = nuke_trip(guild_id, i, "kicks", nuke.kick, &nuke) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
-                    let reason = if trip == Trip::Category {
+                    let reason = if tripped.trip == Trip::Category {
                         format!("Issued {}+ kicks via commands in {}s", nuke.kick, nuke.window_ms / 1000)
                     } else {
                         total_reason(&nuke)
                     };
-                    return nuke_response(ctx, guild_id, i.user.id, &reason).await;
+                    return nuke_response(ctx, guild_id, i.user.id, &reason, tripped).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "kick");
                 if !c.allowed {
@@ -350,14 +350,14 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return reply_text(ctx, i, &why).await;
             }
             if !exempt {
-                if let Some(trip) = nuke_trip(&gid, i.user.id, "bans", nuke.ban, &nuke) {
+                if let Some(tripped) = nuke_trip(guild_id, i, "bans", nuke.ban, &nuke) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
-                    let reason = if trip == Trip::Category {
+                    let reason = if tripped.trip == Trip::Category {
                         format!("Issued {}+ bans via commands in {}s", nuke.ban, nuke.window_ms / 1000)
                     } else {
                         total_reason(&nuke)
                     };
-                    return nuke_response(ctx, guild_id, i.user.id, &reason).await;
+                    return nuke_response(ctx, guild_id, i.user.id, &reason, tripped).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "ban");
                 if !c.allowed {
@@ -504,14 +504,14 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return reply_text(ctx, i, "That channel isn't part of this server.").await;
             }
             if lock && !exempt {
-                if let Some(trip) = nuke_trip(&gid, i.user.id, "chLock", nuke.channel_delete, &nuke) {
+                if let Some(tripped) = nuke_trip(guild_id, i, "chLock", nuke.channel_delete, &nuke) {
                     reply_text(ctx, i, "Hold on - that just tripped the anti-nuke protection.").await;
-                    let reason = if trip == Trip::Category {
+                    let reason = if tripped.trip == Trip::Category {
                         format!("Locked {}+ channels via commands in {}s", nuke.channel_delete, nuke.window_ms / 1000)
                     } else {
                         total_reason(&nuke)
                     };
-                    return nuke_response(ctx, guild_id, i.user.id, &reason).await;
+                    return nuke_response(ctx, guild_id, i.user.id, &reason, tripped).await;
                 }
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "lockdown");
                 if !c.allowed {
@@ -2044,16 +2044,16 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
 /// Anti-nuke's counters, when anti-nuke is on in this guild.
 fn nuke_trip(
-    gid: &str,
-    user: UserId,
-    key: &str,
+    guild_id: GuildId,
+    i: &CommandInteraction,
+    key: &'static str,
     threshold: usize,
     cfg: &crate::state::tunables::NukeConfig,
-) -> Option<Trip> {
+) -> Option<Tripped> {
     if !cfg.enabled {
         return None;
     }
-    bump_destructive(gid, &user.to_string(), key, threshold, cfg)
+    bump_destructive(guild_id, i.user.id, key, threshold, cfg, event_time(i.id.get()))
 }
 
 /// One module's thresholds as this guild sees them, marking which are its own

@@ -332,7 +332,7 @@ fn forget_guild(guild_id: GuildId) {
     systems::anti_spam::forget_guild(guild_id);
     systems::anti_raid::forget_guild(guild_id);
     systems::anti_ping::forget_guild(guild_id);
-    systems::anti_nuke::forget_guild(&guild_id.to_string());
+    systems::anti_nuke::forget_guild(guild_id);
 }
 
 fn missing_core_permissions(perms: Permissions) -> Vec<&'static str> {
