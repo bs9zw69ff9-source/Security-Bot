@@ -1,9 +1,9 @@
 //! `/backup`: Xenon-style server backups. Server owner and bot owners only.
 //!
 //! A backup belongs to the user who took it and can be loaded into any server
-//! that user owns, so it doubles as a way to clone a server. Loading edits
-//! same-named roles and channels in place, creates what's missing and, if asked,
-//! deletes what isn't in the backup.
+//! that user owns, so it doubles as a way to clone a server. Every part a load
+//! is asked to restore is rebuilt from scratch: what's there is deleted and
+//! the backup's version created, rather than matched up and edited.
 
 use once_cell::sync::Lazy;
 use serenity::builder::{
@@ -134,23 +134,6 @@ fn replay_body(m: &BMessage) -> String {
     }
     body
 }
-
-/// What identifies a message across a replay: its original second and the
-/// start of its text. A replayed copy carries the original second in its
-/// date line, so an original and its copy get the same key.
-fn message_key(m: &BMessage) -> (i64, String) {
-    let replayed = m.content.rfind("\n-# <t:").and_then(|at| {
-        let stamp = &m.content[at + "\n-# <t:".len()..];
-        let secs = stamp.split(':').next()?.parse::<i64>().ok()?;
-        Some((secs, m.content[..at].to_string()))
-    });
-    let (secs, body) = replayed.unwrap_or_else(|| (m.at, replay_body(m)));
-    (secs, body.chars().take(30).collect())
-}
-
-/// How far back to look for messages that are already there. Wider than
-/// what's saved, so chat since the backup doesn't hide the originals.
-const DEDUPE_DEPTH: usize = 1000;
 
 /// Read a server into a backup. Channels are required; bans and role
 /// assignments are best-effort and reported as warnings when they can't be read.
@@ -354,6 +337,7 @@ struct Loader<'a> {
     guild_id: GuildId,
     cancel: Arc<AtomicBool>,
     lines: Vec<String>,
+    report_channel_gone: bool,
 }
 
 impl Loader<'_> {
@@ -487,9 +471,19 @@ async fn restore_bans(env: &Env<'_>, b: &Backup) -> String {
 }
 
 async fn restore_emojis(env: &Env<'_>, b: &Backup) -> String {
-    let existing: HashSet<String> =
-        env.ctx.cache.guild(env.gid).map(|g| g.emojis.values().map(|e| e.name.clone()).collect()).unwrap_or_default();
-    let done = par(b.emojis.iter().filter(|e| !existing.contains(&e.name)), 6, |e| async move {
+    // Whatever is there goes first, so the backup's set comes back as-is.
+    let existing: Vec<serenity::model::id::EmojiId> = env
+        .ctx
+        .cache
+        .guild(env.gid)
+        .map(|g| g.emojis.values().filter(|e| !e.managed).map(|e| e.id).collect())
+        .unwrap_or_default();
+    let removed = par(existing, 6, |id| async move {
+        !env.cancelled() && env.gid.delete_emoji(&env.ctx.http, id).await.is_ok()
+    })
+    .await;
+    let removed = removed.iter().filter(|ok| **ok).count();
+    let done = par(&b.emojis, 6, |e| async move {
         if env.cancelled() {
             return true;
         }
@@ -500,7 +494,7 @@ async fn restore_emojis(env: &Env<'_>, b: &Backup) -> String {
     })
     .await;
     let made = done.iter().filter(|ok| **ok).count();
-    format!("✅ **Emojis:** {made} added{}", failed_note(done.len() - made, "failed"))
+    format!("✅ **Emojis:** {removed} removed, {made} added{}", failed_note(done.len() - made, "failed"))
 }
 
 enum Restored<T> {
@@ -633,7 +627,7 @@ async fn restore_channels(
     b: &Backup,
     reuse: &HashMap<String, ChannelId>,
     role_map: &HashMap<String, RoleId>,
-) -> (HashMap<String, ChannelId>, HashSet<ChannelId>, Tally) {
+) -> (HashMap<String, ChannelId>, Tally) {
     let everyone_src = &b.guild_id;
     let remap = |ows: &[BOverwrite]| -> Vec<PermissionOverwrite> {
         ows.iter()
@@ -652,7 +646,6 @@ async fn restore_channels(
     };
 
     let mut map = reuse.clone();
-    let mut created = HashSet::new();
     let mut t = Tally::default();
     let (cats, rest): (Vec<&BChannel>, Vec<&BChannel>) = b.channels.iter().partition(|c| c.kind == 4);
     for group in [cats, rest] {
@@ -668,7 +661,6 @@ async fn restore_channels(
                 Restored::Edited(_) => t.edited += 1,
                 Restored::Created(live) => {
                     t.created += 1;
-                    created.insert(live);
                     map.insert(id.clone(), live);
                 }
                 Restored::Failed => t.failed += 1,
@@ -695,7 +687,7 @@ async fn restore_channels(
     if !layout.is_empty() && !env.cancelled() {
         patch_positions(env, Route::GuildChannels { guild_id: env.gid }, serde_json::Value::Array(layout)).await;
     }
-    (map, created, t)
+    (map, t)
 }
 
 async fn restore_settings(env: &Env<'_>, b: &Backup, chan_map: &HashMap<String, ChannelId>) -> String {
@@ -735,30 +727,15 @@ async fn restore_settings(env: &Env<'_>, b: &Backup, chan_map: &HashMap<String, 
     }
 }
 
-/// Replay one channel's messages in order, through its own webhook.
-async fn replay_channel(env: &Env<'_>, c: &BChannel, channel: ChannelId, fresh: bool) -> (usize, usize, usize) {
+/// Replay every one of a channel's saved messages in order, through its own
+/// webhook, whatever the channel already holds.
+async fn replay_channel(env: &Env<'_>, c: &BChannel, channel: ChannelId) -> (usize, usize) {
     let (ctx, mut sent, mut failed) = (env.ctx, 0usize, 0usize);
-    // A channel that already existed may still hold some or all of these,
-    // originals or copies from an earlier load. Only the missing ones are
-    // posted, so loading twice never doubles them.
-    let present: HashSet<(i64, String)> = if fresh {
-        HashSet::new()
-    } else {
-        match recent_messages(ctx, channel, DEDUPE_DEPTH).await {
-            Ok(ms) => ms.iter().map(message_key).collect(),
-            Err(_) => return (0, c.messages.len(), 0),
-        }
-    };
-    let missing: Vec<&BMessage> = c.messages.iter().filter(|m| !present.contains(&message_key(m))).collect();
-    let kept = c.messages.len() - missing.len();
-    if missing.is_empty() {
-        return (0, 0, kept);
-    }
     let hook = match channel.create_webhook(&ctx.http, CreateWebhook::new("Backup restore")).await {
         Ok(h) => h,
-        Err(_) => return (0, c.messages.len(), kept),
+        Err(_) => return (0, c.messages.len()),
     };
-    for m in missing {
+    for m in &c.messages {
         if env.cancelled() {
             break;
         }
@@ -781,14 +758,13 @@ async fn replay_channel(env: &Env<'_>, c: &BChannel, channel: ChannelId, fresh: 
         }
     }
     let _ = hook.delete(&ctx.http).await;
-    (sent, failed, kept)
+    (sent, failed)
 }
 
 async fn replay_messages(
     env: &Env<'_>,
     b: &Backup,
     chan_map: &HashMap<String, ChannelId>,
-    created: &HashSet<ChannelId>,
 ) -> String {
     let targets: Vec<(&BChannel, ChannelId)> = b
         .channels
@@ -796,10 +772,10 @@ async fn replay_messages(
         .filter(|c| !c.messages.is_empty())
         .filter_map(|c| chan_map.get(&c.id).map(|id| (c, *id)))
         .collect();
-    let results = par(&targets, REPLAYS, |(c, channel)| replay_channel(env, c, *channel, created.contains(channel))).await;
-    let (sent, failed, kept) = results.iter().fold((0, 0, 0), |a, r| (a.0 + r.0, a.1 + r.1, a.2 + r.2));
+    let results = par(&targets, REPLAYS, |(c, channel)| replay_channel(env, c, *channel)).await;
+    let (sent, failed) = results.iter().fold((0, 0), |a, r| (a.0 + r.0, a.1 + r.1));
     format!(
-        "✅ **Messages:** {sent} replayed across {} channel(s), {kept} skipped as already there{}",
+        "✅ **Messages:** {sent} replayed across {} channel(s){}",
         targets.len(),
         failed_note(failed, "failed")
     )
@@ -954,12 +930,10 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     let reuse_channels: HashMap<String, ChannelId> =
         plan.reuse_channels.iter().map(|(k, v)| (k.clone(), ChannelId::new(*v))).collect();
     let mut chan_map = reuse_channels.clone();
-    let mut created_channels = HashSet::new();
     if o.channels {
         l.progress("Restoring channels").await;
-        let (map, created, t) = restore_channels(&env, b, &reuse_channels, &role_map).await;
+        let (map, t) = restore_channels(&env, b, &reuse_channels, &role_map).await;
         chan_map = map;
-        created_channels = created;
         chan_tally.created = t.created;
         chan_tally.edited = t.edited;
         chan_tally.failed += t.failed;
@@ -988,7 +962,7 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     l.progress("Restoring settings, messages and members").await;
     let (settings, messages, members) = tokio::join!(
         async { if o.settings { Some(restore_settings(&env, b, &chan_map).await) } else { None } },
-        async { if o.messages { Some(replay_messages(&env, b, &chan_map, &created_channels).await) } else { None } },
+        async { if o.messages { Some(replay_messages(&env, b, &chan_map).await) } else { None } },
         async {
             match (&live, o.members) {
                 (Some(live), true) => Some(restore_members(&env, b, live, &role_map).await),
@@ -1005,9 +979,35 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
 
     if let (Some(live), true) = (&live, o.dm_invite) {
         l.progress("Inviting members back").await;
-        let line = invite_members(&env, b, live, &banned_now, l.i.channel_id).await;
-        l.lines.push(line);
+        // The channel this was run from goes in a channel rebuild, so the
+        // invite points at a restored one.
+        let channel = if o.channels { invite_channel(b, &chan_map) } else { Some(l.i.channel_id) };
+        match channel {
+            Some(channel) => {
+                let line = invite_members(&env, b, live, &banned_now, channel).await;
+                l.lines.push(line);
+            }
+            None => l.lines.push("⚠️ **Invites:** not sent, no restored text channel to invite into".to_string()),
+        }
     }
+
+    // A channel rebuild keeps nothing that was there before, including the
+    // channel this load was started from. It goes last so progress stays
+    // visible until the end; the report then comes by DM.
+    if o.channels && !l.cancelled() && !chan_map.values().any(|c| *c == l.i.channel_id) {
+        l.report_channel_gone = l.i.channel_id.delete(&env.ctx.http).await.is_ok();
+    }
+}
+
+/// Where invites point: the restored system channel, else the first restored
+/// text channel.
+fn invite_channel(b: &Backup, chan_map: &HashMap<String, ChannelId>) -> Option<ChannelId> {
+    b.settings
+        .system_channel
+        .as_ref()
+        .and_then(|c| chan_map.get(c))
+        .or_else(|| b.channels.iter().filter(|c| c.kind == 0).find_map(|c| chan_map.get(&c.id)))
+        .copied()
 }
 
 async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup, o: LoadOptions) {
@@ -1060,30 +1060,40 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         .values()
         .map(|c| LiveChannel { id: c.id.get(), name: c.name.clone(), kind: channel_kind_num(c.kind) })
         .collect();
-    let plan = backups::plan(&b, &live_roles, &live_chans, o.delete_roles, o.delete_channels, i.channel_id.get());
+    // Anything switched on is rebuilt from scratch rather than matched up
+    // with what's there.
+    let plan_options = backups::PlanOptions {
+        rebuild_roles: o.roles,
+        rebuild_channels: o.channels,
+        delete_roles: o.delete_roles,
+        delete_channels: o.delete_channels,
+    };
+    let plan = backups::plan(&b, &live_roles, &live_chans, plan_options, i.channel_id.get());
 
     let mut what = Vec::new();
-    if o.delete_roles {
-        what.push(format!("• **Delete {}** role(s) that aren't in the backup", plan.delete_roles.len()));
-    }
-    if o.delete_channels {
-        what.push(format!("• **Delete {}** channel(s) that aren't in the backup (not this one)", plan.delete_channels.len()));
-    }
     if o.roles {
-        what.push(format!("• Restore **{}** roles ({} matched by name and edited)", b.roles.len(), plan.reuse_roles.len()));
+        what.push(format!(
+            "• **Delete all {} roles** I can manage and recreate the backup's **{}**",
+            plan.delete_roles.len(),
+            b.roles.len()
+        ));
+    } else if o.delete_roles {
+        what.push(format!("• **Delete {}** role(s) that aren't in the backup", plan.delete_roles.len()));
     }
     if o.channels {
         what.push(format!(
-            "• Restore **{}** channels ({} matched by name and edited)",
-            b.channels.len(),
-            plan.reuse_channels.len()
+            "• **Delete all {} channels**, including this one (last), and recreate the backup's **{}**",
+            plan.delete_channels.len() + 1,
+            b.channels.len()
         ));
+    } else if o.delete_channels {
+        what.push(format!("• **Delete {}** channel(s) that aren't in the backup (not this one)", plan.delete_channels.len()));
     }
     if o.settings {
         what.push("• Overwrite the server name, icon and settings".to_string());
     }
     if o.emojis {
-        what.push(format!("• Add missing emojis (**{}** in the backup)", b.emojis.len()));
+        what.push(format!("• Replace every emoji with the backup's **{}**", b.emojis.len()));
     }
     if o.bans {
         what.push(format!("• Re-apply **{}** bans", b.bans.len()));
@@ -1093,7 +1103,7 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     }
     if o.messages {
         what.push(format!(
-            "• Replay **{}** saved messages, skipping any that are still there",
+            "• Replay all **{}** saved messages",
             b.counts.messages
         ));
     }
@@ -1160,7 +1170,7 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         return;
     }
     println!("💾 [{gid}] {} is loading backup {} ({})", i.user.id, b.id, b.guild_name);
-    let mut loader = Loader { ctx, i, guild_id: gid, cancel, lines: Vec::new() };
+    let mut loader = Loader { ctx, i, guild_id: gid, cancel, lines: Vec::new(), report_channel_gone: false };
     run_load(&mut loader, &b, o, plan).await;
     loads().remove(&gid);
 
@@ -1171,8 +1181,11 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         (Tone::Success, "Backup loaded")
     };
     let card = theme::card(tone, Some(title), loader.lines.join("\n"));
-    // The interaction token lasts 15 minutes, which a big server can outrun.
-    if i.edit_response(&ctx.http, EditInteractionResponse::new().embed(card.clone()).components(vec![])).await.is_err() {
+    // The interaction token lasts 15 minutes, which a big server can outrun,
+    // and a channel rebuild deletes the channel the reply lives in.
+    if loader.report_channel_gone
+        || i.edit_response(&ctx.http, EditInteractionResponse::new().embed(card.clone()).components(vec![])).await.is_err()
+    {
         try_dm_embed(&ctx.http, i.user.id, card).await;
     }
 }
@@ -1463,17 +1476,6 @@ mod tests {
         let long = replay_text(&msg(&"x".repeat(5000)));
         assert!(long.chars().count() <= 2000);
         assert!(long.ends_with("<t:1700000000:f>"));
-    }
-
-    #[test]
-    fn a_replayed_copy_matches_its_original() {
-        let mut original = msg("hello there");
-        original.attachments.push(BAttachment { name: "a.png".into(), url: "https://x/a.png".into() });
-        let copy = BMessage { content: replay_text(&original), at: 1_800_000_000, ..msg("") };
-        assert_eq!(message_key(&copy), message_key(&original));
-        let other = BMessage { at: original.at + 1, ..original.clone() };
-        assert_ne!(message_key(&other), message_key(&original));
-        assert_ne!(message_key(&msg("different")), message_key(&original));
     }
 
     #[tokio::test]

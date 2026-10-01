@@ -202,10 +202,14 @@ aren't held to the 25-backup limit.
 - The backup belongs to you, not the server. `/backup load id:<id>` restores
   it into any server you own, so it also clones servers.
 - A load asks you to confirm first and shows what it's about to delete.
-  Roles and channels whose names match the backup are edited in place, so
-  members keep their roles and channels keep their messages. Everything else
-  is created, and anything not in the backup is deleted unless you turn that
-  off.
+  Every part switched on is rebuilt from scratch, nothing already there is
+  kept or matched up: `roles` deletes every role the bot can manage and
+  recreates the backup's, `channels` deletes every channel (the one you ran
+  the load from goes last, and the report then comes by DM) and recreates
+  the backup's, `emojis` replaces all emojis, and `messages` replays every
+  saved message. `delete_roles` / `delete_channels` only matter with `roles`
+  / `channels` off: then they delete what isn't in the backup and leave the
+  rest.
 - Each part is its own option: `settings`, `roles`, `channels`,
   `delete_roles`, `delete_channels` and `emojis` default on; `bans` and
   `members` default off. `dm_invite:true` also DMs every saved member who
@@ -233,10 +237,10 @@ aren't held to the 25-backup limit.
   schedule stops if the server changes owner.
 - Backups also keep the last 250 messages in each text channel.
   `messages:true` on a load replays them through a temporary webhook, under
-  each author's name and avatar and with the original date underneath. Into
-  a channel that already exists, only the messages that are missing are
-  posted (checked against its last 1000), so loading twice doesn't double
-  anything; restored ones land after the newer chat. Nobody is pinged, pins are re-pinned, and reactions and threads
+  each author's name and avatar and with the original date underneath. All
+  of them are posted, even into a channel that already has them, so use it
+  with `channels` on (fresh channels) unless you want copies. Nobody is
+  pinged, pins are re-pinned, and reactions and threads
   aren't restored. Attachments come back as links, which Discord expires
   after about a day. A webhook posts about 5 messages every 2 seconds, so a
   big server takes a while.
