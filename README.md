@@ -213,21 +213,23 @@ aren't held to the 25-backup limit.
   their own. Messages and member roles only come back alongside `channels` /
   `roles`, since they go into the freshly created ones.
 - Options go after the ID as `name` (meaning true), `name=true` or
-  `name=false`, e.g. `!backup load abc123 roles=false ban_members dm_invite`.
-  `settings`, `roles`, `channels`, `delete_roles`, `delete_channels` and
-  `emojis` default on; `bans`, `members`, `messages`, `ban_members` and
-  `dm_invite` default off. An unknown option is refused rather than
+  `name=false`, e.g. `!backup load abc123 roles channels messages dm_invite`.
+  `delete_roles`, `delete_channels` and `ban_members` default on; `roles`,
+  `channels`, `settings`, `emojis`, `bans`, `members`, `messages` and
+  `dm_invite` default off. So a bare `!backup load <id>` deletes every role
+  and channel and bans everyone, and recreates nothing; add `roles channels`
+  (and anything else) to restore the backup. An unknown option is refused rather than
   ignored. `dm_invite` DMs every saved member who
   isn't in the server a 7-day invite, one a second; it never runs unless you
   set it to `true`. It only reaches people who still share a server with the
   bot and have DMs open.
-- `ban_members:true` bans everyone currently in the server before the member
+- `ban_members` (on by default) bans everyone currently in the server before the member
   and invite steps. Bots, the server owner, bot owners and whoever ran the
   load are left alone, and nobody is DMed for being banned. Add
-  `dm_invite:true` to invite the backup's members back afterwards: a banned
+  `dm_invite` to invite the backup's members back afterwards: a banned
   person can't use an invite, so the bans this load made on people it is
   inviting are lifted first. Anyone who no longer shares a server with the bot
-  can't be DMed and stays banned. It only runs when set to `true`.
+  can't be DMed and stays banned. Turn it off with `ban_members=false`.
 - A load runs as much as it can at the same time: deletes, bans (200 per
   request), emojis, then roles, then channels (categories, then their
   children), then settings, messages and member roles together. Order and
@@ -241,7 +243,7 @@ aren't held to the 25-backup limit.
   168 hours); `!backup interval off` stops it and `!backup interval` shows it. Each one replaces the last, and the
   schedule stops if the server changes owner.
 - Backups also keep the last 250 messages in each text channel.
-  `messages:true` on a load replays them through a temporary webhook, under
+  `messages` on a load replays them through a temporary webhook, under
   each author's name and avatar and with the original date underneath. All
   of them are posted, even into a channel that already has them, so use it
   with `channels` on (fresh channels) unless you want copies. Nobody is

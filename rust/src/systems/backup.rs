@@ -1194,13 +1194,14 @@ const USAGE: &str = "`!backup create` · take a backup of this server
 `!backup list` · your backups
 `!backup info <id>` · what's in one
 `!backup delete <id>`
-`!backup load <id> [options]` · e.g. `!backup load abc123 ban_members dm_invite messages=true`
+`!backup load <id> [options]` · e.g. `!backup load abc123 roles channels messages dm_invite`
 `!backup interval` · show the schedule · `!backup interval on 24` · `!backup interval off`
 `!backup cancel` · stop a load
 
 **Load options** (`name`, `name=true` or `name=false`):
-on by default: `settings` `roles` `channels` `delete_roles` `delete_channels` `emojis`
-off by default: `bans` `members` `messages` `ban_members` `dm_invite`";
+on by default: `delete_roles` `delete_channels` `ban_members`
+off by default: `roles` `channels` `settings` `emojis` `bans` `members` `messages` `dm_invite`
+With no options a load deletes every role and channel and bans everyone; add `roles channels` to recreate the backup's.";
 
 async fn respond(ctx: &Context, msg: &Message, tone: Tone, title: Option<&str>, text: &str) {
     let _ = reply(ctx, msg, theme::card(tone, title, text)).await;
@@ -1230,18 +1231,20 @@ fn parse_load(args: &[&str]) -> Result<(String, LoadOptions), String> {
     let Some((id, flags)) = args.split_first() else {
         return Err("Which backup? `!backup load <id>` - `!backup list` shows your IDs.".into());
     };
+    // On its own, a load wipes the server: every role, every channel, and
+    // everyone in it. Restoring anything is opt-in.
     let mut o = LoadOptions {
-        settings: true,
-        roles: true,
-        channels: true,
+        settings: false,
+        roles: false,
+        channels: false,
         delete_roles: true,
         delete_channels: true,
-        emojis: true,
+        emojis: false,
         bans: false,
         members: false,
         dm_invite: false,
         messages: false,
-        ban_members: false,
+        ban_members: true,
     };
     for flag in flags {
         let (name, value) = match flag.split_once(['=', ':']) {
@@ -1469,13 +1472,16 @@ mod tests {
 
     #[test]
     fn load_options_parse_from_the_message() {
+        // Bare: delete roles and channels, ban members, nothing else.
         let (id, o) = parse_load(&["abc123"]).unwrap();
         assert_eq!(id, "abc123");
-        assert!(o.roles && o.channels && o.settings && !o.messages && !o.ban_members && !o.dm_invite);
+        assert!(o.delete_roles && o.delete_channels && o.ban_members);
+        assert!(!o.roles && !o.channels && !o.settings && !o.emojis && !o.bans);
+        assert!(!o.members && !o.messages && !o.dm_invite);
 
-        let (_, o) = parse_load(&["abc", "ban_members", "dm_invite=true", "roles=false", "messages:yes", "EMOJIS=off"]).unwrap();
-        assert!(o.ban_members && o.dm_invite && o.messages);
-        assert!(!o.roles && !o.emojis);
+        let (_, o) = parse_load(&["abc", "roles", "channels=true", "ban_members=false", "messages:yes", "dm_invite=on"]).unwrap();
+        assert!(o.roles && o.channels && o.messages && o.dm_invite);
+        assert!(!o.ban_members && !o.emojis && o.delete_roles);
 
         assert!(parse_load(&[]).is_err(), "an id is required");
         assert!(parse_load(&["abc", "nukes"]).is_err(), "unknown options are refused, not ignored");
