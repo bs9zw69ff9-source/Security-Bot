@@ -1,4 +1,4 @@
-//! `!backup`: Xenon-style server backups. Server owner and bot owners only.
+//! `!backup`: Xenon-style server backups. Server owner only.
 //!
 //! A backup belongs to the user who took it and can be loaded into any server
 //! that user owns, so it doubles as a way to clone a server. Every part a load
@@ -33,13 +33,7 @@ use crate::common::theme::{self, Tone};
 use crate::state::backups::{self, *};
 use crate::systems::snapshot_rollback::{channel_kind_num, kind_from_num};
 
-const OWNER_ONLY: &str = "Backups are for the server owner (and bot owners) only.";
-
-/// Which backups this user can reach: bot owners reach every backup, everyone
-/// else only their own.
-fn scope(user: &str) -> Option<&str> {
-    (!crate::common::permissions::is_owner_str(user)).then_some(user)
-}
+const OWNER_ONLY: &str = "Backups are for the server owner only.";
 
 /// guild -> cancel flag of the load running there.
 static LOADS: Lazy<Mutex<HashMap<GuildId, Arc<AtomicBool>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -1160,9 +1154,7 @@ pub async fn run_due_intervals(ctx: &Context) {
     for (gid, mut iv) in due_intervals(now) {
         let Some(guild_id) = id_of(&gid).map(GuildId::new) else { continue };
         let Some(guild_owner) = ctx.cache.guild(guild_id).map(|g| g.owner_id) else { continue };
-        // A schedule a bot owner set up keeps running whoever owns the server.
-        let by_bot_owner = crate::common::permissions::is_owner_str(&iv.owner_id);
-        if !by_bot_owner && guild_owner.to_string() != iv.owner_id {
+        if guild_owner.to_string() != iv.owner_id {
             println!("💾 [{gid}] interval backups stopped: the server changed owner");
             set_interval(&gid, None);
             continue;
@@ -1280,8 +1272,7 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
     let Some(info) = GuildInfo::from_cache(ctx, guild_id) else {
         return respond(ctx, msg, Tone::Error, None, "I'm still loading this server's details. Give it a few seconds and try again.").await;
     };
-    let bot_owner = crate::common::permissions::is_owner(msg.author.id);
-    if msg.author.id != info.owner_id && !bot_owner {
+    if msg.author.id != info.owner_id {
         return respond(ctx, msg, Tone::Denied, None, OWNER_ONLY).await;
     }
     let sub = words.get(1).map(|w| w.to_ascii_lowercase()).unwrap_or_default();
@@ -1290,7 +1281,7 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
 
     match sub.as_str() {
         "create" => {
-            if !bot_owner && backups::manual_count(&owner) >= MAX_PER_USER {
+            if backups::manual_count(&owner) >= MAX_PER_USER {
                 return respond(ctx, msg, Tone::Error, None, &format!("You already have {MAX_PER_USER} backups. Delete one with `!backup delete <id>` first.")).await;
             }
             let Some(working) = reply(ctx, msg, theme::card(Tone::Info, Some("Backing up"), "⏳ Taking a backup of this server…")).await else {
@@ -1319,17 +1310,16 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
                 Ok(v) => v,
                 Err(e) => return respond(ctx, msg, Tone::Error, None, &e).await,
             };
-            let Some(b) = backups::get(&id, scope(&owner)) else {
+            let Some(b) = backups::get(&id, Some(&owner)) else {
                 return respond(ctx, msg, Tone::Error, None, "You don't have a backup with that ID. `!backup list` shows yours.").await;
             };
             load(ctx, msg, &info, b, o).await;
         }
         "list" => {
-            let all = backups::list(scope(&owner));
+            let all = backups::list(Some(&owner));
             if all.is_empty() {
                 return respond(ctx, msg, Tone::Info, Some("Your backups"), "You haven't made any backups yet. `!backup create` makes one.").await;
             }
-            // A bot owner sees everyone's, so keep it inside an embed.
             const SHOWN: usize = 20;
             let mut body = all
                 .iter()
@@ -1354,7 +1344,7 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
         }
         "info" => {
             let id = args.first().copied().unwrap_or_default();
-            let Some(b) = backups::get(id, scope(&owner)) else {
+            let Some(b) = backups::get(id, Some(&owner)) else {
                 return respond(ctx, msg, Tone::Error, None, "You don't have a backup with that ID. `!backup info <id>`").await;
             };
             let roles: Vec<String> = b.roles.iter().rev().take(15).map(|r| r.name.clone()).collect();
@@ -1379,7 +1369,7 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
         }
         "delete" => {
             let id = args.first().copied().unwrap_or_default();
-            if backups::delete(id, scope(&owner)) {
+            if backups::delete(id, Some(&owner)) {
                 respond(ctx, msg, Tone::Success, None, &format!("Deleted backup `{id}`.")).await;
             } else {
                 respond(ctx, msg, Tone::Error, None, "You don't have a backup with that ID. `!backup delete <id>`").await;
