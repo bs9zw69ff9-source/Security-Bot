@@ -53,10 +53,18 @@ impl GuildInfo {
                 )
             })
             .collect();
+        // The bot's member record isn't always cached; its own integration
+        // role always is, and that's the floor of where it sits. Without this
+        // the bot read as being at the very bottom, so every role looked out
+        // of its reach.
+        let own_role = guild.roles.values().filter(|r| r.tags.bot_id == Some(bot_id)).map(|r| r.position as i64).max();
         let bot_highest = guild
             .members
             .get(&bot_id)
             .map(|m| highest_of(&roles, &m.roles))
+            .into_iter()
+            .chain(own_role)
+            .max()
             .unwrap_or(0);
         Some(Self {
             id: guild_id,

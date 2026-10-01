@@ -973,6 +973,9 @@ async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: Load
         return respond(ctx, msg, Tone::Error, None, "I couldn't check my own permissions here. Try again in a moment.").await;
     };
     let my_perms = ctx.cache.guild(gid).map(|g| g.member_permissions(&bot)).unwrap_or_default();
+    // From the member just fetched rather than the cache, which can be
+    // missing the bot and put it at the bottom.
+    let bot_top = info.highest_position(&bot.roles).max(info.bot_highest);
     let mut need = Permissions::MANAGE_ROLES | Permissions::MANAGE_CHANNELS | Permissions::MANAGE_GUILD;
     if o.bans {
         need |= Permissions::BAN_MEMBERS;
@@ -1008,7 +1011,7 @@ async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: Load
         .iter()
         .map(|(id, r)| LiveRole {
             id: id.get(),
-            locked: *id == gid.everyone_role() || r.managed || r.position >= info.bot_highest,
+            locked: *id == gid.everyone_role() || r.managed || r.position >= bot_top,
         })
         .collect();
     let live_chans: Vec<LiveChannel> = live_channels
@@ -1023,7 +1026,20 @@ async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: Load
 
     let mut what = Vec::new();
     if wipe_roles {
-        what.push(format!("• **Delete all {} roles** I can manage", plan.delete_roles.len()));
+        // Say why any are left, so "0" never reads as a bug.
+        let above = info
+            .roles
+            .iter()
+            .filter(|(id, r)| **id != gid.everyone_role() && !r.managed && r.position >= bot_top)
+            .count();
+        let managed = info.roles.values().filter(|r| r.managed).count();
+        let mut line = format!("• **Delete all {} roles** I can manage", plan.delete_roles.len());
+        if above + managed > 0 {
+            line.push_str(&format!(
+                " (leaving {above} at or above my top role, position {bot_top}, and {managed} owned by bots or integrations)"
+            ));
+        }
+        what.push(line);
     }
     if o.roles {
         what.push(format!("• Create the backup's **{}** roles", b.roles.len()));
