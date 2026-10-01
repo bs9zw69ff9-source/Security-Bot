@@ -212,6 +212,12 @@ aren't held to the 25-backup limit.
   isn't in the server a 7-day invite, one a second; it never runs unless you
   set it to `true`. It only reaches people who still share a server with the
   bot and have DMs open.
+- `kick_members:true` kicks everyone currently in the server before the
+  member and invite steps. Bots, the server owner, bot owners and whoever ran
+  the load are left alone, and nobody is DMed for being kicked. Add
+  `dm_invite:true` to invite the backup's members back afterwards; anyone who
+  no longer shares a server with the bot can't be DMed. It only runs when set
+  to `true`.
 - `/backup cancel` stops a load after the current step.
 - `/backup list`, `info` and `delete` manage your backups. You can keep up
   to 25 manual backups.

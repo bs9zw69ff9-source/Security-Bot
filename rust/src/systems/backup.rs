@@ -299,6 +299,13 @@ pub struct LoadOptions {
     pub members: bool,
     pub dm_invite: bool,
     pub messages: bool,
+    pub kick_members: bool,
+}
+
+/// Who `kick_members` leaves in place: bots, the server owner (Discord won't
+/// allow it anyway), whoever ran the load, and bot owners.
+fn spared_from_kick(user: UserId, is_bot: bool, guild_owner: Option<UserId>, invoker: UserId) -> bool {
+    is_bot || Some(user) == guild_owner || user == invoker || crate::common::permissions::is_owner(user)
 }
 
 #[derive(Default)]
@@ -364,7 +371,7 @@ impl Loader<'_> {
 
 async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     let (ctx, gid) = (l.ctx, l.guild_id);
-    let reason = format!("Backup {} loaded by the server owner", b.id);
+    let reason = format!("Backup {} loaded", b.id);
 
     // Roles.
     let mut role_map: HashMap<String, RoleId> =
@@ -666,6 +673,37 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
         ));
     }
 
+    if o.kick_members {
+        l.progress("Reading the member list").await;
+        match all_members(ctx, gid).await {
+            Ok(current) => {
+                let owner = ctx.cache.guild(gid).map(|g| g.owner_id);
+                let targets: Vec<UserId> = current
+                    .iter()
+                    .filter(|m| !spared_from_kick(m.user.id, m.user.bot, owner, l.i.user.id))
+                    .map(|m| m.user.id)
+                    .collect();
+                l.progress(&format!("Kicking {} current members", targets.len())).await;
+                let (mut kicked, mut failed) = (0usize, 0usize);
+                for user in targets {
+                    if l.cancelled() {
+                        l.lines.push(format!("🛑 **Kicks:** stopped after {kicked}"));
+                        return;
+                    }
+                    match gid.kick_with_reason(&ctx.http, user, &reason).await {
+                        Ok(()) => kicked += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+                l.lines.push(format!(
+                    "✅ **Kicks:** removed {kicked} current members{}",
+                    if failed > 0 { format!(", **{failed} couldn't be kicked** (above me, or already gone)") } else { String::new() }
+                ));
+            }
+            Err(e) => l.lines.push(format!("⚠️ **Kicks:** skipped, I couldn't read the member list: {e}")),
+        }
+    }
+
     if (!o.members && !o.dm_invite) || b.members.is_empty() {
         return;
     }
@@ -778,6 +816,9 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     if o.dm_invite {
         need |= Permissions::CREATE_INSTANT_INVITE;
     }
+    if o.kick_members {
+        need |= Permissions::KICK_MEMBERS;
+    }
     if o.messages {
         need |= Permissions::MANAGE_WEBHOOKS;
     }
@@ -840,6 +881,12 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         what.push(format!(
             "• Replay **{}** saved messages, skipping any that are still there",
             b.counts.messages
+        ));
+    }
+    if o.kick_members {
+        let here = ctx.cache.guild(gid).map(|g| g.member_count).unwrap_or(0);
+        what.push(format!(
+            "• **Kick every current member** (about {here}), except bots, the server owner, bot owners and you"
         ));
     }
     if o.dm_invite {
@@ -1049,6 +1096,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
                 members: bool_opt("members", false),
                 dm_invite: bool_opt("dm_invite", false),
                 messages: bool_opt("messages", false),
+                kick_members: bool_opt("kick_members", false),
             };
             load(ctx, i, info, b, o).await;
         }
@@ -1212,6 +1260,17 @@ mod tests {
         let other = BMessage { at: original.at + 1, ..original.clone() };
         assert_ne!(message_key(&other), message_key(&original));
         assert_ne!(message_key(&msg("different")), message_key(&original));
+    }
+
+    #[test]
+    fn kick_members_spares_bots_owners_and_the_caller() {
+        let (owner, me, someone) = (UserId::new(1), UserId::new(2), UserId::new(3));
+        assert!(spared_from_kick(UserId::new(9), true, Some(owner), me), "bots stay");
+        assert!(spared_from_kick(owner, false, Some(owner), me));
+        assert!(spared_from_kick(me, false, Some(owner), me));
+        let bot_owner = crate::common::config::BOT_OWNER_IDS.iter().next().and_then(|s| s.parse().ok()).map(UserId::new).unwrap();
+        assert!(spared_from_kick(bot_owner, false, Some(owner), me));
+        assert!(!spared_from_kick(someone, false, Some(owner), me));
     }
 
     #[test]
