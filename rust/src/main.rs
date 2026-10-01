@@ -89,6 +89,10 @@ impl EventHandler for Handler {
         if msg.author.bot {
             return;
         }
+        if msg.content.trim_start().get(..systems::backup::PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(systems::backup::PREFIX)) {
+            systems::backup::handle_message(&ctx, &msg).await;
+            return;
+        }
         let Some(guild_id) = msg.guild_id else { return };
         // Building GuildInfo copies the guild's whole role list; skip it for
         // the common case of a server with neither check switched on.
@@ -192,11 +196,6 @@ impl EventHandler for Handler {
             Interaction::Command(i) => {
                 systems::server_logs::on_command(&ctx, &i).await;
                 commands::handler::handle(&ctx, &i).await
-            }
-            Interaction::Autocomplete(i) => {
-                if i.data.name == "backup" {
-                    systems::backup::autocomplete(&ctx, &i).await;
-                }
             }
             Interaction::Component(i) => {
                 if i.guild_id.is_none() {

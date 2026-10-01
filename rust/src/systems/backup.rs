@@ -1,4 +1,4 @@
-//! `/backup`: Xenon-style server backups. Server owner and bot owners only.
+//! `!backup`: Xenon-style server backups. Server owner and bot owners only.
 //!
 //! A backup belongs to the user who took it and can be loaded into any server
 //! that user owns, so it doubles as a way to clone a server. Every part a load
@@ -7,17 +7,17 @@
 
 use once_cell::sync::Lazy;
 use serenity::builder::{
-    CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel, CreateEmbed,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateAllowedMentions, CreateInvite, CreateMessage, CreateWebhook, ExecuteWebhook, GetMessages, EditGuild, EditInteractionResponse,
-    EditMember, EditRole,
+    CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateButton, CreateChannel, CreateEmbed,
+    CreateInteractionResponse, CreateInvite, CreateMessage, CreateWebhook, EditGuild, EditMember, EditMessage, EditRole,
+    ExecuteWebhook, GetMessages,
 };
 use serenity::client::Context;
 use serenity::collector::ComponentInteractionCollector;
 use serenity::http::{LightMethod, Request, Route};
-use serenity::model::application::{ButtonStyle, CommandInteraction, ResolvedOption, ResolvedValue};
-use serenity::model::channel::{MessageType, PermissionOverwrite, PermissionOverwriteType};
+use serenity::model::application::ButtonStyle;
+use serenity::model::channel::{Message, MessageType, PermissionOverwrite, PermissionOverwriteType};
 use serenity::model::guild::{AfkTimeout, DefaultMessageNotificationLevel, ExplicitContentFilter, VerificationLevel};
-use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use serenity::model::Permissions;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
@@ -332,7 +332,10 @@ fn afk_timeout(secs: u16) -> AfkTimeout {
 
 struct Loader<'a> {
     ctx: &'a Context,
-    i: &'a CommandInteraction,
+    /// The `!backup load` message.
+    cmd: &'a Message,
+    /// The bot's reply, edited as the load goes.
+    status: MessageId,
     guild_id: GuildId,
     cancel: Arc<AtomicBool>,
     lines: Vec<String>,
@@ -349,9 +352,13 @@ impl Loader<'_> {
         if !body.is_empty() {
             body.push('\n');
         }
-        body.push_str(&format!("⏳ {step}…\n\n_`/backup cancel` stops it; what's done stays done._"));
+        body.push_str(&format!("⏳ {step}…\n\n_`!backup cancel` stops it; what's done stays done._"));
         let card = theme::card(Tone::Info, Some("Loading backup"), body);
-        let _ = self.i.edit_response(&self.ctx.http, EditInteractionResponse::new().embed(card).components(vec![])).await;
+        let _ = self
+            .cmd
+            .channel_id
+            .edit_message(&self.ctx.http, self.status, EditMessage::new().embed(card).components(vec![]))
+            .await;
     }
 }
 
@@ -832,7 +839,7 @@ async fn invite_members(
 async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     let cancel = l.cancel.clone();
     let env = Env { ctx: l.ctx, gid: l.guild_id, cancel: &cancel, reason: format!("Backup {} loaded", b.id) };
-    let invoker = l.i.user.id;
+    let invoker = l.cmd.author.id;
 
     // Deleting, banning and emojis don't depend on each other or on anything
     // restored later, so they all run together.
@@ -930,7 +937,7 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
         l.progress("Inviting members back").await;
         // The channel this was run from is deleted along with the rest, so
         // the invite points at a restored one.
-        let channel = if o.channels || o.delete_channels { invite_channel(b, &chan_map) } else { Some(l.i.channel_id) };
+        let channel = if o.channels || o.delete_channels { invite_channel(b, &chan_map) } else { Some(l.cmd.channel_id) };
         match channel {
             Some(channel) => {
                 let line = invite_members(&env, b, live, &banned_now, channel).await;
@@ -944,7 +951,7 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     // channel this load was started from. It goes last so progress stays
     // visible until the end; the report then comes by DM.
     if (o.channels || o.delete_channels) && !l.cancelled() {
-        l.report_channel_gone = l.i.channel_id.delete(&env.ctx.http).await.is_ok();
+        l.report_channel_gone = l.cmd.channel_id.delete(&env.ctx.http).await.is_ok();
     }
 }
 
@@ -959,11 +966,11 @@ fn invite_channel(b: &Backup, chan_map: &HashMap<String, ChannelId>) -> Option<C
         .copied()
 }
 
-async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup, o: LoadOptions) {
+async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: LoadOptions) {
     let gid = info.id;
     let me = ctx.cache.current_user().id;
     let Some(bot) = fetch_member(ctx, gid, me).await else {
-        return respond(ctx, i, Tone::Error, None, "I couldn't check my own permissions here. Try again in a moment.").await;
+        return respond(ctx, msg, Tone::Error, None, "I couldn't check my own permissions here. Try again in a moment.").await;
     };
     let my_perms = ctx.cache.guild(gid).map(|g| g.member_permissions(&bot)).unwrap_or_default();
     let mut need = Permissions::MANAGE_ROLES | Permissions::MANAGE_CHANNELS | Permissions::MANAGE_GUILD;
@@ -987,13 +994,13 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     }
     if !my_perms.administrator() && !my_perms.contains(need) {
         let missing = need - my_perms;
-        return respond(ctx, i, Tone::Error, None, &format!("I'm missing permissions for this load: `{missing}`.")).await;
+        return respond(ctx, msg, Tone::Error, None, &format!("I'm missing permissions for this load: `{missing}`.")).await;
     }
 
     let live_channels = match gid.channels(&ctx.http).await {
         Ok(c) => c,
         Err(e) => {
-            return respond(ctx, i, Tone::Error, None, &format!("I couldn't read this server's channels ({e}), so I haven't touched anything.")).await;
+            return respond(ctx, msg, Tone::Error, None, &format!("I couldn't read this server's channels ({e}), so I haven't touched anything.")).await;
         }
     };
     let live_roles: Vec<LiveRole> = info
@@ -1012,7 +1019,7 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     // existing one is deleted and the backup's are created fresh.
     let wipe_roles = o.roles || o.delete_roles;
     let wipe_channels = o.channels || o.delete_channels;
-    let plan = backups::plan(&live_roles, &live_chans, wipe_roles, wipe_channels, i.channel_id.get());
+    let plan = backups::plan(&live_roles, &live_chans, wipe_roles, wipe_channels, msg.channel_id.get());
 
     let mut what = Vec::new();
     if wipe_roles {
@@ -1055,7 +1062,7 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         what.push("• **DM an invite** to every saved member who isn't in this server (one a second)".to_string());
     }
     let body = format!(
-        "Loading **{}** (`{}`) from <t:{}:f> into **{}**. This will:\n{}\n\nThis can't be undone. Take a `/backup create` first if you might want this server back.",
+        "Loading **{}** (`{}`) from <t:{}:f> into **{}**. This will:\n{}\n\nThis can't be undone. Take a `!backup create` first if you might want this server back.",
         b.guild_name,
         b.id,
         b.created_at / 1000,
@@ -1066,15 +1073,13 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         CreateButton::new("backup_confirm").label("Load it").style(ButtonStyle::Danger),
         CreateButton::new("backup_abort").label("Cancel").style(ButtonStyle::Secondary),
     ]);
-    let msg = CreateInteractionResponseMessage::new()
+    let prompt = CreateMessage::new()
         .embed(theme::card(Tone::Warning, Some("Load this backup?"), body))
         .components(vec![buttons])
-        .ephemeral(true);
-    if i.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await.is_err() {
-        return;
-    }
-    let Ok(prompt) = i.get_response(&ctx.http).await else { return };
-    let user = i.user.id;
+        .reference_message(msg);
+    let Ok(prompt) = msg.channel_id.send_message(&ctx.http, prompt).await else { return };
+    let status = prompt.id;
+    let user = msg.author.id;
     let click = ComponentInteractionCollector::new(&ctx.shard)
         .timeout(Duration::from_secs(60))
         .filter(move |c| c.message.id == prompt.id && c.user.id == user)
@@ -1089,7 +1094,7 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     };
     if !confirmed {
         let card = theme::card(Tone::Info, None, "Cancelled, nothing was changed.");
-        let _ = i.edit_response(&ctx.http, EditInteractionResponse::new().embed(card).components(vec![])).await;
+        let _ = msg.channel_id.edit_message(&ctx.http, status, EditMessage::new().embed(card).components(vec![])).await;
         return;
     }
 
@@ -1103,12 +1108,12 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         busy
     };
     if busy {
-        let card = theme::card(Tone::Error, None, "A backup is already loading here. Wait for it, or `/backup cancel` it.");
-        let _ = i.edit_response(&ctx.http, EditInteractionResponse::new().embed(card).components(vec![])).await;
+        let card = theme::card(Tone::Error, None, "A backup is already loading here. Wait for it, or `!backup cancel` it.");
+        let _ = msg.channel_id.edit_message(&ctx.http, status, EditMessage::new().embed(card).components(vec![])).await;
         return;
     }
-    println!("💾 [{gid}] {} is loading backup {} ({})", i.user.id, b.id, b.guild_name);
-    let mut loader = Loader { ctx, i, guild_id: gid, cancel, lines: Vec::new(), report_channel_gone: false };
+    println!("💾 [{gid}] {} is loading backup {} ({})", msg.author.id, b.id, b.guild_name);
+    let mut loader = Loader { ctx, cmd: msg, status, guild_id: gid, cancel, lines: Vec::new(), report_channel_gone: false };
     run_load(&mut loader, &b, o, plan).await;
     loads().remove(&gid);
 
@@ -1119,12 +1124,15 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         (Tone::Success, "Backup loaded")
     };
     let card = theme::card(tone, Some(title), loader.lines.join("\n"));
-    // The interaction token lasts 15 minutes, which a big server can outrun,
-    // and a channel rebuild deletes the channel the reply lives in.
+    // Deleting channels deletes the one the reply lives in.
     if loader.report_channel_gone
-        || i.edit_response(&ctx.http, EditInteractionResponse::new().embed(card.clone()).components(vec![])).await.is_err()
+        || msg
+            .channel_id
+            .edit_message(&ctx.http, status, EditMessage::new().embed(card.clone()).components(vec![]))
+            .await
+            .is_err()
     {
-        try_dm_embed(&ctx.http, i.user.id, card).await;
+        try_dm_embed(&ctx.http, msg.author.id, card).await;
     }
 }
 
@@ -1164,22 +1172,26 @@ pub async fn run_due_intervals(ctx: &Context) {
 
 // ── Command ───────────────────────────────────────────────────
 
-async fn respond(ctx: &Context, i: &CommandInteraction, tone: Tone, title: Option<&str>, text: &str) {
-    let msg = CreateInteractionResponseMessage::new().embed(theme::card(tone, title, text)).ephemeral(true);
-    let _ = i.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await;
+pub const PREFIX: &str = "!backup";
+
+const USAGE: &str = "`!backup create` · take a backup of this server
+`!backup list` · your backups
+`!backup info <id>` · what's in one
+`!backup delete <id>`
+`!backup load <id> [options]` · e.g. `!backup load abc123 ban_members dm_invite messages=true`
+`!backup interval` · show the schedule · `!backup interval on 24` · `!backup interval off`
+`!backup cancel` · stop a load
+
+**Load options** (`name`, `name=true` or `name=false`):
+on by default: `settings` `roles` `channels` `delete_roles` `delete_channels` `emojis`
+off by default: `bans` `members` `messages` `ban_members` `dm_invite`";
+
+async fn respond(ctx: &Context, msg: &Message, tone: Tone, title: Option<&str>, text: &str) {
+    let _ = reply(ctx, msg, theme::card(tone, title, text)).await;
 }
 
-async fn edit(ctx: &Context, i: &CommandInteraction, e: CreateEmbed) {
-    let _ = i.edit_response(&ctx.http, EditInteractionResponse::new().embed(e)).await;
-}
-
-fn ago(ms: i64) -> String {
-    let mins = (now_ms() - ms).max(0) / 60_000;
-    match mins {
-        0..=59 => format!("{mins}m ago"),
-        60..=2879 => format!("{}h ago", mins / 60),
-        _ => format!("{}d ago", mins / 1440),
-    }
+async fn reply(ctx: &Context, msg: &Message, card: CreateEmbed) -> Option<Message> {
+    msg.channel_id.send_message(&ctx.http, CreateMessage::new().embed(card).reference_message(msg)).await.ok()
 }
 
 fn contents(c: &Counts) -> String {
@@ -1189,50 +1201,86 @@ fn contents(c: &Counts) -> String {
     )
 }
 
-pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
-    let bot_owner = crate::common::permissions::is_owner(i.user.id);
-    if i.user.id != info.owner_id && !bot_owner {
-        return respond(ctx, i, Tone::Denied, None, OWNER_ONLY).await;
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
     }
-    let options = i.data.options();
-    let Some(ResolvedOption { name: sub, value: ResolvedValue::SubCommand(args), .. }) = options.first() else { return };
-    let str_opt = |n: &str| {
-        args.iter().find(|o| o.name == n).and_then(|o| match &o.value {
-            ResolvedValue::String(s) => Some(s.trim().to_string()),
-            _ => None,
-        })
-    };
-    let bool_opt = |n: &str, default: bool| {
-        args.iter()
-            .find(|o| o.name == n)
-            .and_then(|o| match o.value {
-                ResolvedValue::Boolean(b) => Some(b),
-                _ => None,
-            })
-            .unwrap_or(default)
-    };
-    let int_opt = |n: &str| {
-        args.iter().find(|o| o.name == n).and_then(|o| match o.value {
-            ResolvedValue::Integer(v) => Some(v),
-            _ => None,
-        })
-    };
-    let owner = i.user.id.to_string();
+}
 
-    match *sub {
+/// `!backup load <id> [name | name=bool | name:bool ...]`.
+fn parse_load(args: &[&str]) -> Result<(String, LoadOptions), String> {
+    let Some((id, flags)) = args.split_first() else {
+        return Err("Which backup? `!backup load <id>` - `!backup list` shows your IDs.".into());
+    };
+    let mut o = LoadOptions {
+        settings: true,
+        roles: true,
+        channels: true,
+        delete_roles: true,
+        delete_channels: true,
+        emojis: true,
+        bans: false,
+        members: false,
+        dm_invite: false,
+        messages: false,
+        ban_members: false,
+    };
+    for flag in flags {
+        let (name, value) = match flag.split_once(['=', ':']) {
+            Some((n, v)) => (n, parse_bool(v).ok_or_else(|| format!("`{flag}`: use true or false."))?),
+            None => (*flag, true),
+        };
+        let slot = match name.to_ascii_lowercase().as_str() {
+            "settings" => &mut o.settings,
+            "roles" => &mut o.roles,
+            "channels" => &mut o.channels,
+            "delete_roles" => &mut o.delete_roles,
+            "delete_channels" => &mut o.delete_channels,
+            "emojis" => &mut o.emojis,
+            "bans" => &mut o.bans,
+            "members" => &mut o.members,
+            "dm_invite" => &mut o.dm_invite,
+            "messages" => &mut o.messages,
+            "ban_members" => &mut o.ban_members,
+            _ => return Err(format!("I don't know the option `{name}`.\n\n{USAGE}")),
+        };
+        *slot = value;
+    }
+    Ok((id.to_string(), o))
+}
+
+/// Handle a `!backup …` message. Server owner and bot owners only.
+pub async fn handle_message(ctx: &Context, msg: &Message) {
+    let Some(guild_id) = msg.guild_id else { return };
+    let words: Vec<&str> = msg.content.split_whitespace().collect();
+    if !words.first().is_some_and(|w| w.eq_ignore_ascii_case(PREFIX)) {
+        return;
+    }
+    let Some(info) = GuildInfo::from_cache(ctx, guild_id) else {
+        return respond(ctx, msg, Tone::Error, None, "I'm still loading this server's details. Give it a few seconds and try again.").await;
+    };
+    let bot_owner = crate::common::permissions::is_owner(msg.author.id);
+    if msg.author.id != info.owner_id && !bot_owner {
+        return respond(ctx, msg, Tone::Denied, None, OWNER_ONLY).await;
+    }
+    let sub = words.get(1).map(|w| w.to_ascii_lowercase()).unwrap_or_default();
+    let args = words.get(2..).unwrap_or_default();
+    let owner = msg.author.id.to_string();
+
+    match sub.as_str() {
         "create" => {
             if !bot_owner && backups::manual_count(&owner) >= MAX_PER_USER {
-                return respond(ctx, i, Tone::Error, None, &format!("You already have {MAX_PER_USER} backups. Delete one with `/backup delete` first.")).await;
+                return respond(ctx, msg, Tone::Error, None, &format!("You already have {MAX_PER_USER} backups. Delete one with `!backup delete <id>` first.")).await;
             }
-            let defer = CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
-            let _ = i.create_response(&ctx.http, defer).await;
-            match capture(ctx, info.id, i.user.id, false).await {
-                Ok((b, warnings)) => {
-                    if !backups::save(&b) {
-                        return edit(ctx, i, theme::card(Tone::Error, None, "I took the backup but couldn't save it to the database. The bot's log has the reason.")).await;
-                    }
+            let Some(working) = reply(ctx, msg, theme::card(Tone::Info, Some("Backing up"), "⏳ Taking a backup of this server…")).await else {
+                return;
+            };
+            let card = match capture(ctx, info.id, msg.author.id, false).await {
+                Ok((b, warnings)) if backups::save(&b) => {
                     let mut body = format!(
-                        "**ID:** `{}`\n{}\n\nLoad it with `/backup load id:{}`, here or in any server you own.",
+                        "**ID:** `{}`\n{}\n\nLoad it with `!backup load {}`, here or in any server you own.",
                         b.id,
                         contents(&b.counts),
                         b.id
@@ -1240,35 +1288,27 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
                     for w in warnings {
                         body.push_str(&format!("\n⚠️ {w}"));
                     }
-                    edit(ctx, i, theme::card(Tone::Success, Some("Backup created"), body)).await;
+                    theme::card(Tone::Success, Some("Backup created"), body)
                 }
-                Err(e) => edit(ctx, i, theme::card(Tone::Error, None, format!("The backup failed: {e}"))).await,
-            }
+                Ok(_) => theme::card(Tone::Error, None, "I took the backup but couldn't save it to the database. The bot's log has the reason."),
+                Err(e) => theme::card(Tone::Error, None, format!("The backup failed: {e}")),
+            };
+            let _ = msg.channel_id.edit_message(&ctx.http, working.id, EditMessage::new().embed(card)).await;
         }
         "load" => {
-            let id = str_opt("id").unwrap_or_default();
+            let (id, o) = match parse_load(args) {
+                Ok(v) => v,
+                Err(e) => return respond(ctx, msg, Tone::Error, None, &e).await,
+            };
             let Some(b) = backups::get(&id, scope(&owner)) else {
-                return respond(ctx, i, Tone::Error, None, "You don't have a backup with that ID. `/backup list` shows yours.").await;
+                return respond(ctx, msg, Tone::Error, None, "You don't have a backup with that ID. `!backup list` shows yours.").await;
             };
-            let o = LoadOptions {
-                settings: bool_opt("settings", true),
-                roles: bool_opt("roles", true),
-                channels: bool_opt("channels", true),
-                delete_roles: bool_opt("delete_roles", true),
-                delete_channels: bool_opt("delete_channels", true),
-                emojis: bool_opt("emojis", true),
-                bans: bool_opt("bans", false),
-                members: bool_opt("members", false),
-                dm_invite: bool_opt("dm_invite", false),
-                messages: bool_opt("messages", false),
-                ban_members: bool_opt("ban_members", false),
-            };
-            load(ctx, i, info, b, o).await;
+            load(ctx, msg, &info, b, o).await;
         }
         "list" => {
             let all = backups::list(scope(&owner));
             if all.is_empty() {
-                return respond(ctx, i, Tone::Info, Some("Your backups"), "You haven't made any backups yet. `/backup create` makes one.").await;
+                return respond(ctx, msg, Tone::Info, Some("Your backups"), "You haven't made any backups yet. `!backup create` makes one.").await;
             }
             // A bot owner sees everyone's, so keep it inside an embed.
             const SHOWN: usize = 20;
@@ -1289,23 +1329,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
                 .collect::<Vec<_>>()
                 .join("\n\n");
             if all.len() > SHOWN {
-                body.push_str(&format!("\n\n…and {} more. Type in the `id` box to search them.", all.len() - SHOWN));
+                body.push_str(&format!("\n\n…and {} more.", all.len() - SHOWN));
             }
-            respond(ctx, i, Tone::Info, Some("Your backups"), &format!("{body}\n\n🕒 = interval backup")).await;
+            respond(ctx, msg, Tone::Info, Some("Your backups"), &format!("{body}\n\n🕒 = interval backup")).await;
         }
         "info" => {
-            let id = str_opt("id").unwrap_or_default();
-            let Some(b) = backups::get(&id, scope(&owner)) else {
-                return respond(ctx, i, Tone::Error, None, "You don't have a backup with that ID.").await;
+            let id = args.first().copied().unwrap_or_default();
+            let Some(b) = backups::get(id, scope(&owner)) else {
+                return respond(ctx, msg, Tone::Error, None, "You don't have a backup with that ID. `!backup info <id>`").await;
             };
             let roles: Vec<String> = b.roles.iter().rev().take(15).map(|r| r.name.clone()).collect();
-            let channels: Vec<String> = b
-                .channels
-                .iter()
-                .filter(|c| c.kind != 4)
-                .take(15)
-                .map(|c| format!("#{}", c.name))
-                .collect();
+            let channels: Vec<String> =
+                b.channels.iter().filter(|c| c.kind != 4).take(15).map(|c| format!("#{}", c.name)).collect();
             let e = theme::card(
                 Tone::Info,
                 Some("Backup info"),
@@ -1321,39 +1356,31 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
             )
             .field("Top roles", if roles.is_empty() { "-".into() } else { roles.join(", ") }, false)
             .field("Channels", if channels.is_empty() { "-".into() } else { channels.join(", ") }, false);
-            let msg = CreateInteractionResponseMessage::new().embed(e).ephemeral(true);
-            let _ = i.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await;
+            let _ = reply(ctx, msg, e).await;
         }
         "delete" => {
-            let id = str_opt("id").unwrap_or_default();
-            if backups::delete(&id, scope(&owner)) {
-                respond(ctx, i, Tone::Success, None, &format!("Deleted backup `{id}`.")).await;
+            let id = args.first().copied().unwrap_or_default();
+            if backups::delete(id, scope(&owner)) {
+                respond(ctx, msg, Tone::Success, None, &format!("Deleted backup `{id}`.")).await;
             } else {
-                respond(ctx, i, Tone::Error, None, "You don't have a backup with that ID.").await;
+                respond(ctx, msg, Tone::Error, None, "You don't have a backup with that ID. `!backup delete <id>`").await;
             }
         }
         "interval" => {
             let gid = info.id.to_string();
             let current = backups::interval(&gid);
-            let Some(enabled) = args.iter().find(|o| o.name == "enabled").and_then(|o| match o.value {
-                ResolvedValue::Boolean(b) => Some(b),
-                _ => None,
-            }) else {
+            let Some(enabled) = args.first().and_then(|a| parse_bool(a)) else {
                 let text = match current {
-                    Some(iv) => format!(
-                        "On: every **{}h**, next <t:{}:R>. Each one replaces the last.",
-                        iv.hours,
-                        iv.next_at / 1000
-                    ),
-                    None => "Off. `/backup interval enabled:true hours:24` turns it on.".to_string(),
+                    Some(iv) => format!("On: every **{}h**, next <t:{}:R>. Each one replaces the last.", iv.hours, iv.next_at / 1000),
+                    None => "Off. `!backup interval on 24` turns it on (every 6 to 168 hours).".to_string(),
                 };
-                return respond(ctx, i, Tone::Info, Some("Interval backups"), &text).await;
+                return respond(ctx, msg, Tone::Info, Some("Interval backups"), &text).await;
             };
             if !enabled {
                 backups::set_interval(&gid, None);
-                return respond(ctx, i, Tone::Success, None, "Interval backups are off. The last one is kept in `/backup list`.").await;
+                return respond(ctx, msg, Tone::Success, None, "Interval backups are off. The last one is kept in `!backup list`.").await;
             }
-            let hours = int_opt("hours").unwrap_or(24).clamp(INTERVAL_HOURS.0, INTERVAL_HOURS.1);
+            let hours = args.get(1).and_then(|h| h.parse::<i64>().ok()).unwrap_or(24).clamp(INTERVAL_HOURS.0, INTERVAL_HOURS.1);
             let iv = Interval {
                 owner_id: owner,
                 hours,
@@ -1366,37 +1393,20 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
             if !saved {
                 text.push_str("\n\n❌ It didn't save to the database, so it will stop at the next restart.");
             }
-            respond(ctx, i, Tone::Success, Some("Interval backups on"), &text).await;
+            respond(ctx, msg, Tone::Success, Some("Interval backups on"), &text).await;
         }
         "cancel" => {
             let flag = loads().get(&info.id).cloned();
             match flag {
                 Some(f) => {
                     f.store(true, Ordering::Relaxed);
-                    respond(ctx, i, Tone::Success, None, "Stopping the load after the current step.").await;
+                    respond(ctx, msg, Tone::Success, None, "Stopping the load after the current step.").await;
                 }
-                None => respond(ctx, i, Tone::Info, None, "No backup is loading here.").await,
+                None => respond(ctx, msg, Tone::Info, None, "No backup is loading here.").await,
             }
         }
-        _ => {}
+        _ => respond(ctx, msg, Tone::Info, Some("Backups"), USAGE).await,
     }
-}
-
-/// Suggest the backups this user can reach for the `id` option.
-pub async fn autocomplete(ctx: &Context, i: &CommandInteraction) {
-    let typed = i.data.autocomplete().map(|o| o.value.to_lowercase()).unwrap_or_default();
-    let user = i.user.id.to_string();
-    let mut resp = CreateAutocompleteResponse::new();
-    for m in backups::list(scope(&user))
-        .into_iter()
-        .filter(|m| m.id.contains(&typed) || m.guild_name.to_lowercase().contains(&typed))
-        .take(25)
-    {
-        let label: String =
-            format!("{}{} · {} · {}", if m.interval { "🕒 " } else { "" }, m.guild_name, ago(m.created_at), m.id).chars().take(100).collect();
-        resp = resp.add_string_choice(label, m.id);
-    }
-    let _ = i.create_response(&ctx.http, CreateInteractionResponse::Autocomplete(resp)).await;
 }
 
 #[cfg(test)]
@@ -1439,6 +1449,21 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) <= 8, "never more than the limit");
         // 40 x 20ms in series is 800ms; 8 at a time is about 100ms.
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn load_options_parse_from_the_message() {
+        let (id, o) = parse_load(&["abc123"]).unwrap();
+        assert_eq!(id, "abc123");
+        assert!(o.roles && o.channels && o.settings && !o.messages && !o.ban_members && !o.dm_invite);
+
+        let (_, o) = parse_load(&["abc", "ban_members", "dm_invite=true", "roles=false", "messages:yes", "EMOJIS=off"]).unwrap();
+        assert!(o.ban_members && o.dm_invite && o.messages);
+        assert!(!o.roles && !o.emojis);
+
+        assert!(parse_load(&[]).is_err(), "an id is required");
+        assert!(parse_load(&["abc", "nukes"]).is_err(), "unknown options are refused, not ignored");
+        assert!(parse_load(&["abc", "roles=maybe"]).is_err());
     }
 
     #[test]

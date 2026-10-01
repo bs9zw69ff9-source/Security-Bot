@@ -18,8 +18,7 @@ use crate::common::db;
 const TABLE: &str = "backups";
 const INTERVAL_TABLE: &str = "backup_intervals";
 
-/// Per-user cap on manual backups. Also keeps `/backup list` and the
-/// autocomplete inside Discord's 25 entries.
+/// Per-user cap on manual backups.
 pub const MAX_PER_USER: usize = 25;
 pub const MESSAGES_PER_CHANNEL: usize = 250;
 pub const INTERVAL_HOURS: (i64, i64) = (6, 168);
@@ -152,7 +151,7 @@ pub struct Backup {
     pub members: Vec<BMember>,
 }
 
-/// What `/backup list` and the autocomplete need, without the payload.
+/// What `!backup list` needs, without the payload.
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Meta {

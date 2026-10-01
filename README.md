@@ -182,7 +182,7 @@ invocation of a hidden owner command is written to the local
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/chainofcommand` `/config` `/status` `/antiping` `/nuketest` `/backup` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/chainofcommand` `/config` `/status` `/antiping` `/nuketest` `!backup` |
 
 Bot owners (`BOT_OWNER_IDS`) can run every command in every server, with no
 roles or server permissions. Moderation commands also let them act on
@@ -192,14 +192,15 @@ anyone whose top role is above its own.
 
 ### Backups
 
-`/backup` works like Xenon's backups. The server's owner and bot owners can
-use it. Bot owners can also see, load and delete anyone's backups by ID, and
+`!backup` works like Xenon's backups. It's a text command, not a slash
+command: type it in any channel. The server's owner and bot owners can use
+it; anyone else gets a refusal. `!backup` on its own lists the commands. Bot owners can also see, load and delete anyone's backups by ID, and
 aren't held to the 25-backup limit.
 
-- `/backup create` saves the server's name, icon and settings, its roles,
+- `!backup create` saves the server's name, icon and settings, its roles,
   channels with their permission overwrites, emojis, bans, and each member's
   roles and nickname. It replies with an ID.
-- The backup belongs to you, not the server. `/backup load id:<id>` restores
+- The backup belongs to you, not the server. `!backup load <id>` restores
   it into any server you own, so it also clones servers.
 - A load asks you to confirm first and shows what it's about to delete.
   Every part switched on is rebuilt from scratch, nothing already there is
@@ -211,9 +212,12 @@ aren't held to the 25-backup limit.
   `delete_roles` / `delete_channels` also delete every one of them, even on
   their own. Messages and member roles only come back alongside `channels` /
   `roles`, since they go into the freshly created ones.
-- Each part is its own option: `settings`, `roles`, `channels`,
-  `delete_roles`, `delete_channels` and `emojis` default on; `bans` and
-  `members` default off. `dm_invite:true` also DMs every saved member who
+- Options go after the ID as `name` (meaning true), `name=true` or
+  `name=false`, e.g. `!backup load abc123 roles=false ban_members dm_invite`.
+  `settings`, `roles`, `channels`, `delete_roles`, `delete_channels` and
+  `emojis` default on; `bans`, `members`, `messages`, `ban_members` and
+  `dm_invite` default off. An unknown option is refused rather than
+  ignored. `dm_invite` DMs every saved member who
   isn't in the server a 7-day invite, one a second; it never runs unless you
   set it to `true`. It only reaches people who still share a server with the
   bot and have DMs open.
@@ -230,11 +234,11 @@ aren't held to the 25-backup limit.
   parents are set in one request each. Discord's rate limits still apply, so
   the slow parts are messages (a webhook posts about 5 every 2 seconds, one
   channel at a time but several channels at once) and invite DMs (4 at a time).
-- `/backup cancel` stops a load after the current step.
-- `/backup list`, `info` and `delete` manage your backups. You can keep up
+- `!backup cancel` stops a load after the current step.
+- `!backup list`, `!backup info <id>` and `!backup delete <id>` manage your backups. You can keep up
   to 25 manual backups.
-- `/backup interval enabled:true hours:24` backs the server up on a
-  schedule (every 6 to 168 hours). Each one replaces the last, and the
+- `!backup interval on 24` backs the server up on a schedule (every 6 to
+  168 hours); `!backup interval off` stops it and `!backup interval` shows it. Each one replaces the last, and the
   schedule stops if the server changes owner.
 - Backups also keep the last 250 messages in each text channel.
   `messages:true` on a load replays them through a temporary webhook, under
@@ -521,7 +525,7 @@ never overwrite a later manual change.
 ## Data
 
 Runtime state (guild settings, anti-ping config, warnings, muted-role
-stashes, snapshots, failsafe backups, `/backup` backups and schedules, ticket config, open-ticket tracking,
+stashes, snapshots, failsafe backups, `!backup` backups and schedules, ticket config, open-ticket tracking,
 application config) lives in `guardian.db`, a SQLite database (via
 `rusqlite`, WAL mode) created automatically on first boot. Legacy
 JSON files (`antiping.json`, `mutedroles.json`, `warnings.json`, etc.) are
