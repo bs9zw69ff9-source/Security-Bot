@@ -8,7 +8,7 @@
 use once_cell::sync::Lazy;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel, CreateEmbed,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateAllowedMentions, CreateInvite, CreateMessage, CreateWebhook, ExecuteWebhook, GetMessages, EditChannel, EditGuild, EditInteractionResponse,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateAllowedMentions, CreateInvite, CreateMessage, CreateWebhook, ExecuteWebhook, GetMessages, EditGuild, EditInteractionResponse,
     EditMember, EditRole,
 };
 use serenity::client::Context;
@@ -297,14 +297,13 @@ fn spared_from_ban(user: UserId, is_bot: bool, guild_owner: Option<UserId>, invo
 #[derive(Default)]
 struct Tally {
     created: usize,
-    edited: usize,
     deleted: usize,
     failed: usize,
 }
 
 impl Tally {
     fn line(&self, what: &str) -> String {
-        let mut s = format!("**{what}:** {} created, {} updated, {} deleted", self.created, self.edited, self.deleted);
+        let mut s = format!("**{what}:** {} deleted, {} created", self.deleted, self.created);
         if self.failed > 0 {
             s.push_str(&format!(", **{} failed**", self.failed));
         }
@@ -497,12 +496,6 @@ async fn restore_emojis(env: &Env<'_>, b: &Backup) -> String {
     format!("✅ **Emojis:** {removed} removed, {made} added{}", failed_note(done.len() - made, "failed"))
 }
 
-enum Restored<T> {
-    Edited(T),
-    Created(T),
-    Failed,
-}
-
 /// One bulk request to set positions, instead of one request per item.
 async fn patch_positions(env: &Env<'_>, route: Route<'_>, body: serde_json::Value) {
     let Ok(bytes) = serde_json::to_vec(&body) else { return };
@@ -512,10 +505,10 @@ async fn patch_positions(env: &Env<'_>, route: Route<'_>, body: serde_json::Valu
     }
 }
 
-async fn restore_roles(env: &Env<'_>, b: &Backup, reuse: &HashMap<String, RoleId>) -> (HashMap<String, RoleId>, Tally) {
+async fn restore_roles(env: &Env<'_>, b: &Backup) -> (HashMap<String, RoleId>, Tally) {
     let results = par(b.roles.iter(), FAST, |r| async move {
         if env.cancelled() {
-            return (&r.id, Restored::Failed);
+            return (&r.id, None);
         }
         let builder = EditRole::new()
             .name(r.name.clone())
@@ -524,24 +517,19 @@ async fn restore_roles(env: &Env<'_>, b: &Backup, reuse: &HashMap<String, RoleId
             .mentionable(r.mentionable)
             .permissions(perms(&r.permissions))
             .audit_log_reason(&env.reason);
-        let out = match reuse.get(&r.id) {
-            Some(live) => env.gid.edit_role(&env.ctx.http, *live, builder).await.map(|_| Restored::Edited(*live)),
-            None => env.gid.create_role(&env.ctx.http, builder).await.map(|role| Restored::Created(role.id)),
-        };
-        (&r.id, out.unwrap_or(Restored::Failed))
+        (&r.id, env.gid.create_role(&env.ctx.http, builder).await.ok().map(|role| role.id))
     })
     .await;
 
-    let mut map = reuse.clone();
+    let mut map = HashMap::new();
     let mut t = Tally::default();
     for (id, res) in results {
         match res {
-            Restored::Edited(_) => t.edited += 1,
-            Restored::Created(live) => {
+            Some(live) => {
                 t.created += 1;
                 map.insert(id.clone(), live);
             }
-            Restored::Failed => t.failed += 1,
+            None => t.failed += 1,
         }
     }
     // Created concurrently, so their order is whatever finished first. Fix it
@@ -559,73 +547,41 @@ async fn restore_roles(env: &Env<'_>, b: &Backup, reuse: &HashMap<String, RoleId
     (map, t)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Create one channel; `None` if Discord refused.
 async fn restore_channel(
     env: &Env<'_>,
     c: &BChannel,
-    existing: Option<ChannelId>,
     parent: Option<ChannelId>,
     overwrites: Vec<PermissionOverwrite>,
-) -> Restored<ChannelId> {
+) -> Option<ChannelId> {
     if env.cancelled() {
-        return Restored::Failed;
+        return None;
     }
-    let kind = kind_from_num(c.kind);
-    let voice = matches!(c.kind, 2 | 13);
-    let texty = matches!(c.kind, 0 | 5 | 15);
-    let http = &env.ctx.http;
-    match existing {
-        Some(live) => {
-            let mut e = EditChannel::new().name(c.name.clone()).permissions(overwrites);
-            if c.kind != 4 {
-                e = e.category(parent);
-            }
-            if texty {
-                e = e.nsfw(c.nsfw).rate_limit_per_user(c.rate_limit).topic(c.topic.clone().unwrap_or_default());
-            }
-            if voice {
-                if let Some(br) = c.bitrate {
-                    e = e.bitrate(br);
-                }
-                e = e.user_limit(c.user_limit.unwrap_or(0));
-            }
-            match live.edit(http, e.audit_log_reason(&env.reason)).await {
-                Ok(_) => Restored::Edited(live),
-                Err(_) => Restored::Failed,
-            }
-        }
-        None => {
-            let mut e = CreateChannel::new(c.name.clone()).kind(kind).permissions(overwrites);
-            if let Some(p) = parent {
-                e = e.category(p);
-            }
-            if texty {
-                e = e.nsfw(c.nsfw).rate_limit_per_user(c.rate_limit);
-                if let Some(topic) = &c.topic {
-                    e = e.topic(topic.clone());
-                }
-            }
-            if voice {
-                if let Some(br) = c.bitrate {
-                    e = e.bitrate(br);
-                }
-                if let Some(ul) = c.user_limit {
-                    e = e.user_limit(ul);
-                }
-            }
-            match env.gid.create_channel(http, e.audit_log_reason(&env.reason)).await {
-                Ok(ch) => Restored::Created(ch.id),
-                Err(_) => Restored::Failed,
-            }
+    let mut e = CreateChannel::new(c.name.clone()).kind(kind_from_num(c.kind)).permissions(overwrites);
+    if let Some(p) = parent {
+        e = e.category(p);
+    }
+    if matches!(c.kind, 0 | 5 | 15) {
+        e = e.nsfw(c.nsfw).rate_limit_per_user(c.rate_limit);
+        if let Some(topic) = &c.topic {
+            e = e.topic(topic.clone());
         }
     }
+    if matches!(c.kind, 2 | 13) {
+        if let Some(br) = c.bitrate {
+            e = e.bitrate(br);
+        }
+        if let Some(ul) = c.user_limit {
+            e = e.user_limit(ul);
+        }
+    }
+    env.gid.create_channel(&env.ctx.http, e.audit_log_reason(&env.reason)).await.ok().map(|ch| ch.id)
 }
 
 /// Categories first, all at once, then everything inside them, all at once.
 async fn restore_channels(
     env: &Env<'_>,
     b: &Backup,
-    reuse: &HashMap<String, ChannelId>,
     role_map: &HashMap<String, RoleId>,
 ) -> (HashMap<String, ChannelId>, Tally) {
     let everyone_src = &b.guild_id;
@@ -645,25 +601,23 @@ async fn restore_channels(
             .collect()
     };
 
-    let mut map = reuse.clone();
+    let mut map = HashMap::new();
     let mut t = Tally::default();
     let (cats, rest): (Vec<&BChannel>, Vec<&BChannel>) = b.channels.iter().partition(|c| c.kind == 4);
     for group in [cats, rest] {
         let results = par(group, FAST, |c| {
             let parent = c.parent_id.as_ref().and_then(|p| map.get(p).copied());
-            let existing = map.get(&c.id).copied();
             let overwrites = remap(&c.overwrites);
-            async move { (&c.id, restore_channel(env, c, existing, parent, overwrites).await) }
+            async move { (&c.id, restore_channel(env, c, parent, overwrites).await) }
         })
         .await;
         for (id, res) in results {
             match res {
-                Restored::Edited(_) => t.edited += 1,
-                Restored::Created(live) => {
+                Some(live) => {
                     t.created += 1;
                     map.insert(id.clone(), live);
                 }
-                Restored::Failed => t.failed += 1,
+                None => t.failed += 1,
             }
         }
     }
@@ -883,8 +837,8 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     // Deleting, banning and emojis don't depend on each other or on anything
     // restored later, so they all run together.
     l.progress("Clearing out the old server").await;
-    let want_role_deletes = o.delete_roles && !plan.delete_roles.is_empty();
-    let want_channel_deletes = o.delete_channels && !plan.delete_channels.is_empty();
+    let want_role_deletes = !plan.delete_roles.is_empty();
+    let want_channel_deletes = !plan.delete_channels.is_empty();
     let (role_deletes, channel_deletes, current_bans, restored_bans, emojis) = tokio::join!(
         async { if want_role_deletes { Some(delete_roles(&env, &plan.delete_roles).await) } else { None } },
         async { if want_channel_deletes { Some(delete_channels(&env, &plan.delete_channels).await) } else { None } },
@@ -909,14 +863,12 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
         role_tally.deleted = t.deleted;
         role_tally.failed = t.failed;
     }
-    let reuse_roles: HashMap<String, RoleId> = plan.reuse_roles.iter().map(|(k, v)| (k.clone(), RoleId::new(*v))).collect();
-    let mut role_map = reuse_roles.clone();
+    let mut role_map = HashMap::new();
     if o.roles {
         l.progress("Restoring roles").await;
-        let (map, t) = restore_roles(&env, b, &reuse_roles).await;
+        let (map, t) = restore_roles(&env, b).await;
         role_map = map;
         role_tally.created = t.created;
-        role_tally.edited = t.edited;
         role_tally.failed += t.failed;
     }
     if o.roles || want_role_deletes {
@@ -927,15 +879,12 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     }
 
     let mut chan_tally = channel_deletes.unwrap_or_default();
-    let reuse_channels: HashMap<String, ChannelId> =
-        plan.reuse_channels.iter().map(|(k, v)| (k.clone(), ChannelId::new(*v))).collect();
-    let mut chan_map = reuse_channels.clone();
+    let mut chan_map = HashMap::new();
     if o.channels {
         l.progress("Restoring channels").await;
-        let (map, t) = restore_channels(&env, b, &reuse_channels, &role_map).await;
+        let (map, t) = restore_channels(&env, b, &role_map).await;
         chan_map = map;
         chan_tally.created = t.created;
-        chan_tally.edited = t.edited;
         chan_tally.failed += t.failed;
     }
     if o.channels || want_channel_deletes {
@@ -979,9 +928,9 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
 
     if let (Some(live), true) = (&live, o.dm_invite) {
         l.progress("Inviting members back").await;
-        // The channel this was run from goes in a channel rebuild, so the
-        // invite points at a restored one.
-        let channel = if o.channels { invite_channel(b, &chan_map) } else { Some(l.i.channel_id) };
+        // The channel this was run from is deleted along with the rest, so
+        // the invite points at a restored one.
+        let channel = if o.channels || o.delete_channels { invite_channel(b, &chan_map) } else { Some(l.i.channel_id) };
         match channel {
             Some(channel) => {
                 let line = invite_members(&env, b, live, &banned_now, channel).await;
@@ -991,10 +940,10 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
         }
     }
 
-    // A channel rebuild keeps nothing that was there before, including the
+    // Deleting channels keeps nothing that was there before, including the
     // channel this load was started from. It goes last so progress stays
     // visible until the end; the report then comes by DM.
-    if o.channels && !l.cancelled() && !chan_map.values().any(|c| *c == l.i.channel_id) {
+    if (o.channels || o.delete_channels) && !l.cancelled() {
         l.report_channel_gone = l.i.channel_id.delete(&env.ctx.http).await.is_ok();
     }
 }
@@ -1052,42 +1001,31 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
         .iter()
         .map(|(id, r)| LiveRole {
             id: id.get(),
-            name: r.name.clone(),
             locked: *id == gid.everyone_role() || r.managed || r.position >= info.bot_highest,
         })
         .collect();
     let live_chans: Vec<LiveChannel> = live_channels
         .values()
-        .map(|c| LiveChannel { id: c.id.get(), name: c.name.clone(), kind: channel_kind_num(c.kind) })
+        .map(|c| LiveChannel { id: c.id.get(), kind: channel_kind_num(c.kind) })
         .collect();
-    // Anything switched on is rebuilt from scratch rather than matched up
-    // with what's there.
-    let plan_options = backups::PlanOptions {
-        rebuild_roles: o.roles,
-        rebuild_channels: o.channels,
-        delete_roles: o.delete_roles,
-        delete_channels: o.delete_channels,
-    };
-    let plan = backups::plan(&b, &live_roles, &live_chans, plan_options, i.channel_id.get());
+    // Roles and channels are never matched up or kept: switched on, every
+    // existing one is deleted and the backup's are created fresh.
+    let wipe_roles = o.roles || o.delete_roles;
+    let wipe_channels = o.channels || o.delete_channels;
+    let plan = backups::plan(&live_roles, &live_chans, wipe_roles, wipe_channels, i.channel_id.get());
 
     let mut what = Vec::new();
+    if wipe_roles {
+        what.push(format!("• **Delete all {} roles** I can manage", plan.delete_roles.len()));
+    }
     if o.roles {
-        what.push(format!(
-            "• **Delete all {} roles** I can manage and recreate the backup's **{}**",
-            plan.delete_roles.len(),
-            b.roles.len()
-        ));
-    } else if o.delete_roles {
-        what.push(format!("• **Delete {}** role(s) that aren't in the backup", plan.delete_roles.len()));
+        what.push(format!("• Create the backup's **{}** roles", b.roles.len()));
+    }
+    if wipe_channels {
+        what.push(format!("• **Delete all {} channels**, including this one (last)", plan.delete_channels.len() + 1));
     }
     if o.channels {
-        what.push(format!(
-            "• **Delete all {} channels**, including this one (last), and recreate the backup's **{}**",
-            plan.delete_channels.len() + 1,
-            b.channels.len()
-        ));
-    } else if o.delete_channels {
-        what.push(format!("• **Delete {}** channel(s) that aren't in the backup (not this one)", plan.delete_channels.len()));
+        what.push(format!("• Create the backup's **{}** channels", b.channels.len()));
     }
     if o.settings {
         what.push("• Overwrite the server name, icon and settings".to_string());

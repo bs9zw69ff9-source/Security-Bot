@@ -207,9 +207,10 @@ aren't held to the 25-backup limit.
   recreates the backup's, `channels` deletes every channel (the one you ran
   the load from goes last, and the report then comes by DM) and recreates
   the backup's, `emojis` replaces all emojis, and `messages` replays every
-  saved message. `delete_roles` / `delete_channels` only matter with `roles`
-  / `channels` off: then they delete what isn't in the backup and leave the
-  rest.
+  saved message. Existing roles and channels are never matched or reused:
+  `delete_roles` / `delete_channels` also delete every one of them, even on
+  their own. Messages and member roles only come back alongside `channels` /
+  `roles`, since they go into the freshly created ones.
 - Each part is its own option: `settings`, `roles`, `channels`,
   `delete_roles`, `delete_channels` and `emojis` default on; `bans` and
   `members` default off. `dm_invite:true` also DMs every saved member who

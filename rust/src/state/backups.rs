@@ -292,78 +292,37 @@ pub fn due_intervals(now: i64) -> Vec<(String, Interval)> {
     intervals().iter().filter(|(_, iv)| iv.next_at <= now).map(|(g, iv)| (g.clone(), iv.clone())).collect()
 }
 
-/// Which channels and roles a load keeps, edits and deletes, worked out before
-/// anything is touched. Matching is by name (and kind for channels), so loading
-/// a backup over the same server edits things in place instead of recreating
-/// them, and members keep their roles and channels keep their messages.
+/// What a load deletes before recreating anything. Nothing is ever matched up
+/// or kept: whatever is switched on is deleted in full and rebuilt from the
+/// backup.
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
-    /// backup role id -> live role id to edit.
-    pub reuse_roles: HashMap<String, u64>,
     pub delete_roles: Vec<u64>,
-    /// backup channel id -> live channel id to edit.
-    pub reuse_channels: HashMap<String, u64>,
     pub delete_channels: Vec<u64>,
 }
 
 pub struct LiveRole {
     pub id: u64,
-    pub name: String,
-    /// Managed, @everyone, or above the bot: can't be edited or deleted.
+    /// Managed, @everyone, or above the bot: can't be deleted.
     pub locked: bool,
 }
 
 pub struct LiveChannel {
     pub id: u64,
-    pub name: String,
     pub kind: u8,
 }
 
-/// What a load is going to do to the roles and channels already there.
-#[derive(Clone, Copy, Default)]
-pub struct PlanOptions {
-    /// Restore roles from scratch: every existing role goes, every backed-up
-    /// one is created fresh. Nothing is matched or kept.
-    pub rebuild_roles: bool,
-    pub rebuild_channels: bool,
-    /// Without a rebuild: delete what isn't in the backup, edit what is.
-    pub delete_roles: bool,
-    pub delete_channels: bool,
-}
-
-/// `keep_channel` is never in `delete_channels`: it's where the load reports
-/// progress, so a rebuild removes it last, separately.
-pub fn plan(backup: &Backup, live_roles: &[LiveRole], live_channels: &[LiveChannel], o: PlanOptions, keep_channel: u64) -> Plan {
+/// Every role the bot can delete, and every channel. `keep_channel` is left
+/// out: it's where the load reports progress, so it's removed last,
+/// separately.
+pub fn plan(live_roles: &[LiveRole], live_channels: &[LiveChannel], roles: bool, channels: bool, keep_channel: u64) -> Plan {
     let mut plan = Plan::default();
-
-    let mut taken = std::collections::HashSet::new();
-    if !o.rebuild_roles {
-        for r in &backup.roles {
-            if let Some(live) = live_roles.iter().find(|l| !l.locked && l.name == r.name && !taken.contains(&l.id)) {
-                taken.insert(live.id);
-                plan.reuse_roles.insert(r.id.clone(), live.id);
-            }
-        }
+    if roles {
+        plan.delete_roles = live_roles.iter().filter(|l| !l.locked).map(|l| l.id).collect();
     }
-    if o.rebuild_roles || o.delete_roles {
-        plan.delete_roles = live_roles.iter().filter(|l| !l.locked && !taken.contains(&l.id)).map(|l| l.id).collect();
-    }
-
-    let mut taken = std::collections::HashSet::new();
-    if !o.rebuild_channels {
-        for c in &backup.channels {
-            if let Some(live) =
-                live_channels.iter().find(|l| l.name == c.name && l.kind == c.kind && !taken.contains(&l.id))
-            {
-                taken.insert(live.id);
-                plan.reuse_channels.insert(c.id.clone(), live.id);
-            }
-        }
-    }
-    if o.rebuild_channels || o.delete_channels {
+    if channels {
         // Children before categories.
-        let mut doomed: Vec<&LiveChannel> =
-            live_channels.iter().filter(|l| !taken.contains(&l.id) && l.id != keep_channel).collect();
+        let mut doomed: Vec<&LiveChannel> = live_channels.iter().filter(|l| l.id != keep_channel).collect();
         doomed.sort_by_key(|l| l.kind == 4);
         plan.delete_channels = doomed.into_iter().map(|l| l.id).collect();
     }
@@ -431,40 +390,25 @@ mod tests {
     }
 
     #[test]
-    fn plan_reuses_by_name_and_deletes_the_rest() {
-        let b = backup("1");
+    fn plan_deletes_everything_it_can_and_keeps_nothing() {
         let roles = [
-            LiveRole { id: 1, name: "@everyone".into(), locked: true },
-            LiveRole { id: 2, name: "Mod".into(), locked: false },
-            LiveRole { id: 3, name: "Nuker".into(), locked: false },
-            LiveRole { id: 4, name: "Bot".into(), locked: true },
+            LiveRole { id: 1, locked: true },
+            LiveRole { id: 2, locked: false },
+            LiveRole { id: 3, locked: false },
+            LiveRole { id: 4, locked: true },
         ];
         let chans = [
-            LiveChannel { id: 50, name: "general".into(), kind: 0 },
-            LiveChannel { id: 51, name: "general".into(), kind: 2 },
-            LiveChannel { id: 52, name: "spam".into(), kind: 4 },
-            LiveChannel { id: 53, name: "here".into(), kind: 0 },
+            LiveChannel { id: 50, kind: 0 },
+            LiveChannel { id: 52, kind: 4 },
+            LiveChannel { id: 51, kind: 2 },
+            LiveChannel { id: 53, kind: 0 },
         ];
-        let trim = PlanOptions { delete_roles: true, delete_channels: true, ..Default::default() };
-        let p = plan(&b, &roles, &chans, trim, 53);
-        assert_eq!(p.reuse_roles.get("10"), Some(&2));
-        assert!(!p.reuse_roles.contains_key("11"));
-        assert_eq!(p.delete_roles, vec![3], "locked roles are never deleted");
-        assert_eq!(p.reuse_channels.get("20"), Some(&50), "matched by name and kind");
-        assert_eq!(p.delete_channels, vec![51, 52], "categories last, the reporting channel kept");
+        let p = plan(&roles, &chans, true, true, 53);
+        assert_eq!(p.delete_roles, vec![2, 3], "everything but @everyone, managed and above-the-bot roles");
+        assert_eq!(p.delete_channels, vec![50, 51, 52], "every channel, categories last, the reporting one apart");
 
-        let keep = plan(&b, &roles, &chans, PlanOptions::default(), 53);
-        assert!(keep.delete_roles.is_empty() && keep.delete_channels.is_empty());
-
-        // A rebuild keeps nothing: every unlocked role and every channel but
-        // the reporting one goes, and nothing is matched.
-        let rebuild = PlanOptions { rebuild_roles: true, rebuild_channels: true, ..Default::default() };
-        let r = plan(&b, &roles, &chans, rebuild, 53);
-        assert!(r.reuse_roles.is_empty() && r.reuse_channels.is_empty());
-        let mut deleted_roles = r.delete_roles.clone();
-        deleted_roles.sort_unstable();
-        assert_eq!(deleted_roles, vec![2, 3], "everything but @everyone and managed roles");
-        assert_eq!(r.delete_channels, vec![50, 51, 52]);
+        let none = plan(&roles, &chans, false, false, 53);
+        assert!(none.delete_roles.is_empty() && none.delete_channels.is_empty());
     }
 
     #[test]
