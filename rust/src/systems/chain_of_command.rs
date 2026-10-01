@@ -68,7 +68,7 @@ pub fn build_chain_of_command_embed(
         ctx.cache.guild(guild_id).map(|g| g.roles.keys().copied().collect()).unwrap_or_default();
 
     CreateEmbed::new()
-        .color(crate::common::theme::palette::GOLD)
+        .color(crate::common::theme::palette::POWDER)
         .title(if title.is_empty() { "🎖️  CHAIN OF COMMAND" } else { title })
         .footer(crate::common::theme::footer("Chain of Command • updates itself as roles change"))
         .timestamp(Timestamp::now())

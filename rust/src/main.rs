@@ -360,7 +360,7 @@ async fn notify_owners_of_join(ctx: &Context, guild: &Guild) {
                 &ctx.http,
                 serenity::builder::CreateMessage::new().embed(
                     serenity::builder::CreateEmbed::new()
-                        .color(common::theme::palette::MAGENTA)
+                        .color(common::theme::palette::COBALT)
                         .author(serenity::builder::CreateEmbedAuthor::new("➕ NEW SERVER"))
                         .title(format!("🛡️  Guardian joined {}", guild.name))
                         .description(

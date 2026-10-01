@@ -47,7 +47,7 @@ pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]
     let done = progress.iter().filter(|x| **x).count();
 
     CreateEmbed::new()
-        .color(if changes.is_empty() { theme::palette::BLURPLE } else { theme::palette::EMERALD })
+        .color(if changes.is_empty() { theme::palette::SAPPHIRE } else { theme::palette::SKY })
         .author(CreateEmbedAuthor::new(format!("⚙️ SETUP • {}", guild_name.to_uppercase())))
         .title(format!(
             "{}  Setup progress: {done}/{}",

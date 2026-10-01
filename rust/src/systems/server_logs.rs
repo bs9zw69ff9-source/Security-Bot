@@ -32,10 +32,10 @@ use std::sync::Mutex;
 use crate::common::guildinfo::channel_in_guild;
 use crate::state::guild_settings::{gc, update, with};
 
-const GREEN: u32 = 0x43b581; // created / joined / given / unbanned
-const RED: u32 = 0xf04747; // deleted / left / banned / removed
-const ORANGE: u32 = 0xfaa61a; // updated / edited
-const BLUE: u32 = 0x3498db; // voice + informational
+const LOG_ADDED: u32 = 0x38bdf8; // created / joined / given / unbanned (sky)
+const LOG_REMOVED: u32 = 0x1d4ed8; // deleted / left / banned / removed (royal)
+const LOG_CHANGED: u32 = 0x93c5fd; // updated / edited (ice)
+const LOG_NOTICE: u32 = 0x3b82f6; // voice + informational (azure)
 
 pub const CHANNEL_PREFIX: &str = "🗃️│";
 
@@ -54,38 +54,38 @@ const fn lt(key: &'static str, label: &'static str, slug: &'static str, color: u
 /// creates the channels in.
 pub const LOG_TYPES: [LogType; 27] = [
     // Members
-    lt("memberBan", "Member Banned", "ban-log", RED),
-    lt("memberUnban", "Member Unbanned", "unban-log", GREEN),
-    lt("memberJoin", "Member Joined", "join-log", GREEN),
-    lt("memberLeave", "Member Left", "leave-log", RED),
-    lt("memberKick", "Member Kicked", "kick-log", RED),
-    lt("timeout", "Timeout", "timeout-log", ORANGE),
+    lt("memberBan", "Member Banned", "ban-log", LOG_REMOVED),
+    lt("memberUnban", "Member Unbanned", "unban-log", LOG_ADDED),
+    lt("memberJoin", "Member Joined", "join-log", LOG_ADDED),
+    lt("memberLeave", "Member Left", "leave-log", LOG_REMOVED),
+    lt("memberKick", "Member Kicked", "kick-log", LOG_REMOVED),
+    lt("timeout", "Timeout", "timeout-log", LOG_CHANGED),
     // Voice
-    lt("voiceJoin", "Member Joined Voice Channel", "voice-join-log", GREEN),
-    lt("voiceLeave", "Member Left Voice Channel", "voice-leave-log", RED),
-    lt("voiceMove", "Member Moved to Another Voice Channel", "voice-move-log", BLUE),
-    lt("voiceDisconnect", "Member Disconnected from Voice Channel", "voice-disconnect-log", RED),
-    lt("voiceSwitch", "Member Switched Between Voice Channels", "voice-switch-log", BLUE),
-    lt("voiceState", "Voice State", "voice-state-log", BLUE),
+    lt("voiceJoin", "Member Joined Voice Channel", "voice-join-log", LOG_ADDED),
+    lt("voiceLeave", "Member Left Voice Channel", "voice-leave-log", LOG_REMOVED),
+    lt("voiceMove", "Member Moved to Another Voice Channel", "voice-move-log", LOG_NOTICE),
+    lt("voiceDisconnect", "Member Disconnected from Voice Channel", "voice-disconnect-log", LOG_REMOVED),
+    lt("voiceSwitch", "Member Switched Between Voice Channels", "voice-switch-log", LOG_NOTICE),
+    lt("voiceState", "Voice State", "voice-state-log", LOG_NOTICE),
     // Channels
-    lt("channelCreate", "Channel Created", "channel-create-log", GREEN),
-    lt("channelDelete", "Channel Deleted", "channel-delete-log", RED),
-    lt("channelUpdate", "Channel Updated", "channel-update-log", ORANGE),
-    lt("channelPermissions", "Channel Permissions Updated", "channel-permissions-log", ORANGE),
+    lt("channelCreate", "Channel Created", "channel-create-log", LOG_ADDED),
+    lt("channelDelete", "Channel Deleted", "channel-delete-log", LOG_REMOVED),
+    lt("channelUpdate", "Channel Updated", "channel-update-log", LOG_CHANGED),
+    lt("channelPermissions", "Channel Permissions Updated", "channel-permissions-log", LOG_CHANGED),
     // Roles
-    lt("roleCreate", "Role Created", "role-create-log", GREEN),
-    lt("roleDelete", "Role Deleted", "role-delete-log", RED),
-    lt("roleUpdate", "Role Updated", "role-update-log", ORANGE),
-    lt("roleGiven", "Role Given", "role-given-log", GREEN),
-    lt("roleRemoved", "Role Removed", "role-removed-log", RED),
+    lt("roleCreate", "Role Created", "role-create-log", LOG_ADDED),
+    lt("roleDelete", "Role Deleted", "role-delete-log", LOG_REMOVED),
+    lt("roleUpdate", "Role Updated", "role-update-log", LOG_CHANGED),
+    lt("roleGiven", "Role Given", "role-given-log", LOG_ADDED),
+    lt("roleRemoved", "Role Removed", "role-removed-log", LOG_REMOVED),
     // Messages
-    lt("messageDelete", "Message Deleted", "message-delete-log", RED),
-    lt("messageEdit", "Message Edited", "message-edit-log", ORANGE),
+    lt("messageDelete", "Message Deleted", "message-delete-log", LOG_REMOVED),
+    lt("messageEdit", "Message Edited", "message-edit-log", LOG_CHANGED),
     // Server
-    lt("modCommand", "Moderation Command Used", "mod-command-log", BLUE),
-    lt("invites", "Server Invites", "invite-log", BLUE),
-    lt("serverUpdate", "Update Server", "server-update-log", ORANGE),
-    lt("nickname", "Nickname Changed", "nickname-log", ORANGE),
+    lt("modCommand", "Moderation Command Used", "mod-command-log", LOG_NOTICE),
+    lt("invites", "Server Invites", "invite-log", LOG_NOTICE),
+    lt("serverUpdate", "Update Server", "server-update-log", LOG_CHANGED),
+    lt("nickname", "Nickname Changed", "nickname-log", LOG_CHANGED),
 ];
 
 fn log_type(key: &str) -> &'static LogType {
@@ -396,7 +396,7 @@ pub mod build {
                 with_reason(with_mod(e, ex), reason, true)
             }
             None => {
-                let e = base("timeout", s, Some(u), format!("**:stopwatch: <@{}> timeout has been removed**", u.id)).color(GREEN);
+                let e = base("timeout", s, Some(u), format!("**:stopwatch: <@{}> timeout has been removed**", u.id)).color(LOG_ADDED);
                 with_reason(with_mod(e, ex), reason, false)
             }
         }
@@ -567,7 +567,7 @@ pub mod build {
         } else {
             format!("**:link: Invite created: [discord.gg/{code}](https://discord.gg/{code})**")
         };
-        let mut e = base("invites", s, ex, headline).color(if inv.deleted { RED } else { GREEN });
+        let mut e = base("invites", s, ex, headline).color(if inv.deleted { LOG_REMOVED } else { LOG_ADDED });
         if let Some(c) = inv.channel {
             e = e.field("Channel", format!("<#{c}>"), true);
         }

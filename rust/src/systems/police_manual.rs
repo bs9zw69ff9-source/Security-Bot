@@ -6,7 +6,7 @@
 
 use serenity::builder::CreateEmbed;
 
-const POLICE_MANUAL_COLOR: u32 = 0xf59e0b; // orange left bar
+const POLICE_MANUAL_COLOR: u32 = 0x3b82f6; // azure left bar
 
 fn section(title: &str, body: &str) -> String {
     let divider = "-".repeat(42);

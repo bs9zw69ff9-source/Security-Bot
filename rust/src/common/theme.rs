@@ -14,21 +14,22 @@
 use serenity::builder::{CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter};
 use serenity::model::Timestamp;
 
-/// The bold palette. Saturated on purpose: each colour carries meaning at a
-/// glance in a busy log channel.
+/// The palette: all blue, one shade per meaning, so the bot reads as one
+/// colour while each kind of message still stands apart in a busy channel.
+/// Darker means more serious.
 pub mod palette {
-    pub const EMERALD: u32 = 0x2ECC71; // success, restored, unbanned
-    pub const CRIMSON: u32 = 0xED4245; // bans, kicks, errors
-    pub const AMBER: u32 = 0xFFA600; // warnings, purges, heads-ups
-    pub const AZURE: u32 = 0x3BA0FF; // information, status
-    pub const VIOLET: u32 = 0x9B59FF; // moderation in general
-    pub const MAGENTA: u32 = 0xFF2E88; // security systems (anti-spam, raid, ping)
-    pub const INFERNO: u32 = 0xFF3D00; // anti-nuke, critical alerts
-    pub const TANGERINE: u32 = 0xFF7A1A; // mutes
-    pub const TEAL: u32 = 0x1ABC9C; // tickets
-    pub const GOLD: u32 = 0xFFC83D; // applications
-    pub const BLURPLE: u32 = 0x5865F2; // setup / configuration
-    pub const SLATE: u32 = 0x2B2D31; // neutral
+    pub const SKY: u32 = 0x38BDF8; // success, restored, unbanned
+    pub const ROYAL: u32 = 0x1D4ED8; // bans, kicks, errors
+    pub const ICE: u32 = 0x93C5FD; // warnings, purges, heads-ups
+    pub const AZURE: u32 = 0x3B82F6; // information, status
+    pub const INDIGO: u32 = 0x4F46E5; // moderation in general
+    pub const COBALT: u32 = 0x2563EB; // security systems (anti-spam, raid, ping)
+    pub const NAVY: u32 = 0x1E3A8A; // anti-nuke, critical alerts
+    pub const CERULEAN: u32 = 0x0EA5E9; // mutes
+    pub const CYAN: u32 = 0x06B6D4; // tickets
+    pub const POWDER: u32 = 0x7DD3FC; // applications
+    pub const SAPPHIRE: u32 = 0x3B5BDB; // setup / configuration
+    pub const MIDNIGHT: u32 = 0x172554; // neutral
 }
 
 pub const BRAND: &str = "Guardian";
@@ -47,11 +48,11 @@ pub enum Tone {
 impl Tone {
     pub fn color(self) -> u32 {
         match self {
-            Tone::Success => palette::EMERALD,
-            Tone::Error => palette::CRIMSON,
-            Tone::Warning => palette::AMBER,
+            Tone::Success => palette::SKY,
+            Tone::Error => palette::ROYAL,
+            Tone::Warning => palette::ICE,
             Tone::Info => palette::AZURE,
-            Tone::Denied => palette::INFERNO,
+            Tone::Denied => palette::NAVY,
         }
     }
     pub fn icon(self) -> &'static str {
@@ -132,16 +133,16 @@ pub fn card(tone: Tone, title: Option<&str>, body: impl Into<String>) -> CreateE
 /// know their colour.
 pub fn icon_for_color(color: u32) -> &'static str {
     match color {
-        palette::EMERALD => "✅",
-        palette::CRIMSON => "⛔",
-        palette::AMBER => "⚠️",
+        palette::SKY => "✅",
+        palette::ROYAL => "⛔",
+        palette::ICE => "⚠️",
         palette::AZURE => "💡",
-        palette::INFERNO => "☢️",
-        palette::TANGERINE => "🔇",
-        palette::MAGENTA => "🚨",
-        palette::TEAL => "🎫",
-        palette::GOLD => "📝",
-        palette::BLURPLE => "⚙️",
+        palette::NAVY => "☢️",
+        palette::CERULEAN => "🔇",
+        palette::COBALT => "🚨",
+        palette::CYAN => "🎫",
+        palette::POWDER => "📝",
+        palette::SAPPHIRE => "⚙️",
         _ => BRAND_ICON,
     }
 }
@@ -187,10 +188,10 @@ impl ModAction {
     }
     pub fn color(self) -> u32 {
         match self {
-            ModAction::Mute => palette::TANGERINE,
-            ModAction::Unmute | ModAction::Unban => palette::EMERALD,
-            ModAction::Kick | ModAction::Ban => palette::CRIMSON,
-            ModAction::Warn | ModAction::Purge => palette::AMBER,
+            ModAction::Mute => palette::CERULEAN,
+            ModAction::Unmute | ModAction::Unban => palette::SKY,
+            ModAction::Kick | ModAction::Ban => palette::ROYAL,
+            ModAction::Warn | ModAction::Purge => palette::ICE,
         }
     }
     pub fn headline(self) -> &'static str {
@@ -341,7 +342,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
     HelpSection {
         icon: "🔨",
         name: "Moderation",
-        color: palette::VIOLET,
+        color: palette::INDIGO,
         commands: &[
             ("/mute `@user [minutes] [reason]`", "Mute - roles are stashed and handed back on unmute"),
             ("/unmute `@user`", "Unmute and restore stashed roles"),
@@ -358,7 +359,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
     HelpSection {
         icon: "🚨",
         name: "Protection",
-        color: palette::INFERNO,
+        color: palette::NAVY,
         commands: &[
             ("/panic", "Lock **every** text channel at once *(owner)*"),
             ("/antiraid `status|enable|disable`", "Raid protection for this server *(owner)*"),
@@ -369,7 +370,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
     HelpSection {
         icon: "⚙️",
         name: "Setup",
-        color: palette::BLURPLE,
+        color: palette::SAPPHIRE,
         commands: &[
             ("/setup quick", "Mute role + log channels in one step"),
             ("/setup logs", "A 🗃️│ channel for every log type"),
@@ -382,7 +383,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
     HelpSection {
         icon: "🏛️",
         name: "Community",
-        color: palette::TEAL,
+        color: palette::CYAN,
         commands: &[
             ("/tickets", "Ticket types, support roles, categories and panels"),
             ("/applications", "Applications: open, close, panels, review, roles, questions"),
@@ -407,7 +408,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
 pub fn help_cards(window_hours: i64, avatar: Option<String>) -> Vec<CreateEmbed> {
     let total: usize = HELP_SECTIONS.iter().map(|s| s.commands.len()).sum();
     let mut header = CreateEmbed::new()
-        .color(palette::MAGENTA)
+        .color(palette::COBALT)
         .title(format!("{BRAND_ICON}  GUARDIAN • COMMAND CENTER"))
         .description(format!(
             "**Anti-nuke · anti-raid · anti-spam · moderation · server logs**\n\
@@ -458,7 +459,7 @@ mod tests {
     fn cards_carry_brand_footer_and_icon() {
         let j = json(card(Tone::Error, None, "nope"));
         assert_eq!(j["title"], "❌  That didn't work");
-        assert_eq!(j["color"], palette::CRIMSON);
+        assert_eq!(j["color"], palette::ROYAL);
         assert_eq!(j["footer"]["text"], "🛡️ Guardian");
         assert!(j["timestamp"].is_string());
     }
@@ -488,7 +489,7 @@ mod tests {
         assert_eq!(j["fields"][1]["value"], "<@9>");
         assert_eq!(j["fields"][2]["value"], ">>> spam");
         assert_eq!(j["thumbnail"]["url"], "https://cdn/a.png");
-        assert_eq!(j["color"], palette::CRIMSON);
+        assert_eq!(j["color"], palette::ROYAL);
     }
 
     #[test]

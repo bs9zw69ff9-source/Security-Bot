@@ -15,20 +15,20 @@ use crate::state::guild_settings::with;
 /// names so every existing call site picks up the new look unchanged.
 pub mod colors {
     use super::super::theme::palette;
-    pub const SUCCESS: u32 = palette::EMERALD;
-    pub const WARN: u32 = palette::AMBER;
-    pub const DANGER: u32 = palette::CRIMSON;
+    pub const SUCCESS: u32 = palette::SKY;
+    pub const WARN: u32 = palette::ICE;
+    pub const DANGER: u32 = palette::ROYAL;
     pub const INFO: u32 = palette::AZURE;
-    pub const MUTED: u32 = palette::TANGERINE;
-    pub const NUKE: u32 = palette::INFERNO;
-    pub const NEUTRAL: u32 = palette::SLATE;
+    pub const MUTED: u32 = palette::CERULEAN;
+    pub const NUKE: u32 = palette::NAVY;
+    pub const NEUTRAL: u32 = palette::MIDNIGHT;
 }
 
 /// Appy-style accent colours for the application DM flow and review embed.
-pub const APPY_GREEN: u32 = 0x57f287; // intro / submitted / accepted (green left bar)
-pub const APPY_BLURPLE: u32 = 0x5865f2; // per-question prompts (blurple left bar)
-pub const APPY_RED: u32 = 0xed4245; // denied (red left bar)
-pub const APP_PENDING: u32 = 0xf59e0b; // review pending (orange left bar)
+pub const APPY_GREEN: u32 = 0x38bdf8; // intro / submitted / accepted (sky)
+pub const APPY_BLURPLE: u32 = 0x3b5bdb; // per-question prompts (sapphire)
+pub const APPY_RED: u32 = 0x1d4ed8; // denied (royal)
+pub const APP_PENDING: u32 = 0x93c5fd; // review pending (ice)
 
 /// The standard Guardian embed: bold colour bar, an icon matched to the
 /// colour in front of the title, the Guardian footer and a timestamp.

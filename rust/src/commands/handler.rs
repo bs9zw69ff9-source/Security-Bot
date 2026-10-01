@@ -738,7 +738,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 ctx,
                 i,
                 CreateEmbed::new()
-                    .color(theme::palette::AMBER)
+                    .color(theme::palette::ICE)
                     .author(serenity::builder::CreateEmbedAuthor::new(format!("⚠️ WARNING HISTORY • {tag}")))
                     .description(format!("<@{target_id}> has **{} warning{}** on record.\n\n{lines}", list.len(), plural(list.len())))
                     .footer(CreateEmbedFooter::new(format!(
@@ -790,7 +790,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     ctx,
                     i,
                     CreateEmbed::new()
-                        .color(theme::palette::EMERALD)
+                        .color(theme::palette::SKY)
                         .title("♾️  YOUR MOD LIMITS")
                         .description("You're whitelisted, so none of the rate limits apply to you.")
                         .timestamp(Timestamp::now()),
@@ -807,7 +807,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 ("lockdown", "🔒", "Lockdowns"),
             ];
             let mut e = CreateEmbed::new()
-                .color(theme::palette::VIOLET)
+                .color(theme::palette::INDIGO)
                 .title("📊  YOUR MOD ACTION LIMITS")
                 .thumbnail(i.user.face())
                 .description(format!(
@@ -1020,7 +1020,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let mod_role = opts.role("mod_role");
                     let r = quick_setup_guild(ctx, guild_id, mod_role).await;
                     let mut e = build_setup_embed(guild_id, &info.name, &[]);
-                    e = e.color(theme::palette::EMERALD).description(format!(
+                    e = e.color(theme::palette::SKY).description(format!(
                         "⚡ **Quick setup finished.**\n{}{}\nNext: `/setup logs` for a channel per log type.",
                         if r.created.is_empty() { String::new() } else { format!("🆕 **Created:** {}\n", r.created.join(", ")) },
                         if r.reused.is_empty() { String::new() } else { format!("♻️ **Reused:** {}\n", r.reused.join(", ")) },
@@ -1235,7 +1235,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let g = gc(&gid);
                     let a = ap(&gid);
                     let infra = CreateEmbed::new()
-                        .color(theme::palette::BLURPLE)
+                        .color(theme::palette::SAPPHIRE)
                         .title("⚙️  CONFIGURATION • INFRASTRUCTURE")
                         .field("👑 Owner(s)", BOT_OWNER_IDS.iter().map(|id| format!("<@{id}>")).collect::<Vec<_>>().join(", "), false)
                         .field("📜 Log Channel", opt_channel(&g.log_channel_id), true)
@@ -1301,7 +1301,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 ctx,
                 i,
                 CreateEmbed::new()
-                    .color(if need.iter().all(|(_, p)| my_perms.contains(*p)) { theme::palette::EMERALD } else { theme::palette::AMBER })
+                    .color(if need.iter().all(|(_, p)| my_perms.contains(*p)) { theme::palette::SKY } else { theme::palette::ICE })
                     .title("☢️  ANTI-NUKE • SYSTEM CHECK")
                     .description("🟢 **Anti-nuke is armed and watching the audit log.**")
                     .field("🔑 My permissions", status, false)
@@ -2066,10 +2066,10 @@ fn nuke_trip(
 /// and which are the bot-wide default.
 fn module_card(g: &crate::state::guild_settings::GuildSettings, module: Module) -> CreateEmbed {
     let (color, icon, on) = match module {
-        Module::AntiNuke => (theme::palette::INFERNO, "☢️", Some(!g.antinuke_disabled)),
-        Module::AntiRaid => (theme::palette::MAGENTA, "🚪", Some(!g.antiraid_disabled)),
-        Module::AntiSpam => (theme::palette::AMBER, "🧹", Some(!g.antispam_disabled)),
-        Module::Moderation => (theme::palette::VIOLET, "🔨", None),
+        Module::AntiNuke => (theme::palette::NAVY, "☢️", Some(!g.antinuke_disabled)),
+        Module::AntiRaid => (theme::palette::COBALT, "🚪", Some(!g.antiraid_disabled)),
+        Module::AntiSpam => (theme::palette::ICE, "🧹", Some(!g.antispam_disabled)),
+        Module::Moderation => (theme::palette::INDIGO, "🔨", None),
     };
     let lines = Tunable::ALL
         .iter()
