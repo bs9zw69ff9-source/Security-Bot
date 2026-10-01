@@ -13,11 +13,14 @@ use serenity::builder::{
 };
 use serenity::client::Context;
 use serenity::collector::ComponentInteractionCollector;
+use serenity::http::{LightMethod, Request, Route};
 use serenity::model::application::{ButtonStyle, CommandInteraction, ResolvedOption, ResolvedValue};
 use serenity::model::channel::{MessageType, PermissionOverwrite, PermissionOverwriteType};
 use serenity::model::guild::{AfkTimeout, DefaultMessageNotificationLevel, ExplicitContentFilter, VerificationLevel};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use serenity::model::Permissions;
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -369,69 +372,277 @@ impl Loader<'_> {
     }
 }
 
-async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
-    let (ctx, gid) = (l.ctx, l.guild_id);
-    let reason = format!("Backup {} loaded", b.id);
+/// How many requests of each kind run at once. Discord's per-route limits
+/// still apply and serenity waits them out, so this only sets how many are
+/// kept in flight; the global limit is 50 requests a second.
+const FAST: usize = 24;
+/// Channels replayed at once. Each has its own webhook and its own limit.
+const REPLAYS: usize = 8;
+/// Invite DMs at once. DMs are limited far more tightly than anything else.
+const DMS: usize = 4;
+/// Users per bulk-ban request, Discord's maximum.
+const BULK_BAN: usize = 200;
 
-    // Roles.
-    let mut role_map: HashMap<String, RoleId> =
-        plan.reuse_roles.iter().map(|(k, v)| (k.clone(), RoleId::new(*v))).collect();
+/// Run `f` over `items`, up to `limit` at a time, in no particular order.
+///
+/// Boxed and spelled out with `Send` bounds: left to inference, the compiler
+/// can't prove the borrowed futures `Send` for every lifetime.
+fn par<'a, I, R, F, Fut>(items: I, limit: usize, f: F) -> BoxFuture<'a, Vec<R>>
+where
+    I: IntoIterator + Send + 'a,
+    I::IntoIter: Send,
+    I::Item: Send + 'a,
+    R: Send + 'a,
+    F: FnMut(I::Item) -> Fut + Send + 'a,
+    Fut: std::future::Future<Output = R> + Send + 'a,
+{
+    futures::stream::iter(items).map(f).buffer_unordered(limit).collect().boxed()
+}
+
+struct Env<'a> {
+    ctx: &'a Context,
+    gid: GuildId,
+    cancel: &'a AtomicBool,
+    reason: String,
+}
+
+impl Env<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+fn failed_note(failed: usize, why: &str) -> String {
+    if failed > 0 {
+        format!(", **{failed} {why}**")
+    } else {
+        String::new()
+    }
+}
+
+async fn delete_roles(env: &Env<'_>, ids: &[u64]) -> Tally {
+    let done = par(ids, FAST, |id| async move {
+        !env.cancelled() && env.gid.delete_role(&env.ctx.http, RoleId::new(*id)).await.is_ok()
+    })
+    .await;
+    let deleted = done.iter().filter(|ok| **ok).count();
+    Tally { deleted, failed: if env.cancelled() { 0 } else { done.len() - deleted }, ..Tally::default() }
+}
+
+async fn delete_channels(env: &Env<'_>, ids: &[u64]) -> Tally {
+    // Children first would only matter for ordering; deleting a category
+    // leaves its children in place, so everything can go at once.
+    let done = par(ids, FAST, |id| async move {
+        !env.cancelled() && ChannelId::new(*id).delete(&env.ctx.http).await.is_ok()
+    })
+    .await;
+    let deleted = done.iter().filter(|ok| **ok).count();
+    Tally { deleted, failed: if env.cancelled() { 0 } else { done.len() - deleted }, ..Tally::default() }
+}
+
+/// Ban `users` in bulk requests of 200. Returns who was banned and how many
+/// weren't.
+async fn ban_many(env: &Env<'_>, users: &[UserId], reason: &str) -> (Vec<UserId>, usize) {
+    let results = par(users.chunks(BULK_BAN), 4, |chunk| async move {
+        if env.cancelled() {
+            return (Vec::new(), 0);
+        }
+        match env.gid.bulk_ban(&env.ctx.http, chunk, 0, Some(reason)).await {
+            Ok(r) => (r.banned_users, r.failed_users.len()),
+            Err(_) => (Vec::new(), chunk.len()),
+        }
+    })
+    .await;
+    results.into_iter().fold((Vec::new(), 0), |(mut banned, failed), (b, f)| {
+        banned.extend(b);
+        (banned, failed + f)
+    })
+}
+
+/// `ban_members`: everyone currently in the server except those spared.
+async fn ban_current(env: &Env<'_>, invoker: UserId) -> (HashSet<UserId>, String) {
+    let current = match all_members(env.ctx, env.gid).await {
+        Ok(m) => m,
+        Err(e) => return (HashSet::new(), format!("⚠️ **Bans:** skipped, I couldn't read the member list: {e}")),
+    };
+    let owner = env.ctx.cache.guild(env.gid).map(|g| g.owner_id);
+    let targets: Vec<UserId> = current
+        .iter()
+        .filter(|m| !spared_from_ban(m.user.id, m.user.bot, owner, invoker))
+        .map(|m| m.user.id)
+        .collect();
+    let (banned, failed) = ban_many(env, &targets, &env.reason).await;
+    let line = format!(
+        "✅ **Bans:** banned {} current members{}",
+        banned.len(),
+        failed_note(failed, "couldn't be banned** (above me, or already gone")
+    );
+    (banned.into_iter().collect(), line)
+}
+
+async fn restore_bans(env: &Env<'_>, b: &Backup) -> String {
+    let users: Vec<UserId> = b.bans.iter().filter_map(|x| id_of(&x.user_id).map(UserId::new)).collect();
+    let (banned, failed) = ban_many(env, &users, "Restored from a backup").await;
+    format!("✅ **Bans:** {} restored{}", banned.len(), failed_note(failed, "failed"))
+}
+
+async fn restore_emojis(env: &Env<'_>, b: &Backup) -> String {
+    let existing: HashSet<String> =
+        env.ctx.cache.guild(env.gid).map(|g| g.emojis.values().map(|e| e.name.clone()).collect()).unwrap_or_default();
+    let done = par(b.emojis.iter().filter(|e| !existing.contains(&e.name)), 6, |e| async move {
+        if env.cancelled() {
+            return true;
+        }
+        match CreateAttachment::url(&env.ctx.http, &e.url).await {
+            Ok(img) => env.gid.create_emoji(&env.ctx.http, &e.name, &img.to_base64()).await.is_ok(),
+            Err(_) => false,
+        }
+    })
+    .await;
+    let made = done.iter().filter(|ok| **ok).count();
+    format!("✅ **Emojis:** {made} added{}", failed_note(done.len() - made, "failed"))
+}
+
+enum Restored<T> {
+    Edited(T),
+    Created(T),
+    Failed,
+}
+
+/// One bulk request to set positions, instead of one request per item.
+async fn patch_positions(env: &Env<'_>, route: Route<'_>, body: serde_json::Value) {
+    let Ok(bytes) = serde_json::to_vec(&body) else { return };
+    let req = Request::new(route, LightMethod::Patch).body(Some(bytes));
+    if let Err(e) = env.ctx.http.fire::<serde_json::Value>(req).await {
+        eprintln!("⚠️ [{}] backup load couldn't set positions: {e}", env.gid);
+    }
+}
+
+async fn restore_roles(env: &Env<'_>, b: &Backup, reuse: &HashMap<String, RoleId>) -> (HashMap<String, RoleId>, Tally) {
+    let results = par(b.roles.iter(), FAST, |r| async move {
+        if env.cancelled() {
+            return (&r.id, Restored::Failed);
+        }
+        let builder = EditRole::new()
+            .name(r.name.clone())
+            .colour(r.color as u64)
+            .hoist(r.hoist)
+            .mentionable(r.mentionable)
+            .permissions(perms(&r.permissions))
+            .audit_log_reason(&env.reason);
+        let out = match reuse.get(&r.id) {
+            Some(live) => env.gid.edit_role(&env.ctx.http, *live, builder).await.map(|_| Restored::Edited(*live)),
+            None => env.gid.create_role(&env.ctx.http, builder).await.map(|role| Restored::Created(role.id)),
+        };
+        (&r.id, out.unwrap_or(Restored::Failed))
+    })
+    .await;
+
+    let mut map = reuse.clone();
     let mut t = Tally::default();
-    if o.delete_roles && !plan.delete_roles.is_empty() {
-        l.progress("Deleting roles that aren't in the backup").await;
-        for id in &plan.delete_roles {
-            if l.cancelled() {
-                return;
+    for (id, res) in results {
+        match res {
+            Restored::Edited(_) => t.edited += 1,
+            Restored::Created(live) => {
+                t.created += 1;
+                map.insert(id.clone(), live);
             }
-            match gid.delete_role(&ctx.http, RoleId::new(*id)).await {
-                Ok(()) => t.deleted += 1,
-                Err(_) => t.failed += 1,
-            }
+            Restored::Failed => t.failed += 1,
         }
     }
-    if o.roles {
-        l.progress("Restoring roles").await;
-        // Highest first: a new role lands at the bottom, so this leaves the
-        // created ones in the backup's order.
-        for r in b.roles.iter().rev() {
-            if l.cancelled() {
-                return;
-            }
-            let builder = EditRole::new()
-                .name(r.name.clone())
-                .colour(r.color as u64)
-                .hoist(r.hoist)
-                .mentionable(r.mentionable)
-                .permissions(perms(&r.permissions))
-                .audit_log_reason(&reason);
-            match role_map.get(&r.id) {
-                Some(live) => match gid.edit_role(&ctx.http, *live, builder).await {
-                    Ok(_) => t.edited += 1,
-                    Err(_) => t.failed += 1,
-                },
-                None => match gid.create_role(&ctx.http, builder).await {
-                    Ok(role) => {
-                        t.created += 1;
-                        role_map.insert(r.id.clone(), role.id);
-                    }
-                    Err(_) => t.failed += 1,
-                },
-            }
-        }
+    // Created concurrently, so their order is whatever finished first. Fix it
+    // in one request: the backup's order, bottom up.
+    let order: Vec<serde_json::Value> = b
+        .roles
+        .iter()
+        .filter_map(|r| map.get(&r.id))
+        .enumerate()
+        .map(|(n, live)| serde_json::json!({ "id": live, "position": n + 1 }))
+        .collect();
+    if !order.is_empty() && !env.cancelled() {
+        patch_positions(env, Route::GuildRoles { guild_id: env.gid }, serde_json::Value::Array(order)).await;
     }
-    if o.roles || o.delete_roles {
-        l.lines.push(format!("✅ {}", t.line("Roles")));
-    }
+    (map, t)
+}
 
-    let everyone_src = b.guild_id.clone();
+#[allow(clippy::too_many_arguments)]
+async fn restore_channel(
+    env: &Env<'_>,
+    c: &BChannel,
+    existing: Option<ChannelId>,
+    parent: Option<ChannelId>,
+    overwrites: Vec<PermissionOverwrite>,
+) -> Restored<ChannelId> {
+    if env.cancelled() {
+        return Restored::Failed;
+    }
+    let kind = kind_from_num(c.kind);
+    let voice = matches!(c.kind, 2 | 13);
+    let texty = matches!(c.kind, 0 | 5 | 15);
+    let http = &env.ctx.http;
+    match existing {
+        Some(live) => {
+            let mut e = EditChannel::new().name(c.name.clone()).permissions(overwrites);
+            if c.kind != 4 {
+                e = e.category(parent);
+            }
+            if texty {
+                e = e.nsfw(c.nsfw).rate_limit_per_user(c.rate_limit).topic(c.topic.clone().unwrap_or_default());
+            }
+            if voice {
+                if let Some(br) = c.bitrate {
+                    e = e.bitrate(br);
+                }
+                e = e.user_limit(c.user_limit.unwrap_or(0));
+            }
+            match live.edit(http, e.audit_log_reason(&env.reason)).await {
+                Ok(_) => Restored::Edited(live),
+                Err(_) => Restored::Failed,
+            }
+        }
+        None => {
+            let mut e = CreateChannel::new(c.name.clone()).kind(kind).permissions(overwrites);
+            if let Some(p) = parent {
+                e = e.category(p);
+            }
+            if texty {
+                e = e.nsfw(c.nsfw).rate_limit_per_user(c.rate_limit);
+                if let Some(topic) = &c.topic {
+                    e = e.topic(topic.clone());
+                }
+            }
+            if voice {
+                if let Some(br) = c.bitrate {
+                    e = e.bitrate(br);
+                }
+                if let Some(ul) = c.user_limit {
+                    e = e.user_limit(ul);
+                }
+            }
+            match env.gid.create_channel(http, e.audit_log_reason(&env.reason)).await {
+                Ok(ch) => Restored::Created(ch.id),
+                Err(_) => Restored::Failed,
+            }
+        }
+    }
+}
+
+/// Categories first, all at once, then everything inside them, all at once.
+async fn restore_channels(
+    env: &Env<'_>,
+    b: &Backup,
+    reuse: &HashMap<String, ChannelId>,
+    role_map: &HashMap<String, RoleId>,
+) -> (HashMap<String, ChannelId>, HashSet<ChannelId>, Tally) {
+    let everyone_src = &b.guild_id;
     let remap = |ows: &[BOverwrite]| -> Vec<PermissionOverwrite> {
         ows.iter()
             .filter_map(|o| {
                 let (allow, deny) = (perms(&o.allow), perms(&o.deny));
                 let kind = if o.kind == 1 {
                     PermissionOverwriteType::Member(UserId::new(id_of(&o.id)?))
-                } else if o.id == everyone_src {
-                    PermissionOverwriteType::Role(gid.everyone_role())
+                } else if &o.id == everyone_src {
+                    PermissionOverwriteType::Role(env.gid.everyone_role())
                 } else {
                     PermissionOverwriteType::Role(*role_map.get(&o.id)?)
                 };
@@ -440,375 +651,362 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
             .collect()
     };
 
-    // Channels.
-    let mut created_channels: HashSet<ChannelId> = HashSet::new();
-    let mut chan_map: HashMap<String, ChannelId> =
-        plan.reuse_channels.iter().map(|(k, v)| (k.clone(), ChannelId::new(*v))).collect();
+    let mut map = reuse.clone();
+    let mut created = HashSet::new();
     let mut t = Tally::default();
-    if o.delete_channels && !plan.delete_channels.is_empty() {
-        l.progress("Deleting channels that aren't in the backup").await;
-        for id in &plan.delete_channels {
-            if l.cancelled() {
-                return;
-            }
-            match ChannelId::new(*id).delete(&ctx.http).await {
-                Ok(_) => t.deleted += 1,
-                Err(_) => t.failed += 1,
-            }
-        }
-    }
-    if o.channels {
-        l.progress("Restoring channels").await;
-        let (cats, rest): (Vec<&BChannel>, Vec<&BChannel>) = b.channels.iter().partition(|c| c.kind == 4);
-        for c in cats.into_iter().chain(rest) {
-            if l.cancelled() {
-                return;
-            }
-            let kind = kind_from_num(c.kind);
-            let voice = matches!(c.kind, 2 | 13);
-            let texty = matches!(c.kind, 0 | 5 | 15);
-            let parent = c.parent_id.as_ref().and_then(|p| chan_map.get(p).copied());
-            let position = c.position.clamp(0, u16::MAX as i64) as u16;
+    let (cats, rest): (Vec<&BChannel>, Vec<&BChannel>) = b.channels.iter().partition(|c| c.kind == 4);
+    for group in [cats, rest] {
+        let results = par(group, FAST, |c| {
+            let parent = c.parent_id.as_ref().and_then(|p| map.get(p).copied());
+            let existing = map.get(&c.id).copied();
             let overwrites = remap(&c.overwrites);
-            match chan_map.get(&c.id).copied() {
-                Some(live) => {
-                    let mut e = EditChannel::new().name(c.name.clone()).position(position).permissions(overwrites);
-                    if c.kind != 4 {
-                        e = e.category(parent);
-                    }
-                    if texty {
-                        e = e.nsfw(c.nsfw).rate_limit_per_user(c.rate_limit).topic(c.topic.clone().unwrap_or_default());
-                    }
-                    if voice {
-                        if let Some(br) = c.bitrate {
-                            e = e.bitrate(br);
-                        }
-                        e = e.user_limit(c.user_limit.unwrap_or(0));
-                    }
-                    match live.edit(&ctx.http, e.audit_log_reason(&reason)).await {
-                        Ok(_) => t.edited += 1,
-                        Err(_) => t.failed += 1,
-                    }
+            async move { (&c.id, restore_channel(env, c, existing, parent, overwrites).await) }
+        })
+        .await;
+        for (id, res) in results {
+            match res {
+                Restored::Edited(_) => t.edited += 1,
+                Restored::Created(live) => {
+                    t.created += 1;
+                    created.insert(live);
+                    map.insert(id.clone(), live);
                 }
-                None => {
-                    let mut e =
-                        CreateChannel::new(c.name.clone()).kind(kind).position(position).permissions(overwrites);
-                    if let Some(p) = parent {
-                        e = e.category(p);
-                    }
-                    if texty {
-                        e = e.nsfw(c.nsfw).rate_limit_per_user(c.rate_limit);
-                        if let Some(topic) = &c.topic {
-                            e = e.topic(topic.clone());
-                        }
-                    }
-                    if voice {
-                        if let Some(br) = c.bitrate {
-                            e = e.bitrate(br);
-                        }
-                        if let Some(ul) = c.user_limit {
-                            e = e.user_limit(ul);
-                        }
-                    }
-                    match gid.create_channel(&ctx.http, e.audit_log_reason(&reason)).await {
-                        Ok(ch) => {
-                            t.created += 1;
-                            created_channels.insert(ch.id);
-                            chan_map.insert(c.id.clone(), ch.id);
-                        }
-                        Err(_) => t.failed += 1,
-                    }
-                }
+                Restored::Failed => t.failed += 1,
             }
-        }
-    }
-    if o.channels || o.delete_channels {
-        l.lines.push(format!("✅ {}", t.line("Channels")));
-    }
-
-    if o.settings {
-        if l.cancelled() {
-            return;
-        }
-        l.progress("Restoring server settings").await;
-        let s = &b.settings;
-        let mut e = EditGuild::new()
-            .name(s.name.clone())
-            .verification_level(VerificationLevel::from(s.verification_level))
-            .default_message_notifications(Some(DefaultMessageNotificationLevel::from(s.default_notifications)))
-            .explicit_content_filter(Some(ExplicitContentFilter::from(s.explicit_content_filter)))
-            .afk_timeout(afk_timeout(s.afk_timeout))
-            .afk_channel(s.afk_channel.as_ref().and_then(|c| chan_map.get(c).copied()))
-            .system_channel_id(s.system_channel.as_ref().and_then(|c| chan_map.get(c).copied()))
-            .audit_log_reason(&reason);
-        let icon = match &s.icon_url {
-            Some(url) => CreateAttachment::url(&ctx.http, url).await.ok(),
-            None => None,
-        };
-        if icon.is_some() {
-            e = e.icon(icon.as_ref());
-        }
-        let mut notes = Vec::new();
-        if s.icon_url.is_some() && icon.is_none() {
-            notes.push("icon couldn't be downloaded");
-        }
-        if gid.edit(&ctx.http, e).await.is_err() {
-            notes.push("some settings were refused");
-        }
-        let everyone = EditRole::new().permissions(perms(&s.everyone_permissions));
-        if gid.edit_role(&ctx.http, gid.everyone_role(), everyone).await.is_err() {
-            notes.push("@everyone permissions weren't changed");
-        }
-        l.lines.push(if notes.is_empty() {
-            "✅ **Settings:** name, icon, verification, notifications, AFK, system channel, @everyone".to_string()
-        } else {
-            format!("⚠️ **Settings:** restored, but {}", notes.join(", "))
-        });
-    }
-
-    if o.emojis && !b.emojis.is_empty() {
-        l.progress("Restoring emojis").await;
-        let existing: HashSet<String> =
-            ctx.cache.guild(gid).map(|g| g.emojis.values().map(|e| e.name.clone()).collect()).unwrap_or_default();
-        let (mut made, mut failed) = (0, 0);
-        for e in b.emojis.iter().filter(|e| !existing.contains(&e.name)) {
-            if l.cancelled() {
-                return;
-            }
-            let ok = match CreateAttachment::url(&ctx.http, &e.url).await {
-                Ok(img) => gid.create_emoji(&ctx.http, &e.name, &img.to_base64()).await.is_ok(),
-                Err(_) => false,
-            };
-            if ok {
-                made += 1;
-            } else {
-                failed += 1;
-            }
-        }
-        l.lines.push(format!("✅ **Emojis:** {made} added{}", if failed > 0 { format!(", **{failed} failed**") } else { String::new() }));
-    }
-
-    if o.bans && !b.bans.is_empty() {
-        l.progress("Restoring bans").await;
-        let (mut done, mut failed) = (0, 0);
-        for ban in &b.bans {
-            if l.cancelled() {
-                return;
-            }
-            let Some(uid) = id_of(&ban.user_id) else { continue };
-            let why: String = ban.reason.as_deref().unwrap_or("Restored from a backup").chars().take(400).collect();
-            match gid.ban_with_reason(&ctx.http, UserId::new(uid), 0, why).await {
-                Ok(()) => done += 1,
-                Err(_) => failed += 1,
-            }
-        }
-        l.lines.push(format!("✅ **Bans:** {done} restored{}", if failed > 0 { format!(", **{failed} failed**") } else { String::new() }));
-    }
-
-    if o.messages {
-        let targets: Vec<(&BChannel, ChannelId)> = b
-            .channels
-            .iter()
-            .filter(|c| !c.messages.is_empty())
-            .filter_map(|c| chan_map.get(&c.id).map(|id| (c, *id)))
-            .collect();
-        let (mut sent, mut failed, mut kept) = (0usize, 0usize, 0usize);
-        for (n, (c, channel)) in targets.iter().enumerate() {
-            l.progress(&format!("Restoring messages in #{} ({}/{})", c.name, n + 1, targets.len())).await;
-            // A channel that already existed may still hold some or all of
-            // these, originals or copies from an earlier load. Only the
-            // missing ones are posted, so loading twice never doubles them.
-            let present: HashSet<(i64, String)> = if created_channels.contains(channel) {
-                HashSet::new()
-            } else {
-                match recent_messages(ctx, *channel, DEDUPE_DEPTH).await {
-                    Ok(ms) => ms.iter().map(message_key).collect(),
-                    Err(_) => {
-                        failed += c.messages.len();
-                        continue;
-                    }
-                }
-            };
-            let missing: Vec<&BMessage> = c.messages.iter().filter(|m| !present.contains(&message_key(m))).collect();
-            kept += c.messages.len() - missing.len();
-            if missing.is_empty() {
-                continue;
-            }
-            let hook = match channel.create_webhook(&ctx.http, CreateWebhook::new("Backup restore")).await {
-                Ok(h) => h,
-                Err(_) => {
-                    failed += c.messages.len();
-                    continue;
-                }
-            };
-            for m in missing {
-                if l.cancelled() {
-                    let _ = hook.delete(&ctx.http).await;
-                    return;
-                }
-                let mut exec = ExecuteWebhook::new()
-                    .username(webhook_name(&m.author))
-                    .avatar_url(m.avatar.clone())
-                    .content(replay_text(m))
-                    .allowed_mentions(CreateAllowedMentions::new());
-                if !m.embeds.is_empty() {
-                    exec = exec.embeds(m.embeds.iter().take(10).cloned().map(CreateEmbed::from).collect());
-                }
-                match hook.execute(&ctx.http, m.pinned, exec).await {
-                    Ok(posted) => {
-                        sent += 1;
-                        if let Some(msg) = posted {
-                            let _ = channel.pin(&ctx.http, msg.id).await;
-                        }
-                    }
-                    Err(_) => failed += 1,
-                }
-            }
-            let _ = hook.delete(&ctx.http).await;
-        }
-        l.lines.push(format!(
-            "✅ **Messages:** {sent} replayed across {} channel(s), {kept} skipped as already there{}",
-            targets.len(),
-            if failed > 0 { format!(", **{failed} failed**") } else { String::new() }
-        ));
-    }
-
-    // Everyone this load banned, so the invite step can lift the ban on the
-    // ones it is inviting back: a banned person can't use an invite.
-    let mut banned_now: HashSet<UserId> = HashSet::new();
-    if o.ban_members {
-        l.progress("Reading the member list").await;
-        match all_members(ctx, gid).await {
-            Ok(current) => {
-                let owner = ctx.cache.guild(gid).map(|g| g.owner_id);
-                let targets: Vec<UserId> = current
-                    .iter()
-                    .filter(|m| !spared_from_ban(m.user.id, m.user.bot, owner, l.i.user.id))
-                    .map(|m| m.user.id)
-                    .collect();
-                l.progress(&format!("Banning {} current members", targets.len())).await;
-                let mut failed = 0usize;
-                for user in targets {
-                    if l.cancelled() {
-                        l.lines.push(format!("🛑 **Bans:** stopped after {}", banned_now.len()));
-                        return;
-                    }
-                    match gid.ban_with_reason(&ctx.http, user, 0, &reason).await {
-                        Ok(()) => {
-                            banned_now.insert(user);
-                        }
-                        Err(_) => failed += 1,
-                    }
-                }
-                l.lines.push(format!(
-                    "✅ **Bans:** banned {} current members{}",
-                    banned_now.len(),
-                    if failed > 0 { format!(", **{failed} couldn't be banned** (above me, or already gone)") } else { String::new() }
-                ));
-            }
-            Err(e) => l.lines.push(format!("⚠️ **Bans:** skipped, I couldn't read the member list: {e}")),
         }
     }
 
-    if (!o.members && !o.dm_invite) || b.members.is_empty() {
-        return;
+    // One request for the order and the parents, rather than one per channel.
+    let layout: Vec<serde_json::Value> = b
+        .channels
+        .iter()
+        .filter_map(|c| {
+            let live = map.get(&c.id)?;
+            let mut v = serde_json::json!({ "id": live, "position": c.position.max(0) });
+            if c.kind != 4 {
+                v["parent_id"] = match c.parent_id.as_ref().and_then(|p| map.get(p)) {
+                    Some(p) => serde_json::json!(p),
+                    None => serde_json::Value::Null,
+                };
+            }
+            Some(v)
+        })
+        .collect();
+    if !layout.is_empty() && !env.cancelled() {
+        patch_positions(env, Route::GuildChannels { guild_id: env.gid }, serde_json::Value::Array(layout)).await;
     }
-    l.progress("Reading the member list").await;
-    let live = match all_members(ctx, gid).await {
-        Ok(m) => m,
-        Err(e) => {
-            l.lines.push(format!("⚠️ **Members:** skipped, I couldn't read the member list: {e}"));
-            return;
+    (map, created, t)
+}
+
+async fn restore_settings(env: &Env<'_>, b: &Backup, chan_map: &HashMap<String, ChannelId>) -> String {
+    let (ctx, gid, s) = (env.ctx, env.gid, &b.settings);
+    let mut e = EditGuild::new()
+        .name(s.name.clone())
+        .verification_level(VerificationLevel::from(s.verification_level))
+        .default_message_notifications(Some(DefaultMessageNotificationLevel::from(s.default_notifications)))
+        .explicit_content_filter(Some(ExplicitContentFilter::from(s.explicit_content_filter)))
+        .afk_timeout(afk_timeout(s.afk_timeout))
+        .afk_channel(s.afk_channel.as_ref().and_then(|c| chan_map.get(c).copied()))
+        .system_channel_id(s.system_channel.as_ref().and_then(|c| chan_map.get(c).copied()))
+        .audit_log_reason(&env.reason);
+    let icon = match &s.icon_url {
+        Some(url) => CreateAttachment::url(&ctx.http, url).await.ok(),
+        None => None,
+    };
+    if icon.is_some() {
+        e = e.icon(icon.as_ref());
+    }
+    let everyone = EditRole::new().permissions(perms(&s.everyone_permissions));
+    let (guild_edit, everyone_edit) = tokio::join!(gid.edit(&ctx.http, e), gid.edit_role(&ctx.http, gid.everyone_role(), everyone));
+    let mut notes = Vec::new();
+    if s.icon_url.is_some() && icon.is_none() {
+        notes.push("icon couldn't be downloaded");
+    }
+    if guild_edit.is_err() {
+        notes.push("some settings were refused");
+    }
+    if everyone_edit.is_err() {
+        notes.push("@everyone permissions weren't changed");
+    }
+    if notes.is_empty() {
+        "✅ **Settings:** name, icon, verification, notifications, AFK, system channel, @everyone".to_string()
+    } else {
+        format!("⚠️ **Settings:** restored, but {}", notes.join(", "))
+    }
+}
+
+/// Replay one channel's messages in order, through its own webhook.
+async fn replay_channel(env: &Env<'_>, c: &BChannel, channel: ChannelId, fresh: bool) -> (usize, usize, usize) {
+    let (ctx, mut sent, mut failed) = (env.ctx, 0usize, 0usize);
+    // A channel that already existed may still hold some or all of these,
+    // originals or copies from an earlier load. Only the missing ones are
+    // posted, so loading twice never doubles them.
+    let present: HashSet<(i64, String)> = if fresh {
+        HashSet::new()
+    } else {
+        match recent_messages(ctx, channel, DEDUPE_DEPTH).await {
+            Ok(ms) => ms.iter().map(message_key).collect(),
+            Err(_) => return (0, c.messages.len(), 0),
         }
     };
-
-    if o.members {
-        l.progress("Restoring members' roles and nicknames").await;
-        let owner = ctx.cache.guild(gid).map(|g| g.owner_id);
-        let wanted: HashMap<&str, &BMember> = b.members.iter().map(|m| (m.user_id.as_str(), m)).collect();
-        let (mut updated, mut failed) = (0, 0);
-        for m in &live {
-            if l.cancelled() {
-                return;
+    let missing: Vec<&BMessage> = c.messages.iter().filter(|m| !present.contains(&message_key(m))).collect();
+    let kept = c.messages.len() - missing.len();
+    if missing.is_empty() {
+        return (0, 0, kept);
+    }
+    let hook = match channel.create_webhook(&ctx.http, CreateWebhook::new("Backup restore")).await {
+        Ok(h) => h,
+        Err(_) => return (0, c.messages.len(), kept),
+    };
+    for m in missing {
+        if env.cancelled() {
+            break;
+        }
+        let mut exec = ExecuteWebhook::new()
+            .username(webhook_name(&m.author))
+            .avatar_url(m.avatar.clone())
+            .content(replay_text(m))
+            .allowed_mentions(CreateAllowedMentions::new());
+        if !m.embeds.is_empty() {
+            exec = exec.embeds(m.embeds.iter().take(10).cloned().map(CreateEmbed::from).collect());
+        }
+        match hook.execute(&ctx.http, m.pinned, exec).await {
+            Ok(posted) => {
+                sent += 1;
+                if let Some(msg) = posted {
+                    let _ = channel.pin(&ctx.http, msg.id).await;
+                }
             }
-            let Some(saved) = wanted.get(m.user.id.to_string().as_str()) else { continue };
+            Err(_) => failed += 1,
+        }
+    }
+    let _ = hook.delete(&ctx.http).await;
+    (sent, failed, kept)
+}
+
+async fn replay_messages(
+    env: &Env<'_>,
+    b: &Backup,
+    chan_map: &HashMap<String, ChannelId>,
+    created: &HashSet<ChannelId>,
+) -> String {
+    let targets: Vec<(&BChannel, ChannelId)> = b
+        .channels
+        .iter()
+        .filter(|c| !c.messages.is_empty())
+        .filter_map(|c| chan_map.get(&c.id).map(|id| (c, *id)))
+        .collect();
+    let results = par(&targets, REPLAYS, |(c, channel)| replay_channel(env, c, *channel, created.contains(channel))).await;
+    let (sent, failed, kept) = results.iter().fold((0, 0, 0), |a, r| (a.0 + r.0, a.1 + r.1, a.2 + r.2));
+    format!(
+        "✅ **Messages:** {sent} replayed across {} channel(s), {kept} skipped as already there{}",
+        targets.len(),
+        failed_note(failed, "failed")
+    )
+}
+
+/// Give members their saved roles and nicknames back, many at once.
+async fn restore_members(
+    env: &Env<'_>,
+    b: &Backup,
+    live: &[serenity::model::guild::Member],
+    role_map: &HashMap<String, RoleId>,
+) -> String {
+    let owner = env.ctx.cache.guild(env.gid).map(|g| g.owner_id);
+    let wanted: HashMap<&str, &BMember> = b.members.iter().map(|m| (m.user_id.as_str(), m)).collect();
+    let edits: Vec<(UserId, EditMember<'_>)> = live
+        .iter()
+        .filter_map(|m| {
+            let saved = wanted.get(m.user.id.to_string().as_str())?;
             let missing: Vec<RoleId> =
                 saved.roles.iter().filter_map(|r| role_map.get(r).copied()).filter(|r| !m.roles.contains(r)).collect();
             let nick = saved.nick.clone().filter(|n| m.nick.as_ref() != Some(n) && Some(m.user.id) != owner);
             if missing.is_empty() && nick.is_none() {
-                continue;
+                return None;
             }
             let mut roles = m.roles.clone();
             roles.extend(missing);
-            let mut e = EditMember::new().roles(roles).audit_log_reason(&reason);
+            let mut e = EditMember::new().roles(roles).audit_log_reason(&env.reason);
             if let Some(n) = nick {
                 e = e.nickname(n);
             }
-            match gid.edit_member(&ctx.http, m.user.id, e).await {
-                Ok(_) => updated += 1,
-                Err(_) => failed += 1,
+            Some((m.user.id, e))
+        })
+        .collect();
+    let done = par(edits, FAST, |(user, e)| async move {
+        !env.cancelled() && env.gid.edit_member(&env.ctx.http, user, e).await.is_ok()
+    })
+    .await;
+    let updated = done.iter().filter(|ok| **ok).count();
+    format!("✅ **Members:** {updated} given their roles and nicknames back{}", failed_note(done.len() - updated, "failed"))
+}
+
+/// DM an invite to every saved member who isn't here, lifting this load's own
+/// bans on them first so the invite works.
+async fn invite_members(
+    env: &Env<'_>,
+    b: &Backup,
+    live: &[serenity::model::guild::Member],
+    banned_now: &HashSet<UserId>,
+    channel: ChannelId,
+) -> String {
+    let (ctx, gid) = (env.ctx, env.gid);
+    let here: HashSet<UserId> = live.iter().map(|m| m.user.id).collect();
+    let banned: HashSet<&str> = b.bans.iter().map(|b| b.user_id.as_str()).collect();
+    let missing: Vec<UserId> = b
+        .members
+        .iter()
+        .filter(|m| !banned.contains(m.user_id.as_str()))
+        .filter_map(|m| id_of(&m.user_id).map(UserId::new))
+        .filter(|u| !here.contains(u))
+        .collect();
+    if missing.is_empty() {
+        return "✅ **Invites:** everyone in the backup is already here".to_string();
+    }
+    let invite = match channel.create_invite(&ctx.http, CreateInvite::new().max_age(7 * 86_400).max_uses(0).unique(true)).await {
+        Ok(inv) => inv.url(),
+        Err(e) => return format!("⚠️ **Invites:** not sent, I couldn't make an invite: {e}"),
+    };
+    let server = ctx.cache.guild(gid).map(|g| g.name.to_string()).unwrap_or_default();
+    let card = theme::card(
+        Tone::Info,
+        Some("You're invited back"),
+        format!("**{}** has been restored as **{server}**. You were a member, so here's an invite (valid for 7 days):\n{invite}", b.guild_name),
+    );
+    // The unbans and the DMs are both per person; a few at a time.
+    let results = par(missing, DMS, |user| {
+        let card = card.clone();
+        async move {
+            if env.cancelled() {
+                return (false, false, false);
             }
+            let unbanned = banned_now.contains(&user);
+            if unbanned && gid.unban(&ctx.http, user).await.is_err() {
+                return (false, false, true);
+            }
+            let sent = user.direct_message(&ctx.http, CreateMessage::new().embed(card)).await.is_ok();
+            (sent, unbanned, !sent)
         }
-        l.lines.push(format!(
-            "✅ **Members:** {updated} given their roles and nicknames back{}",
-            if failed > 0 { format!(", **{failed} failed**") } else { String::new() }
-        ));
+    })
+    .await;
+    let sent = results.iter().filter(|r| r.0).count();
+    let unbanned = results.iter().filter(|r| r.1).count();
+    let failed = results.iter().filter(|r| r.2).count();
+    format!(
+        "✅ **Invites:** DMed {sent} members an invite{}{}",
+        if unbanned > 0 { format!(" (lifted {unbanned} of this load's bans so they can use it)") } else { String::new() },
+        failed_note(failed, "couldn't be reached** (DMs closed or no shared server")
+    )
+}
+
+async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
+    let cancel = l.cancel.clone();
+    let env = Env { ctx: l.ctx, gid: l.guild_id, cancel: &cancel, reason: format!("Backup {} loaded", b.id) };
+    let invoker = l.i.user.id;
+
+    // Deleting, banning and emojis don't depend on each other or on anything
+    // restored later, so they all run together.
+    l.progress("Clearing out the old server").await;
+    let want_role_deletes = o.delete_roles && !plan.delete_roles.is_empty();
+    let want_channel_deletes = o.delete_channels && !plan.delete_channels.is_empty();
+    let (role_deletes, channel_deletes, current_bans, restored_bans, emojis) = tokio::join!(
+        async { if want_role_deletes { Some(delete_roles(&env, &plan.delete_roles).await) } else { None } },
+        async { if want_channel_deletes { Some(delete_channels(&env, &plan.delete_channels).await) } else { None } },
+        async { if o.ban_members { Some(ban_current(&env, invoker).await) } else { None } },
+        async { if o.bans && !b.bans.is_empty() { Some(restore_bans(&env, b).await) } else { None } },
+        async { if o.emojis && !b.emojis.is_empty() { Some(restore_emojis(&env, b).await) } else { None } },
+    );
+    let (banned_now, ban_line) = match current_bans {
+        Some((set, line)) => (set, Some(line)),
+        None => (HashSet::new(), None),
+    };
+    l.lines.extend(ban_line);
+    l.lines.extend(restored_bans);
+    l.lines.extend(emojis);
+    if l.cancelled() {
+        return;
     }
 
-    if o.dm_invite {
-        let here: HashSet<UserId> = live.iter().map(|m| m.user.id).collect();
-        let banned: HashSet<&str> = b.bans.iter().map(|b| b.user_id.as_str()).collect();
-        let missing: Vec<UserId> = b
-            .members
-            .iter()
-            .filter(|m| !banned.contains(m.user_id.as_str()))
-            .filter_map(|m| id_of(&m.user_id).map(UserId::new))
-            .filter(|u| !here.contains(u))
-            .collect();
-        if missing.is_empty() {
-            l.lines.push("✅ **Invites:** everyone in the backup is already here".to_string());
-            return;
-        }
-        let invite = match l.i.channel_id.create_invite(&ctx.http, CreateInvite::new().max_age(7 * 86_400).max_uses(0).unique(true)).await {
-            Ok(inv) => inv.url(),
+    // Roles, then channels (their permissions point at roles).
+    let mut role_tally = Tally::default();
+    for t in [role_deletes].into_iter().flatten() {
+        role_tally.deleted = t.deleted;
+        role_tally.failed = t.failed;
+    }
+    let reuse_roles: HashMap<String, RoleId> = plan.reuse_roles.iter().map(|(k, v)| (k.clone(), RoleId::new(*v))).collect();
+    let mut role_map = reuse_roles.clone();
+    if o.roles {
+        l.progress("Restoring roles").await;
+        let (map, t) = restore_roles(&env, b, &reuse_roles).await;
+        role_map = map;
+        role_tally.created = t.created;
+        role_tally.edited = t.edited;
+        role_tally.failed += t.failed;
+    }
+    if o.roles || want_role_deletes {
+        l.lines.push(format!("✅ {}", role_tally.line("Roles")));
+    }
+    if l.cancelled() {
+        return;
+    }
+
+    let mut chan_tally = channel_deletes.unwrap_or_default();
+    let reuse_channels: HashMap<String, ChannelId> =
+        plan.reuse_channels.iter().map(|(k, v)| (k.clone(), ChannelId::new(*v))).collect();
+    let mut chan_map = reuse_channels.clone();
+    let mut created_channels = HashSet::new();
+    if o.channels {
+        l.progress("Restoring channels").await;
+        let (map, created, t) = restore_channels(&env, b, &reuse_channels, &role_map).await;
+        chan_map = map;
+        created_channels = created;
+        chan_tally.created = t.created;
+        chan_tally.edited = t.edited;
+        chan_tally.failed += t.failed;
+    }
+    if o.channels || want_channel_deletes {
+        l.lines.push(format!("✅ {}", chan_tally.line("Channels")));
+    }
+    if l.cancelled() {
+        return;
+    }
+
+    // Everything left needs the roles and channels but not each other.
+    let wants_members = (o.members || o.dm_invite) && !b.members.is_empty();
+    let live = if wants_members {
+        l.progress("Reading the member list").await;
+        match all_members(env.ctx, env.gid).await {
+            Ok(m) => Some(m),
             Err(e) => {
-                l.lines.push(format!("⚠️ **Invites:** not sent, I couldn't make an invite: {e}"));
-                return;
+                l.lines.push(format!("⚠️ **Members:** skipped, I couldn't read the member list: {e}"));
+                None
             }
-        };
-        let server = ctx.cache.guild(gid).map(|g| g.name.to_string()).unwrap_or_default();
-        let card = theme::card(
-            Tone::Info,
-            Some("You're invited back"),
-            format!("**{}** has been restored as **{server}**. You were a member, so here's an invite (valid for 7 days):\n{invite}", b.guild_name),
-        );
-        l.progress(&format!("DMing {} members an invite (about {} min)", missing.len(), missing.len().div_ceil(60))).await;
-        let (mut sent, mut failed, mut unbanned) = (0, 0, 0);
-        for user in missing {
-            if l.cancelled() {
-                return;
-            }
-            if banned_now.contains(&user) {
-                match gid.unban(&ctx.http, user).await {
-                    Ok(()) => unbanned += 1,
-                    Err(_) => {
-                        failed += 1;
-                        continue;
-                    }
-                }
-            }
-            match user.direct_message(&ctx.http, CreateMessage::new().embed(card.clone())).await {
-                Ok(_) => sent += 1,
-                Err(_) => failed += 1,
-            }
-            // Slow on purpose: a burst of DMs is what gets a bot flagged as spam.
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        l.lines.push(format!(
-            "✅ **Invites:** DMed {sent} members an invite{}{}",
-            if unbanned > 0 { format!(" (lifted {unbanned} of this load's bans so they can use it)") } else { String::new() },
-            if failed > 0 { format!(", **{failed} couldn't be reached** (DMs closed or no shared server)") } else { String::new() }
-        ));
+    } else {
+        None
+    };
+    l.progress("Restoring settings, messages and members").await;
+    let (settings, messages, members) = tokio::join!(
+        async { if o.settings { Some(restore_settings(&env, b, &chan_map).await) } else { None } },
+        async { if o.messages { Some(replay_messages(&env, b, &chan_map, &created_channels).await) } else { None } },
+        async {
+            match (&live, o.members) {
+                (Some(live), true) => Some(restore_members(&env, b, live, &role_map).await),
+                _ => None,
+            }
+        },
+    );
+    l.lines.extend(settings);
+    l.lines.extend(messages);
+    l.lines.extend(members);
+    if l.cancelled() {
+        return;
+    }
+
+    if let (Some(live), true) = (&live, o.dm_invite) {
+        l.progress("Inviting members back").await;
+        let line = invite_members(&env, b, live, &banned_now, l.i.channel_id).await;
+        l.lines.push(line);
     }
 }
 
@@ -1276,6 +1474,37 @@ mod tests {
         let other = BMessage { at: original.at + 1, ..original.clone() };
         assert_ne!(message_key(&other), message_key(&original));
         assert_ne!(message_key(&msg("different")), message_key(&original));
+    }
+
+    #[tokio::test]
+    async fn par_runs_everything_at_once_up_to_its_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let started = std::time::Instant::now();
+        let out = par(0..40u32, 8, |n| {
+            let (now, peak) = (&now, &peak);
+            async move {
+                let running = now.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                now.fetch_sub(1, Ordering::SeqCst);
+                n * 2
+            }
+        })
+        .await;
+        let mut sorted = out.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..40).map(|n| n * 2).collect::<Vec<_>>(), "every item is processed exactly once");
+        assert!(peak.load(Ordering::SeqCst) > 1, "items must overlap");
+        assert!(peak.load(Ordering::SeqCst) <= 8, "never more than the limit");
+        // 40 x 20ms in series is 800ms; 8 at a time is about 100ms.
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn failure_notes_only_appear_when_something_failed() {
+        assert_eq!(failed_note(0, "failed"), "");
+        assert_eq!(failed_note(3, "failed"), ", **3 failed**");
     }
 
     #[test]

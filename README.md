@@ -219,6 +219,12 @@ aren't held to the 25-backup limit.
   person can't use an invite, so the bans this load made on people it is
   inviting are lifted first. Anyone who no longer shares a server with the bot
   can't be DMed and stays banned. It only runs when set to `true`.
+- A load runs as much as it can at the same time: deletes, bans (200 per
+  request), emojis, then roles, then channels (categories, then their
+  children), then settings, messages and member roles together. Order and
+  parents are set in one request each. Discord's rate limits still apply, so
+  the slow parts are messages (a webhook posts about 5 every 2 seconds, one
+  channel at a time but several channels at once) and invite DMs (4 at a time).
 - `/backup cancel` stops a load after the current step.
 - `/backup list`, `info` and `delete` manage your backups. You can keep up
   to 25 manual backups.
