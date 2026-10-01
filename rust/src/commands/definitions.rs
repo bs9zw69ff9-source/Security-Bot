@@ -304,7 +304,7 @@ pub fn all() -> Vec<CreateCommand> {
             .add_option(sub("list", "List every board configured for this server")),
 
         CreateCommand::new("backup")
-            .description("Back up this server, or load a backup into it (server owner only)")
+            .description("Back up this server, or load a backup into it (server owner / bot owner)")
             .add_option(sub("create", "Save this server, including the last 250 messages in each channel"))
             .add_option(sub("load", "Load one of your backups into this server")
                 .add_sub_option(backup_id())

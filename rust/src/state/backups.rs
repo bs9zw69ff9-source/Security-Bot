@@ -230,18 +230,23 @@ pub fn save(b: &Backup) -> bool {
     true
 }
 
-/// A backup, if it exists and belongs to `owner_id`.
-pub fn get(id: &str, owner_id: &str) -> Option<Backup> {
-    if meta().get(id).map(|m| m.owner_id != owner_id).unwrap_or(true) {
+/// Whose backups a caller can reach: one user's, or everyone's (bot owners).
+fn reachable(m: &Meta, owner: Option<&str>) -> bool {
+    owner.is_none_or(|o| m.owner_id == o)
+}
+
+/// A backup, if it exists and `owner` can reach it.
+pub fn get(id: &str, owner: Option<&str>) -> Option<Backup> {
+    if !meta().get(id).is_some_and(|m| reachable(m, owner)) {
         return None;
     }
     db::get(TABLE, id)
 }
 
-/// Delete a backup the user owns; false if there was nothing of theirs to delete.
-pub fn delete(id: &str, owner_id: &str) -> bool {
+/// Delete a backup `owner` can reach; false if there was nothing to delete.
+pub fn delete(id: &str, owner: Option<&str>) -> bool {
     let mut map = meta();
-    if map.get(id).map(|m| m.owner_id != owner_id).unwrap_or(true) {
+    if !map.get(id).is_some_and(|m| reachable(m, owner)) {
         return false;
     }
     map.remove(id);
@@ -250,9 +255,9 @@ pub fn delete(id: &str, owner_id: &str) -> bool {
     true
 }
 
-/// A user's backups, newest first.
-pub fn list(owner_id: &str) -> Vec<Meta> {
-    let mut out: Vec<Meta> = meta().values().filter(|m| m.owner_id == owner_id).cloned().collect();
+/// The backups `owner` can reach, newest first.
+pub fn list(owner: Option<&str>) -> Vec<Meta> {
+    let mut out: Vec<Meta> = meta().values().filter(|m| reachable(m, owner)).cloned().collect();
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     out
 }
@@ -397,12 +402,16 @@ mod tests {
     fn backups_belong_to_their_creator() {
         let b = backup("100");
         assert!(save(&b));
-        assert!(get(&b.id, "100").is_some());
-        assert!(get(&b.id, "200").is_none(), "someone else's backup must not load");
-        assert!(!delete(&b.id, "200"));
-        assert!(list("200").iter().all(|m| m.id != b.id));
-        assert!(delete(&b.id, "100"));
-        assert!(get(&b.id, "100").is_none());
+        assert!(get(&b.id, Some("100")).is_some());
+        assert!(get(&b.id, Some("200")).is_none(), "someone else's backup must not load");
+        assert!(!delete(&b.id, Some("200")));
+        assert!(list(Some("200")).iter().all(|m| m.id != b.id));
+        // Bot owners reach every backup.
+        assert!(get(&b.id, None).is_some());
+        assert!(list(None).iter().any(|m| m.id == b.id));
+        assert!(delete(&b.id, Some("100")));
+        assert!(get(&b.id, Some("100")).is_none());
+        assert!(get(&b.id, None).is_none());
     }
 
     #[test]

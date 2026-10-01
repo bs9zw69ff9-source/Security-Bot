@@ -10,7 +10,11 @@ use super::guildinfo::GuildInfo;
 use crate::state::guild_settings::gc;
 
 pub fn is_owner(user_id: UserId) -> bool {
-    BOT_OWNER_IDS.contains(&user_id.to_string())
+    is_owner_str(&user_id.to_string())
+}
+
+pub fn is_owner_str(user_id: &str) -> bool {
+    BOT_OWNER_IDS.contains(user_id)
 }
 
 pub fn is_mod(member: &Member, guild_owner_id: UserId) -> bool {
@@ -65,7 +69,10 @@ pub fn can_act_on(info: &GuildInfo, actor: &Member, target: &Member) -> Result<(
     if target.user.id == info.owner_id {
         return Err("That's the server owner - can't touch them.".into());
     }
-    if is_whitelisted(target, info.owner_id) {
+    // Bot owners get past the bot's own protections (the whitelist and the
+    // role ladder). What's left below is Discord's limit, not the bot's.
+    let actor_is_bot_owner = is_owner(actor.user.id);
+    if !actor_is_bot_owner && is_whitelisted(target, info.owner_id) {
         return Err("That user's whitelisted, so they're protected.".into());
     }
     if target.user.id == actor.user.id {
@@ -75,9 +82,67 @@ pub fn can_act_on(info: &GuildInfo, actor: &Member, target: &Member) -> Result<(
     if info.bot_highest > 0 && target_pos >= info.bot_highest {
         return Err("Their top role sits above mine, so I can't. Bump my role higher and try again.".into());
     }
-    let actor_privileged = is_owner(actor.user.id) || actor.user.id == info.owner_id;
+    let actor_privileged = actor_is_bot_owner || actor.user.id == info.owner_id;
     if !actor_privileged && target_pos >= info.member_highest(actor) {
         return Err("Their role is the same as or higher than yours, so this one's out of your reach.".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::guildinfo::RoleInfo;
+    use serenity::model::id::{GuildId, RoleId};
+    use std::collections::HashMap;
+
+    fn member(guild: GuildId, id: u64, roles: &[u64]) -> Member {
+        let mut m = Member::default();
+        m.guild_id = guild;
+        m.user.id = UserId::new(id);
+        m.roles = roles.iter().map(|r| RoleId::new(*r)).collect();
+        m
+    }
+
+    fn role(position: i64) -> RoleInfo {
+        RoleInfo {
+            name: String::new(),
+            position,
+            managed: false,
+            permissions: serenity::model::Permissions::empty(),
+            colour: 0,
+            hoist: false,
+            mentionable: false,
+        }
+    }
+
+    #[test]
+    fn bot_owners_get_past_the_whitelist_and_the_role_ladder() {
+        let guild = GuildId::new(880_001);
+        let bot_owner: u64 = BOT_OWNER_IDS.iter().next().and_then(|s| s.parse().ok()).expect("a bot owner is configured");
+        let info = GuildInfo {
+            id: guild,
+            name: String::new(),
+            owner_id: UserId::new(1),
+            roles: HashMap::from([(RoleId::new(10), role(2)), (RoleId::new(20), role(5))]),
+            bot_highest: 9,
+        };
+        crate::state::guild_settings::update(&guild.to_string(), |s| s.nuke_whitelist_user_ids.push("300".into()));
+
+        let staff = member(guild, 200, &[10]);
+        let whitelisted = member(guild, 300, &[]);
+        let senior = member(guild, 400, &[20]);
+        let owner = member(guild, bot_owner, &[]);
+
+        // Staff are held back by both.
+        assert!(can_act_on(&info, &staff, &whitelisted).is_err());
+        assert!(can_act_on(&info, &staff, &senior).is_err());
+        // A bot owner with no roles at all is not.
+        assert!(can_act_on(&info, &owner, &whitelisted).is_ok());
+        assert!(can_act_on(&info, &owner, &senior).is_ok());
+        // Discord's own limits still apply to everyone.
+        assert!(can_act_on(&info, &owner, &member(guild, 1, &[])).is_err(), "the server owner can't be actioned");
+        let above_bot = GuildInfo { bot_highest: 4, ..info };
+        assert!(can_act_on(&above_bot, &owner, &senior).is_err(), "nor anyone above the bot");
+    }
 }

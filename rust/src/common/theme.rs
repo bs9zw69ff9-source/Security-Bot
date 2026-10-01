@@ -376,7 +376,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
             ("/setup view", "Everything that's configured here"),
             ("/setup roles · channels · whitelist · failsafe", "Set individual pieces"),
             ("/config", "This server's thresholds & module switches *(owner)*"),
-            ("/backup `create|load|list|info|delete|interval`", "Server backups you can restore or clone *(server owner)*"),
+            ("/backup `create|load|list|info|delete|interval`", "Server backups you can restore or clone *(owner)*"),
         ],
     },
     HelpSection {

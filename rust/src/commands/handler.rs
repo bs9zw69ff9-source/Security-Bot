@@ -183,7 +183,13 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
     let Some(info) = GuildInfo::from_cache(ctx, guild_id) else {
         return reply_text(ctx, i, "I'm still loading this server's details. Give it a few seconds and try again.").await;
     };
-    let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else {
+    // The interaction carries the caller's member record; the fetch is only a
+    // fallback, so a cache miss can't lock anyone (a bot owner included) out.
+    let member = match i.member.as_deref() {
+        Some(m) => Some(m.clone()),
+        None => fetch_member(ctx, guild_id, i.user.id).await,
+    };
+    let Some(member) = member else {
         return reply_text(ctx, i, "I couldn't look up your membership in this server just now. Please try again.").await;
     };
     if i.data.name == "backup" {

@@ -1,4 +1,4 @@
-//! `/backup`: Xenon-style server backups. Server owner only.
+//! `/backup`: Xenon-style server backups. Server owner and bot owners only.
 //!
 //! A backup belongs to the user who took it and can be loaded into any server
 //! that user owns, so it doubles as a way to clone a server. Loading edits
@@ -30,7 +30,13 @@ use crate::common::theme::{self, Tone};
 use crate::state::backups::{self, *};
 use crate::systems::snapshot_rollback::{channel_kind_num, kind_from_num};
 
-const OWNER_ONLY: &str = "Backups are for the server owner only.";
+const OWNER_ONLY: &str = "Backups are for the server owner (and bot owners) only.";
+
+/// Which backups this user can reach: bot owners reach every backup, everyone
+/// else only their own.
+fn scope(user: &str) -> Option<&str> {
+    (!crate::common::permissions::is_owner_str(user)).then_some(user)
+}
 
 /// guild -> cancel flag of the load running there.
 static LOADS: Lazy<Mutex<HashMap<GuildId, Arc<AtomicBool>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -917,16 +923,19 @@ pub async fn run_due_intervals(ctx: &Context) {
     let now = now_ms();
     for (gid, mut iv) in due_intervals(now) {
         let Some(guild_id) = id_of(&gid).map(GuildId::new) else { continue };
-        let Some(owner) = ctx.cache.guild(guild_id).map(|g| g.owner_id) else { continue };
-        if owner.to_string() != iv.owner_id {
+        let Some(guild_owner) = ctx.cache.guild(guild_id).map(|g| g.owner_id) else { continue };
+        // A schedule a bot owner set up keeps running whoever owns the server.
+        let by_bot_owner = crate::common::permissions::is_owner_str(&iv.owner_id);
+        if !by_bot_owner && guild_owner.to_string() != iv.owner_id {
             println!("💾 [{gid}] interval backups stopped: the server changed owner");
             set_interval(&gid, None);
             continue;
         }
+        let Some(owner) = id_of(&iv.owner_id).map(UserId::new) else { continue };
         match capture(ctx, guild_id, owner, true).await {
             Ok((b, _)) if backups::save(&b) => {
                 if let Some(old) = iv.last_backup.take() {
-                    backups::delete(&old, &iv.owner_id);
+                    backups::delete(&old, Some(&iv.owner_id));
                 }
                 iv.last_backup = Some(b.id);
                 iv.next_at = now + iv.hours * 3_600_000;
@@ -969,7 +978,8 @@ fn contents(c: &Counts) -> String {
 }
 
 pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
-    if i.user.id != info.owner_id {
+    let bot_owner = crate::common::permissions::is_owner(i.user.id);
+    if i.user.id != info.owner_id && !bot_owner {
         return respond(ctx, i, Tone::Denied, None, OWNER_ONLY).await;
     }
     let options = i.data.options();
@@ -999,7 +1009,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
 
     match *sub {
         "create" => {
-            if backups::manual_count(&owner) >= MAX_PER_USER {
+            if !bot_owner && backups::manual_count(&owner) >= MAX_PER_USER {
                 return respond(ctx, i, Tone::Error, None, &format!("You already have {MAX_PER_USER} backups. Delete one with `/backup delete` first.")).await;
             }
             let defer = CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
@@ -1025,7 +1035,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
         }
         "load" => {
             let id = str_opt("id").unwrap_or_default();
-            let Some(b) = backups::get(&id, &owner) else {
+            let Some(b) = backups::get(&id, scope(&owner)) else {
                 return respond(ctx, i, Tone::Error, None, "You don't have a backup with that ID. `/backup list` shows yours.").await;
             };
             let o = LoadOptions {
@@ -1043,29 +1053,36 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
             load(ctx, i, info, b, o).await;
         }
         "list" => {
-            let all = backups::list(&owner);
+            let all = backups::list(scope(&owner));
             if all.is_empty() {
                 return respond(ctx, i, Tone::Info, Some("Your backups"), "You haven't made any backups yet. `/backup create` makes one.").await;
             }
-            let body = all
+            // A bot owner sees everyone's, so keep it inside an embed.
+            const SHOWN: usize = 20;
+            let mut body = all
                 .iter()
+                .take(SHOWN)
                 .map(|m| {
                     format!(
-                        "{}`{}` **{}** · <t:{}:R>\n{}",
+                        "{}`{}` **{}** · <t:{}:R>{}\n{}",
                         if m.interval { "🕒 " } else { "" },
                         m.id,
                         m.guild_name,
                         m.created_at / 1000,
+                        if m.owner_id == owner { String::new() } else { format!(" · by <@{}>", m.owner_id) },
                         contents(&m.counts)
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
+            if all.len() > SHOWN {
+                body.push_str(&format!("\n\n…and {} more. Type in the `id` box to search them.", all.len() - SHOWN));
+            }
             respond(ctx, i, Tone::Info, Some("Your backups"), &format!("{body}\n\n🕒 = interval backup")).await;
         }
         "info" => {
             let id = str_opt("id").unwrap_or_default();
-            let Some(b) = backups::get(&id, &owner) else {
+            let Some(b) = backups::get(&id, scope(&owner)) else {
                 return respond(ctx, i, Tone::Error, None, "You don't have a backup with that ID.").await;
             };
             let roles: Vec<String> = b.roles.iter().rev().take(15).map(|r| r.name.clone()).collect();
@@ -1096,7 +1113,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
         }
         "delete" => {
             let id = str_opt("id").unwrap_or_default();
-            if backups::delete(&id, &owner) {
+            if backups::delete(&id, scope(&owner)) {
                 respond(ctx, i, Tone::Success, None, &format!("Deleted backup `{id}`.")).await;
             } else {
                 respond(ctx, i, Tone::Error, None, "You don't have a backup with that ID.").await;
@@ -1152,11 +1169,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
     }
 }
 
-/// Suggest the user's own backups for the `id` option.
+/// Suggest the backups this user can reach for the `id` option.
 pub async fn autocomplete(ctx: &Context, i: &CommandInteraction) {
     let typed = i.data.autocomplete().map(|o| o.value.to_lowercase()).unwrap_or_default();
+    let user = i.user.id.to_string();
     let mut resp = CreateAutocompleteResponse::new();
-    for m in backups::list(&i.user.id.to_string())
+    for m in backups::list(scope(&user))
         .into_iter()
         .filter(|m| m.id.contains(&typed) || m.guild_name.to_lowercase().contains(&typed))
         .take(25)

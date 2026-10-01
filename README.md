@@ -182,13 +182,19 @@ invocation of a hidden owner command is written to the local
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/chainofcommand` `/config` `/status` `/antiping` `/nuketest` |
-| 👑 Server owner only | `/backup` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/chainofcommand` `/config` `/status` `/antiping` `/nuketest` `/backup` |
+
+Bot owners (`BOT_OWNER_IDS`) can run every command in every server, with no
+roles or server permissions. Moderation commands also let them act on
+whitelisted users and on people ranked above them. The only limits left are
+Discord's: nobody can action the server owner, and the bot can't touch
+anyone whose top role is above its own.
 
 ### Backups
 
-`/backup` works like Xenon's backups. Only the server's owner can use it;
-bot owners get no exception.
+`/backup` works like Xenon's backups. The server's owner and bot owners can
+use it. Bot owners can also see, load and delete anyone's backups by ID, and
+aren't held to the 25-backup limit.
 
 - `/backup create` saves the server's name, icon and settings, its roles,
   channels with their permission overwrites, emojis, bans, and each member's
