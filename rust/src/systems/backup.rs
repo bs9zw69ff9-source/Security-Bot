@@ -299,12 +299,12 @@ pub struct LoadOptions {
     pub members: bool,
     pub dm_invite: bool,
     pub messages: bool,
-    pub kick_members: bool,
+    pub ban_members: bool,
 }
 
-/// Who `kick_members` leaves in place: bots, the server owner (Discord won't
+/// Who `ban_members` leaves in place: bots, the server owner (Discord won't
 /// allow it anyway), whoever ran the load, and bot owners.
-fn spared_from_kick(user: UserId, is_bot: bool, guild_owner: Option<UserId>, invoker: UserId) -> bool {
+fn spared_from_ban(user: UserId, is_bot: bool, guild_owner: Option<UserId>, invoker: UserId) -> bool {
     is_bot || Some(user) == guild_owner || user == invoker || crate::common::permissions::is_owner(user)
 }
 
@@ -673,34 +673,40 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
         ));
     }
 
-    if o.kick_members {
+    // Everyone this load banned, so the invite step can lift the ban on the
+    // ones it is inviting back: a banned person can't use an invite.
+    let mut banned_now: HashSet<UserId> = HashSet::new();
+    if o.ban_members {
         l.progress("Reading the member list").await;
         match all_members(ctx, gid).await {
             Ok(current) => {
                 let owner = ctx.cache.guild(gid).map(|g| g.owner_id);
                 let targets: Vec<UserId> = current
                     .iter()
-                    .filter(|m| !spared_from_kick(m.user.id, m.user.bot, owner, l.i.user.id))
+                    .filter(|m| !spared_from_ban(m.user.id, m.user.bot, owner, l.i.user.id))
                     .map(|m| m.user.id)
                     .collect();
-                l.progress(&format!("Kicking {} current members", targets.len())).await;
-                let (mut kicked, mut failed) = (0usize, 0usize);
+                l.progress(&format!("Banning {} current members", targets.len())).await;
+                let mut failed = 0usize;
                 for user in targets {
                     if l.cancelled() {
-                        l.lines.push(format!("🛑 **Kicks:** stopped after {kicked}"));
+                        l.lines.push(format!("🛑 **Bans:** stopped after {}", banned_now.len()));
                         return;
                     }
-                    match gid.kick_with_reason(&ctx.http, user, &reason).await {
-                        Ok(()) => kicked += 1,
+                    match gid.ban_with_reason(&ctx.http, user, 0, &reason).await {
+                        Ok(()) => {
+                            banned_now.insert(user);
+                        }
                         Err(_) => failed += 1,
                     }
                 }
                 l.lines.push(format!(
-                    "✅ **Kicks:** removed {kicked} current members{}",
-                    if failed > 0 { format!(", **{failed} couldn't be kicked** (above me, or already gone)") } else { String::new() }
+                    "✅ **Bans:** banned {} current members{}",
+                    banned_now.len(),
+                    if failed > 0 { format!(", **{failed} couldn't be banned** (above me, or already gone)") } else { String::new() }
                 ));
             }
-            Err(e) => l.lines.push(format!("⚠️ **Kicks:** skipped, I couldn't read the member list: {e}")),
+            Err(e) => l.lines.push(format!("⚠️ **Bans:** skipped, I couldn't read the member list: {e}")),
         }
     }
 
@@ -777,10 +783,19 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
             format!("**{}** has been restored as **{server}**. You were a member, so here's an invite (valid for 7 days):\n{invite}", b.guild_name),
         );
         l.progress(&format!("DMing {} members an invite (about {} min)", missing.len(), missing.len().div_ceil(60))).await;
-        let (mut sent, mut failed) = (0, 0);
+        let (mut sent, mut failed, mut unbanned) = (0, 0, 0);
         for user in missing {
             if l.cancelled() {
                 return;
+            }
+            if banned_now.contains(&user) {
+                match gid.unban(&ctx.http, user).await {
+                    Ok(()) => unbanned += 1,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                }
             }
             match user.direct_message(&ctx.http, CreateMessage::new().embed(card.clone())).await {
                 Ok(_) => sent += 1,
@@ -790,7 +805,8 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         l.lines.push(format!(
-            "✅ **Invites:** DMed {sent} members an invite{}",
+            "✅ **Invites:** DMed {sent} members an invite{}{}",
+            if unbanned > 0 { format!(" (lifted {unbanned} of this load's bans so they can use it)") } else { String::new() },
             if failed > 0 { format!(", **{failed} couldn't be reached** (DMs closed or no shared server)") } else { String::new() }
         ));
     }
@@ -816,8 +832,8 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
     if o.dm_invite {
         need |= Permissions::CREATE_INSTANT_INVITE;
     }
-    if o.kick_members {
-        need |= Permissions::KICK_MEMBERS;
+    if o.ban_members {
+        need |= Permissions::BAN_MEMBERS;
     }
     if o.messages {
         need |= Permissions::MANAGE_WEBHOOKS;
@@ -883,10 +899,10 @@ async fn load(ctx: &Context, i: &CommandInteraction, info: &GuildInfo, b: Backup
             b.counts.messages
         ));
     }
-    if o.kick_members {
+    if o.ban_members {
         let here = ctx.cache.guild(gid).map(|g| g.member_count).unwrap_or(0);
         what.push(format!(
-            "• **Kick every current member** (about {here}), except bots, the server owner, bot owners and you"
+            "• **Ban every current member** (about {here}), except bots, the server owner, bot owners and you"
         ));
     }
     if o.dm_invite {
@@ -1096,7 +1112,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction, info: &GuildInfo) {
                 members: bool_opt("members", false),
                 dm_invite: bool_opt("dm_invite", false),
                 messages: bool_opt("messages", false),
-                kick_members: bool_opt("kick_members", false),
+                ban_members: bool_opt("ban_members", false),
             };
             load(ctx, i, info, b, o).await;
         }
@@ -1263,14 +1279,14 @@ mod tests {
     }
 
     #[test]
-    fn kick_members_spares_bots_owners_and_the_caller() {
+    fn ban_members_spares_bots_owners_and_the_caller() {
         let (owner, me, someone) = (UserId::new(1), UserId::new(2), UserId::new(3));
-        assert!(spared_from_kick(UserId::new(9), true, Some(owner), me), "bots stay");
-        assert!(spared_from_kick(owner, false, Some(owner), me));
-        assert!(spared_from_kick(me, false, Some(owner), me));
+        assert!(spared_from_ban(UserId::new(9), true, Some(owner), me), "bots stay");
+        assert!(spared_from_ban(owner, false, Some(owner), me));
+        assert!(spared_from_ban(me, false, Some(owner), me));
         let bot_owner = crate::common::config::BOT_OWNER_IDS.iter().next().and_then(|s| s.parse().ok()).map(UserId::new).unwrap();
-        assert!(spared_from_kick(bot_owner, false, Some(owner), me));
-        assert!(!spared_from_kick(someone, false, Some(owner), me));
+        assert!(spared_from_ban(bot_owner, false, Some(owner), me));
+        assert!(!spared_from_ban(someone, false, Some(owner), me));
     }
 
     #[test]
