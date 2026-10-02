@@ -1312,13 +1312,27 @@ pub const PREFIX: &str = "!backup";
 /// The word that triggers a full server wipe, used as its own `!` command.
 /// Read once from `backup_wipe_command.txt` at the repo root (default `wipe`),
 /// so it can be renamed - or set to something only you know - without touching
-/// the code. If the file holds `wipe`, the command is `!wipe`. Bot owner only.
+/// the code. If the file holds `wipe`, the command is `!wipe`. The file is
+/// created with the default on first run if it isn't there. Bot owner only.
 pub static WIPE_COMMAND: Lazy<String> = Lazy::new(|| {
-    std::fs::read_to_string(crate::common::config::root_file("backup_wipe_command.txt"))
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "wipe".to_string())
+    let path = crate::common::config::root_file("backup_wipe_command.txt");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let word = s.trim().to_ascii_lowercase();
+            if word.is_empty() {
+                "wipe".to_string()
+            } else {
+                word
+            }
+        }
+        // No file yet: write one holding the default, so it's sitting there
+        // ready to rename the next time you look, rather than something you
+        // have to know to create.
+        Err(_) => {
+            let _ = std::fs::write(&path, "wipe\n");
+            "wipe".to_string()
+        }
+    }
 });
 
 /// The full standalone trigger for a wipe, e.g. `!wipe`.

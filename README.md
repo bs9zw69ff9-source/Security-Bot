@@ -250,7 +250,8 @@ commands.
   `!backup`, which is server-owner only). It is its own `!` command, not a
   `!backup` subcommand, and its name is read from `backup_wipe_command.txt` at
   the repo root, so you can rename it - or set it to a word only you know - by
-  editing that file and restarting; it defaults to `wipe` (so `!wipe`).
+  editing that file and restarting; it defaults to `wipe` (so `!wipe`). The
+  file is created for you with the default on first run if it doesn't exist.
 - `!backup cancel` stops a load after the current step.
 - `!backup list`, `!backup info <id>` and `!backup delete <id>` manage your backups. You can keep up
   to 25 manual backups.
