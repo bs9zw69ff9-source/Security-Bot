@@ -960,6 +960,133 @@ fn invite_channel(b: &Backup, chan_map: &HashMap<String, ChannelId>) -> Option<C
         .copied()
 }
 
+/// `!backup wipe`: ban every member and delete every role and channel, with
+/// nothing recreated - a blank server. Nothing is backed up first, so it asks
+/// for a typed confirmation, not just a button.
+async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo) {
+    let gid = info.id;
+    let me = ctx.cache.current_user().id;
+    let Some(bot) = fetch_member(ctx, gid, me).await else {
+        return respond(ctx, msg, Tone::Error, None, "I couldn't check my own permissions here. Try again in a moment.").await;
+    };
+    let my_perms = ctx.cache.guild(gid).map(|g| g.member_permissions(&bot)).unwrap_or_default();
+    let bot_top = info.highest_position(&bot.roles).max(info.bot_highest);
+    let need = Permissions::MANAGE_ROLES | Permissions::MANAGE_CHANNELS | Permissions::BAN_MEMBERS;
+    if !my_perms.administrator() && !my_perms.contains(need) {
+        let missing = need - my_perms;
+        return respond(ctx, msg, Tone::Error, None, &format!("I'm missing permissions to wipe this server: `{missing}`.")).await;
+    }
+
+    let live_channels = match gid.channels(&ctx.http).await {
+        Ok(c) => c,
+        Err(e) => return respond(ctx, msg, Tone::Error, None, &format!("I couldn't read this server's channels ({e}), so I haven't touched anything.")).await,
+    };
+    let live_roles: Vec<LiveRole> = info
+        .roles
+        .iter()
+        .map(|(id, r)| LiveRole { id: id.get(), locked: *id == gid.everyone_role() || r.managed || r.position >= bot_top })
+        .collect();
+    let live_chans: Vec<LiveChannel> =
+        live_channels.values().map(|c| LiveChannel { id: c.id.get(), kind: channel_kind_num(c.kind) }).collect();
+    let plan = backups::plan(&live_roles, &live_chans, true, true, msg.channel_id.get());
+    let here = ctx.cache.guild(gid).map(|g| g.member_count).unwrap_or(0);
+
+    let body = format!(
+        "**This wipes __{}__ to a blank server. There is no backup and no undo.**\n\n• **Ban every current member** (about {here}), except bots, the server owner, bot owners and you\n• **Delete all {} roles** I can manage\n• **Delete all {} channels**, including this one (last)\n\nClick **Wipe the server** within 60s to go ahead.",
+        info.name,
+        plan.delete_roles.len(),
+        plan.delete_channels.len() + 1
+    );
+    let buttons = CreateActionRow::Buttons(vec![
+        CreateButton::new("backup_wipe_confirm").label("Wipe the server").style(ButtonStyle::Danger),
+        CreateButton::new("backup_wipe_abort").label("Cancel").style(ButtonStyle::Secondary),
+    ]);
+    let prompt = CreateMessage::new()
+        .embed(theme::card(Tone::Error, Some("Wipe this server?"), body))
+        .components(vec![buttons])
+        .reference_message(msg);
+    let Ok(prompt) = msg.channel_id.send_message(&ctx.http, prompt).await else { return };
+    let prompt = prompt.id;
+
+    let author = msg.author.id;
+    let channel = msg.channel_id;
+    let click = ComponentInteractionCollector::new(&ctx.shard)
+        .timeout(Duration::from_secs(60))
+        .filter(move |c| c.message.id == prompt && c.user.id == author)
+        .next()
+        .await;
+    let confirmed = match click {
+        Some(c) => {
+            let _ = c.create_response(&ctx.http, CreateInteractionResponse::Acknowledge).await;
+            c.data.custom_id == "backup_wipe_confirm"
+        }
+        None => false,
+    };
+    if !confirmed {
+        let card = theme::card(Tone::Info, None, "Wipe cancelled, nothing was changed.");
+        let _ = channel.edit_message(&ctx.http, prompt, EditMessage::new().embed(card).components(vec![])).await;
+        return;
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let busy = {
+        let mut running = loads();
+        let busy = running.contains_key(&gid);
+        if !busy {
+            running.insert(gid, cancel.clone());
+        }
+        busy
+    };
+    if busy {
+        return respond(ctx, msg, Tone::Error, None, "A backup is already running here. Wait for it, or `!backup cancel` it.").await;
+    }
+    println!("💥 [{gid}] {author} is wiping the server");
+    let mut loader = Loader { ctx, cmd: msg, status: prompt, guild_id: gid, cancel, lines: Vec::new(), report_channel_gone: false };
+    run_wipe(&mut loader, plan).await;
+    loads().remove(&gid);
+
+    let (tone, title) = if loader.cancelled() {
+        loader.lines.push("🛑 Cancelled. Everything above was already applied.".to_string());
+        (Tone::Warning, "Wipe cancelled")
+    } else {
+        (Tone::Success, "Server wiped")
+    };
+    let card = theme::card(tone, Some(title), loader.lines.join("\n"));
+    if loader.report_channel_gone
+        || channel.edit_message(&ctx.http, prompt, EditMessage::new().embed(card.clone()).components(vec![])).await.is_err()
+    {
+        try_dm_embed(&ctx.http, author, card).await;
+    }
+}
+
+/// Ban everyone and delete every role and channel. The deletes and the ban
+/// run together; the reporting channel goes last so progress stays visible.
+async fn run_wipe(l: &mut Loader<'_>, plan: Plan) {
+    let cancel = l.cancel.clone();
+    let env = Env { ctx: l.ctx, gid: l.guild_id, cancel: &cancel, reason: "Server wipe".to_string() };
+    let invoker = l.cmd.author.id;
+
+    l.progress("Banning members and clearing out roles and channels").await;
+    let (role_deletes, channel_deletes, bans) = tokio::join!(
+        async { if !plan.delete_roles.is_empty() { Some(delete_roles(&env, &plan.delete_roles).await) } else { None } },
+        async { if !plan.delete_channels.is_empty() { Some(delete_channels(&env, &plan.delete_channels).await) } else { None } },
+        ban_current(&env, invoker),
+    );
+    l.lines.push(bans.1);
+    if let Some(t) = role_deletes {
+        l.lines.push(format!("✅ {}", t.line("Roles")));
+    }
+    if let Some(t) = channel_deletes {
+        l.lines.push(format!("✅ {}", t.line("Channels")));
+    }
+    if l.cancelled() {
+        return;
+    }
+    // The channel this was run from is the one place still standing; it goes
+    // last so the progress above stays readable, and the report then DMs.
+    l.report_channel_gone = l.cmd.channel_id.delete(&env.ctx.http).await.is_ok();
+}
+
 async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: LoadOptions) {
     let gid = info.id;
     let me = ctx.cache.current_user().id;
@@ -1187,6 +1314,7 @@ const USAGE: &str = "`!backup create` · take a backup of this server
 `!backup info <id>` · what's in one
 `!backup delete <id>`
 `!backup load <id> [options]` · e.g. `!backup load abc123 roles channels messages dm_invite`
+`!backup wipe` · ban everyone and delete all roles and channels (blank server, no backup)
 `!backup interval` · show the schedule · `!backup interval on 24` · `!backup interval off`
 `!backup cancel` · stop a load
 
@@ -1414,6 +1542,7 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
                 None => respond(ctx, msg, Tone::Info, None, "No backup is loading here.").await,
             }
         }
+        "wipe" => wipe(ctx, msg, &info).await,
         _ => respond(ctx, msg, Tone::Info, Some("Backups"), USAGE).await,
     }
 }
