@@ -20,8 +20,74 @@ use crate::common::guildinfo::fetch_member;
 use crate::state::guild_settings::gc;
 use crate::state::tickets::{
     delete_open_ticket, find_open_ticket_by_user, get_open_ticket, get_ticket_config, set_open_ticket,
-    update_ticket_config, OpenTicket, TicketConfig, TicketType,
+    update_ticket_config, OpenTicket, TicketAnswer, TicketConfig, TicketType,
 };
+
+/// The questions the open-ticket form asks, mirroring the Appy ticket form:
+/// what kind of ticket it is, what they need, and whether they have evidence.
+/// Discord modals have no help text under a field, so the hint that sits below
+/// each Appy question lives in the placeholder here.
+struct Question {
+    /// Modal field label, and the field/question name reused in the welcome
+    /// embed, the close log and the DM to the opener.
+    label: &'static str,
+    placeholder: &'static str,
+    paragraph: bool,
+    required: bool,
+}
+
+const TICKET_QUESTIONS: &[Question] = &[
+    Question {
+        label: "Is this a ban appeal or support ticket?",
+        placeholder: "Type \"support\" for support or \"ban appeal\" for a ban appeal",
+        paragraph: false,
+        required: true,
+    },
+    Question {
+        label: "How can we help?",
+        placeholder: "Please explain your answer in full detail",
+        paragraph: true,
+        required: true,
+    },
+    Question {
+        label: "Can you provide evidence?",
+        placeholder: "Links or clips - type N/A if this does not apply",
+        paragraph: true,
+        required: true,
+    },
+];
+
+/// Pair the opener's answers (in the order the modal returned them) with the
+/// questions that were asked, so an empty trailing optional answer still keeps
+/// its question.
+fn pair_answers(answers: &[String]) -> Vec<TicketAnswer> {
+    TICKET_QUESTIONS
+        .iter()
+        .enumerate()
+        .map(|(idx, q)| TicketAnswer {
+            question: q.label.to_string(),
+            answer: answers.get(idx).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// The form answers as one block, laid out like Appy's "Open reason": the
+/// question in brackets, the answer under it. Falls back to the legacy single
+/// `reason` for tickets opened before the multi-question form.
+fn answers_block(ticket: &OpenTicket) -> String {
+    if ticket.answers.is_empty() {
+        return if ticket.reason.trim().is_empty() { "N/A".to_string() } else { ticket.reason.clone() };
+    }
+    ticket
+        .answers
+        .iter()
+        .map(|a| {
+            let ans = if a.answer.trim().is_empty() { "N/A" } else { a.answer.trim() };
+            format!("[{}]\n{ans}", a.question)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
 
 /// The panel embed, built the same way the application panel is: one
 /// underlined heading per option, and a shared block of text underneath when
@@ -306,13 +372,21 @@ pub async fn handle_ticket_open(ctx: &Context, i: &ComponentInteraction) {
         }
     }
 
+    let rows = TICKET_QUESTIONS
+        .iter()
+        .enumerate()
+        .map(|(idx, q)| {
+            let style = if q.paragraph { InputTextStyle::Paragraph } else { InputTextStyle::Short };
+            CreateActionRow::InputText(
+                CreateInputText::new(style, q.label, format!("q{idx}"))
+                    .required(q.required)
+                    .max_length(1000)
+                    .placeholder(q.placeholder),
+            )
+        })
+        .collect::<Vec<_>>();
     let modal = CreateModal::new(format!("ticket_reason_{key}"), truncate(&format!("{} - Ticket", t.label), 45))
-        .components(vec![CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Paragraph, "What can we help you with?", "reason")
-                .required(true)
-                .max_length(1000)
-                .placeholder("A few details go a long way (who, what, when)..."),
-        )]);
+        .components(rows);
     let _ = i.create_response(&ctx.http, CreateInteractionResponse::Modal(modal)).await;
 }
 
@@ -321,7 +395,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Modal submit → actually create the private channel.
-pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &str, reason: &str) {
+pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &str, answers: &[String]) {
     let Some(guild_id) = i.guild_id else { return };
     let cfg = get_ticket_config(&guild_id.to_string());
     let Some(t) = cfg.types.iter().find(|t| t.key == key).cloned() else {
@@ -472,6 +546,7 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         }
     };
 
+    let qa = pair_answers(answers);
     set_open_ticket(
         &guild_id.to_string(),
         &ticket_channel.id.to_string(),
@@ -480,20 +555,26 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
             opener_id: i.user.id.to_string(),
             opened_at: now_ms(),
             claimed_by: None,
-            reason: reason.to_string(),
+            answers: qa.clone(),
+            reason: String::new(),
         },
     );
 
     // Green bar and the same field layout as a submitted application, so the
-    // two systems read as one bot rather than two.
-    let welcome = CreateEmbed::new()
+    // two systems read as one bot rather than two. One field per form answer,
+    // the way Appy lists what the opener submitted.
+    let mut welcome = CreateEmbed::new()
         .color(APPY_GREEN)
         .title(format!("{} {} Ticket Opened", if t.emoji.is_empty() { "🎫" } else { &t.emoji }, t.label))
         .description(format!(
             "Thanks for reaching out, <@{}>. Someone from the team will be with you shortly.",
             i.user.id
-        ))
-        .field("1. What can we help you with?", truncate(reason, 1024), false)
+        ));
+    for a in &qa {
+        let val = if a.answer.trim().is_empty() { "N/A".to_string() } else { truncate(a.answer.trim(), 1024) };
+        welcome = welcome.field(&a.question, val, false);
+    }
+    let welcome = welcome
         .field("Opened by", format!("<@{}>", i.user.id), true)
         .field("Type", t.label.clone(), true)
         .field("Status", "🟢 Waiting for staff", true)
@@ -723,7 +804,7 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
         )
         .field("Opened", format!("<t:{}:F>", ticket.opened_at / 1000), true)
         .field("Duration", format_uptime(now_ms() - ticket.opened_at), true)
-        .field("Reason", truncate(if ticket.reason.is_empty() { "N/A" } else { &ticket.reason }, 1024), false)
+        .field("Open reason", truncate(&answers_block(&ticket), 1024), false)
         .timestamp(Timestamp::now());
 
     if let Some(log_id) = t.as_ref().and_then(|t| t.log_channel_id.parse::<u64>().ok()) {
@@ -736,6 +817,27 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
                 )),
             )
             .await;
+    }
+
+    // Let the opener know their ticket was closed, with the answers they gave,
+    // the way Appy DMs the person who opened it. Best-effort: silently skipped
+    // if their DMs are shut.
+    if let Ok(opener_raw) = ticket.opener_id.parse::<u64>() {
+        let (guild_name, guild_icon) = guild_meta(ctx, guild_id);
+        let mut dm = CreateEmbed::new()
+            .color(APPY_RED)
+            .title("Ticket Closed")
+            .description(format!(
+                "Your **{label}** ticket in **{guild_name}** was closed by {}.",
+                i.user.tag()
+            ))
+            .field("Open reason", truncate(&answers_block(&ticket), 1024), false)
+            .footer(CreateEmbedFooter::new(format!("Ticket ID: {}", i.channel_id)))
+            .timestamp(Timestamp::now());
+        if let Some(url) = guild_icon {
+            dm = dm.thumbnail(url);
+        }
+        crate::common::permissions::try_dm_embed(&ctx.http, UserId::new(opener_raw), dm).await;
     }
 
     sec_log(
@@ -909,6 +1011,31 @@ mod tests {
         assert_eq!(split.1[0].key, "partnerships");
 
         crate::common::db::delete("tickets", gid);
+    }
+
+    /// The form answers render as Appy's "Open reason" block: each question in
+    /// brackets with its answer underneath, and a blank answer shown as N/A.
+    #[test]
+    fn answers_block_lays_out_each_question_and_answer() {
+        let ticket = OpenTicket {
+            answers: vec![
+                TicketAnswer { question: "Is this a ban appeal or support ticket?".into(), answer: "ban appeal".into() },
+                TicketAnswer { question: "How can we help?".into(), answer: "".into() },
+            ],
+            ..Default::default()
+        };
+        let block = answers_block(&ticket);
+        assert_eq!(block, "[Is this a ban appeal or support ticket?]\nban appeal\n\n[How can we help?]\nN/A");
+    }
+
+    /// A ticket opened under the old single-question form still shows its one
+    /// answer rather than nothing, because `reason` is the fallback.
+    #[test]
+    fn answers_block_falls_back_to_the_legacy_reason() {
+        let ticket = OpenTicket { reason: "the old single answer".into(), ..Default::default() };
+        assert_eq!(answers_block(&ticket), "the old single answer");
+        let empty = OpenTicket::default();
+        assert_eq!(answers_block(&empty), "N/A");
     }
 
     /// With no panel channel anywhere there is nothing to render, rather than

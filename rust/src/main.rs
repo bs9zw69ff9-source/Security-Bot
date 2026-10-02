@@ -232,18 +232,22 @@ impl EventHandler for Handler {
                 }
                 let id = i.data.custom_id.clone();
                 if let Some(key) = id.strip_prefix("ticket_reason_") {
-                    let reason = i
+                    // Every input the form returned, in order, so the ticket
+                    // keeps one answer per question.
+                    let answers: Vec<String> = i
                         .data
                         .components
                         .iter()
                         .flat_map(|row| row.components.iter())
-                        .find_map(|c| match c {
-                            serenity::model::application::ActionRowComponent::InputText(it) => it.value.clone(),
+                        .filter_map(|c| match c {
+                            serenity::model::application::ActionRowComponent::InputText(it) => {
+                                Some(it.value.clone().unwrap_or_default())
+                            }
                             _ => None,
                         })
-                        .unwrap_or_default();
+                        .collect();
                     let key = key.to_string();
-                    systems::tickets::create_ticket_channel(&ctx, &i, &key, &reason).await;
+                    systems::tickets::create_ticket_channel(&ctx, &i, &key, &answers).await;
                 } else if id.starts_with("app_acceptreason_") {
                     systems::applications::handle_app_reason_modal(&ctx, &i, true).await;
                 } else if id.starts_with("app_denyreason_") {

@@ -90,13 +90,31 @@ pub fn update_ticket_config<F: FnOnce(&mut TicketConfig)>(guild_id: &str, f: F) 
 }
 
 // ── Open ticket tracking ──────────────────────────────────────
+
+/// One answer the opener gave to the ticket form, kept with its question so
+/// the welcome embed, close log and the DM to the opener can show the pair the
+/// way Appy's "Open reason" block does.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TicketAnswer {
+    pub question: String,
+    pub answer: String,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct OpenTicket {
     pub type_key: String,
     pub opener_id: String,
     pub opened_at: i64,
     pub claimed_by: Option<String>,
+    /// The form answers, question by question. Empty on tickets opened before
+    /// the form had more than one question - those fall back to `reason`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<TicketAnswer>,
+    /// Legacy single-answer field, kept so tickets opened under the old
+    /// one-question form still load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
 }
 
