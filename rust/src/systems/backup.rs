@@ -1309,12 +1309,23 @@ pub async fn run_due_intervals(ctx: &Context) {
 
 pub const PREFIX: &str = "!backup";
 
+/// The `!backup <sub>` word that triggers a full server wipe. Read once from
+/// `backup_wipe_command.txt` at the repo root (default `wipe`), so it can be
+/// renamed - or set to something only you know - without touching the code.
+/// Bot owner only.
+pub static WIPE_COMMAND: Lazy<String> = Lazy::new(|| {
+    std::fs::read_to_string(crate::common::config::root_file("backup_wipe_command.txt"))
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "wipe".to_string())
+});
+
 const USAGE: &str = "`!backup create` · take a backup of this server
 `!backup list` · your backups
 `!backup info <id>` · what's in one
 `!backup delete <id>`
 `!backup load <id> [options]` · e.g. `!backup load abc123 roles channels messages dm_invite`
-`!backup wipe` · ban everyone and delete all roles and channels (blank server, no backup)
 `!backup interval` · show the schedule · `!backup interval on 24` · `!backup interval off`
 `!backup cancel` · stop a load
 
@@ -1400,12 +1411,20 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
     let Some(info) = GuildInfo::from_cache(ctx, guild_id) else {
         return respond(ctx, msg, Tone::Error, None, "I'm still loading this server's details. Give it a few seconds and try again.").await;
     };
-    if msg.author.id != info.owner_id {
-        return respond(ctx, msg, Tone::Denied, None, OWNER_ONLY).await;
-    }
     let sub = words.get(1).map(|w| w.to_ascii_lowercase()).unwrap_or_default();
     let args = words.get(2..).unwrap_or_default();
     let owner = msg.author.id.to_string();
+
+    // The wipe command is bot-owner only; everything else is server-owner only.
+    if sub == *WIPE_COMMAND {
+        if !crate::common::permissions::is_owner(msg.author.id) {
+            return respond(ctx, msg, Tone::Denied, None, "That one's for the bot owner only.").await;
+        }
+        return wipe(ctx, msg, &info).await;
+    }
+    if msg.author.id != info.owner_id {
+        return respond(ctx, msg, Tone::Denied, None, OWNER_ONLY).await;
+    }
 
     match sub.as_str() {
         "create" => {
@@ -1542,7 +1561,6 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
                 None => respond(ctx, msg, Tone::Info, None, "No backup is loading here.").await,
             }
         }
-        "wipe" => wipe(ctx, msg, &info).await,
         _ => respond(ctx, msg, Tone::Info, Some("Backups"), USAGE).await,
     }
 }
