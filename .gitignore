@@ -20,3 +20,6 @@ failsafe_backup.json
 
 # Rust build artifacts
 rust/target/
+
+# your secret wipe command word (auto-created on first run)
+backup_wipe_command.txt
