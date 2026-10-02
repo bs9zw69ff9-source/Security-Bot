@@ -385,10 +385,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
         name: "Community",
         color: palette::CYAN,
         commands: &[
-            ("/tickets", "Ticket types, support roles, categories and panels"),
-            ("/applications", "Applications: open, close, panels, review, roles, questions"),
             ("/police manual setup", "Post the officer guide & procedures manual"),
-            ("/chainofcommand", "Self-updating rank boards"),
         ],
     },
     HelpSection {

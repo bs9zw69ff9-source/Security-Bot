@@ -48,6 +48,14 @@ fn guild_only(c: CreateCommand) -> CreateCommand {
     c.contexts(vec![InteractionContext::Guild])
 }
 
+/// Commands left out of registration. Their definitions and handlers stay in
+/// place; taking a name off this list brings the command back.
+const DISABLED: &[&str] = &["tickets", "applications", "chainofcommand"];
+
+fn command_name(c: &CreateCommand) -> String {
+    serde_json::to_value(c).ok().and_then(|v| v["name"].as_str().map(str::to_string)).unwrap_or_default()
+}
+
 pub fn all() -> Vec<CreateCommand> {
     vec![
         CreateCommand::new("mute")
@@ -302,6 +310,7 @@ pub fn all() -> Vec<CreateCommand> {
         CreateCommand::new("help").description("Show all Guardian Bot commands"),
     ]
     .into_iter()
+    .filter(|c| !DISABLED.contains(&command_name(c).as_str()))
     .map(guild_only)
     .collect()
 }
@@ -320,6 +329,15 @@ mod tests {
             let json = serde_json::to_string(&c).unwrap();
             assert!(json.contains("\"contexts\":[0]"), "a command is not server-only: {json}");
         }
+    }
+
+    #[test]
+    fn disabled_commands_are_not_registered() {
+        let names: Vec<String> = all().iter().map(command_name).collect();
+        for d in DISABLED {
+            assert!(!names.iter().any(|n| n == d), "/{d} is still registered");
+        }
+        assert!(names.iter().any(|n| n == "help"), "the rest still are");
     }
 
     /// The list itself should not quietly empty out.

@@ -182,8 +182,13 @@ invocation of a hidden owner command is written to the local
 |------|----------|
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
-| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/tickets` `/applications` `/police` `/chainofcommand` `/config` `/status` `/antiping` `/nuketest` |
+| 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/police` `/config` `/status` `/antiping` `/nuketest` |
 | 👑 Server owner only | `!backup` |
+
+`/tickets`, `/applications` and `/chainofcommand` are switched off: their
+code is still here, but they aren't registered with Discord. To bring one
+back, take its name out of `DISABLED` in `rust/src/commands/definitions.rs`.
+Panels and boards already posted keep working.
 
 Bot owners (`BOT_OWNER_IDS`) can run every command except `!backup` in every server, with no
 roles or server permissions. Moderation commands also let them act on
