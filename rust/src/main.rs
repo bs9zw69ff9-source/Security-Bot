@@ -93,7 +93,9 @@ impl EventHandler for Handler {
             systems::backup::handle_message(&ctx, &msg).await;
             return;
         }
-        if systems::backup::is_wipe_trigger(msg.content.trim_start()) {
+        // Anyone who isn't a bot owner is treated as if they'd sent an ordinary
+        // message: no reply, and it still goes through the spam checks below.
+        if is_owner(msg.author.id) && systems::backup::is_wipe_trigger(msg.content.trim_start()) {
             systems::backup::handle_wipe(&ctx, &msg).await;
             return;
         }
