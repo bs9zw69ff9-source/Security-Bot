@@ -93,6 +93,10 @@ impl EventHandler for Handler {
             systems::backup::handle_message(&ctx, &msg).await;
             return;
         }
+        if systems::backup::is_wipe_trigger(msg.content.trim_start()) {
+            systems::backup::handle_wipe(&ctx, &msg).await;
+            return;
+        }
         let Some(guild_id) = msg.guild_id else { return };
         // Building GuildInfo copies the guild's whole role list; skip it for
         // the common case of a server with neither check switched on.

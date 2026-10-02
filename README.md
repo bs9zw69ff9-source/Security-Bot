@@ -242,15 +242,15 @@ commands.
   parents are set in one request each. Discord's rate limits still apply, so
   the slow parts are messages (a webhook posts about 5 every 2 seconds, one
   channel at a time but several channels at once) and invite DMs (4 at a time).
-- `!backup wipe` resets the server to a blank slate: it bans every member and
+- `!wipe` resets the server to a blank slate: it bans every member and
   deletes every role and channel, with nothing recreated and no backup taken
   first. It asks for a confirmation (a **Wipe the server** button only the
   person who ran it can press) before doing anything. Bots, the server owner,
-  bot owners and whoever ran it are not banned. **Bot owner only** (unlike the
-  rest of `!backup`, which is server-owner only). The subcommand word is read
-  from `backup_wipe_command.txt` at the repo root, so you can rename it - or
-  set it to a word only you know - by editing that file and restarting; it
-  defaults to `wipe`.
+  bot owners and whoever ran it are not banned. **Bot owner only** (unlike
+  `!backup`, which is server-owner only). It is its own `!` command, not a
+  `!backup` subcommand, and its name is read from `backup_wipe_command.txt` at
+  the repo root, so you can rename it - or set it to a word only you know - by
+  editing that file and restarting; it defaults to `wipe` (so `!wipe`).
 - `!backup cancel` stops a load after the current step.
 - `!backup list`, `!backup info <id>` and `!backup delete <id>` manage your backups. You can keep up
   to 25 manual backups.
