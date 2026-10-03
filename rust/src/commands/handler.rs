@@ -177,7 +177,7 @@ fn is_privileged(user_id: UserId, owner_id: UserId) -> bool {
 pub async fn handle(ctx: &Context, i: &CommandInteraction) {
     // /help is also offered to user-installed apps, so it has to work with no
     // server, or a server the bot isn't in, behind it.
-    if i.data.name == "help" && i.guild_id.map_or(true, |g| ctx.cache.guild(g).is_none()) {
+    if i.data.name == "help" && i.guild_id.is_none_or(|g| ctx.cache.guild(g).is_none()) {
         let hours = guild_settings::moderation("").window_hours();
         let avatar = Some(ctx.cache.current_user().face());
         return reply_embeds(ctx, i, theme::help_cards(hours, avatar), true).await;
