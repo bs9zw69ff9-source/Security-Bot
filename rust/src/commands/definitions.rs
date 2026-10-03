@@ -1,7 +1,7 @@
 //! Slash command definitions.
 
 use serenity::builder::{CreateCommand, CreateCommandOption};
-use serenity::model::application::{CommandOptionType, InteractionContext};
+use serenity::model::application::{CommandOptionType, InstallationContext, InteractionContext};
 use serenity::model::channel::ChannelType;
 
 use crate::state::tunables::{Module, Tunable};
@@ -46,6 +46,26 @@ fn tunable_sub(name: &str, desc: &str, module: Module) -> CreateCommandOption {
 /// rather than command by command, so a new command cannot miss it.
 fn guild_only(c: CreateCommand) -> CreateCommand {
     c.contexts(vec![InteractionContext::Guild])
+}
+
+/// Commands that make sense with no server behind them, so the bot can also be
+/// installed to a user's own account ("user apps") and used anywhere: in any
+/// server, in the bot's DMs, and in other DMs and group chats. Everything else
+/// is moderation or configuration and needs the bot inside the guild, so it
+/// stays server-only. The Developer Portal's Installation page must have
+/// "User Install" switched on for Discord to offer this.
+const USER_APP_COMMANDS: &[&str] = &["help"];
+
+fn scope(c: CreateCommand) -> CreateCommand {
+    if USER_APP_COMMANDS.contains(&command_name(&c).as_str()) {
+        c.integration_types(vec![InstallationContext::Guild, InstallationContext::User]).contexts(vec![
+            InteractionContext::Guild,
+            InteractionContext::BotDm,
+            InteractionContext::PrivateChannel,
+        ])
+    } else {
+        guild_only(c)
+    }
 }
 
 /// Commands left out of registration. Their definitions and handlers stay in
@@ -311,7 +331,7 @@ pub fn all() -> Vec<CreateCommand> {
     ]
     .into_iter()
     .filter(|c| !DISABLED.contains(&command_name(c).as_str()))
-    .map(guild_only)
+    .map(scope)
     .collect()
 }
 
@@ -326,8 +346,20 @@ mod tests {
     #[test]
     fn every_command_is_marked_server_only() {
         for c in all() {
+            if USER_APP_COMMANDS.contains(&command_name(&c).as_str()) {
+                continue;
+            }
             let json = serde_json::to_string(&c).unwrap();
             assert!(json.contains("\"contexts\":[0]"), "a command is not server-only: {json}");
+        }
+    }
+
+    #[test]
+    fn user_app_commands_work_outside_servers() {
+        for c in all().iter().filter(|c| USER_APP_COMMANDS.contains(&command_name(c).as_str())) {
+            let json = serde_json::to_string(c).unwrap();
+            assert!(json.contains("\"integration_types\":[0,1]"), "not user-installable: {json}");
+            assert!(json.contains("\"contexts\":[0,1,2]"), "not usable in DMs: {json}");
         }
     }
 
