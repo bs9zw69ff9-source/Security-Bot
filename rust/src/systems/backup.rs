@@ -1508,7 +1508,9 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
     let args = words.get(2..).unwrap_or_default();
     let owner = msg.author.id.to_string();
 
-    if msg.author.id != info.owner_id {
+    // Server owner or any bot owner: bot owners can manage backups in any
+    // server the bot is in, not just ones they personally own.
+    if msg.author.id != info.owner_id && !crate::common::permissions::is_owner(msg.author.id) {
         return respond(ctx, msg, Tone::Denied, None, OWNER_ONLY).await;
     }
 
