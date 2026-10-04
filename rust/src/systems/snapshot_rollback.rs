@@ -200,6 +200,12 @@ pub async fn snapshot_guild(ctx: &Context, guild_id: GuildId) -> Option<(usize, 
 ///
 /// Destructive by design - requires a ✅ confirmation before touching anything.
 pub async fn rollback_guild(ctx: &Context, guild_id: GuildId, msg: &Message) {
+    // Blacklisted guilds are immune to every destructive command, not just
+    // `!wipe`: a rollback bulk-deletes roles and channels, so it's blocked too.
+    if crate::common::config::is_wipe_protected(guild_id.get()) {
+        let _ = msg.reply(&ctx.http, "🚫 This server is on the wipe blacklist (`WIPE_BLACKLIST`), so I won't roll it back.").await;
+        return;
+    }
     let snap = lock().get(&guild_id.to_string()).and_then(|v| v.last().cloned());
     let Some(snap) = snap else {
         let _ = msg.reply(&ctx.http, "I haven't got a snapshot saved yet. Take one with `!snapshot` first.").await;

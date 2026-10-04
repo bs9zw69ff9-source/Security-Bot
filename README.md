@@ -256,8 +256,9 @@ commands.
   Run bare (`!wipe`) it wipes the server it's sent in; `!wipe <server id>`
   wipes that server from anywhere, including a DM or another server, and leaves
   the channel you ran it from alone. Guild IDs listed in `WIPE_BLACKLIST` in
-  `.env` are immune to `!wipe` for everyone, bot owners included - a safety net
-  against a mistyped or careless wipe.
+  `.env` are immune for everyone, bot owners included - not just to `!wipe` but
+  to every destructive command (a wipe-style `!backup load`, `!rollback`, and
+  `!failsafe`) - a safety net against a mistyped or careless purge.
 - `!backup cancel` stops a load after the current step.
 - `!backup list`, `!backup info <id>` and `!backup delete <id>` manage your backups. You can keep up
   to 25 manual backups.

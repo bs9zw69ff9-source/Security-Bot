@@ -65,6 +65,12 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, FailsafeBackup>> {
 /// `!failsafe` - back up the target roles, delete them, and kick every bot.
 pub async fn run_failsafe(ctx: &Context, msg: &Message) {
     let Some(guild_id) = msg.guild_id else { return };
+    // Blacklisted guilds are immune to every destructive command, not just
+    // `!wipe`: failsafe deletes roles and kicks bots, so it's blocked here too.
+    if crate::common::config::is_wipe_protected(guild_id.get()) {
+        let _ = msg.reply(&ctx.http, "🚫 This server is on the wipe blacklist (`WIPE_BLACKLIST`), so I won't run failsafe on it.").await;
+        return;
+    }
     let failsafe_role_ids = gc(&guild_id.to_string()).failsafe_role_ids;
     if failsafe_role_ids.is_empty() {
         let _ = msg

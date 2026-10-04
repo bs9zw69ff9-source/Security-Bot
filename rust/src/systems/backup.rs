@@ -1121,6 +1121,12 @@ async fn run_wipe(l: &mut Loader<'_>, plan: Plan) {
 
 async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: LoadOptions) {
     let gid = info.id;
+    // A load is wipe-equivalent (by default it deletes every role and channel
+    // and bans everyone), so a blacklisted guild is off-limits here too - the
+    // same hard stop as `!wipe`, before anything is read or touched.
+    if crate::common::config::is_wipe_protected(gid.get()) {
+        return respond(ctx, msg, Tone::Denied, None, &format!("**{}** is on the wipe blacklist (`WIPE_BLACKLIST`), so I won't run a destructive load on it.", info.name)).await;
+    }
     let me = ctx.cache.current_user().id;
     let Some(bot) = fetch_member(ctx, gid, me).await else {
         return respond(ctx, msg, Tone::Error, None, "I couldn't check my own permissions here. Try again in a moment.").await;
