@@ -333,6 +333,11 @@ struct Loader<'a> {
     guild_id: GuildId,
     cancel: Arc<AtomicBool>,
     lines: Vec<String>,
+    /// The channel to delete last so the final report comes by DM, when it
+    /// lives inside the guild being wiped/loaded. `None` for a remote wipe run
+    /// from another server or a DM: there is no in-guild channel to remove, and
+    /// the channel the command came from must be left alone.
+    report_channel: Option<ChannelId>,
     report_channel_gone: bool,
 }
 
@@ -945,7 +950,9 @@ async fn run_load(l: &mut Loader<'_>, b: &Backup, o: LoadOptions, plan: Plan) {
     // channel this load was started from. It goes last so progress stays
     // visible until the end; the report then comes by DM.
     if (o.channels || o.delete_channels) && !l.cancelled() {
-        l.report_channel_gone = l.cmd.channel_id.delete(&env.ctx.http).await.is_ok();
+        if let Some(rc) = l.report_channel {
+            l.report_channel_gone = rc.delete(&env.ctx.http).await.is_ok();
+        }
     }
 }
 
@@ -964,7 +971,12 @@ fn invite_channel(b: &Backup, chan_map: &HashMap<String, ChannelId>) -> Option<C
 /// channel, with nothing recreated - a blank server. Nothing is backed up
 /// first and there is no confirmation: the secret name and the bot-owner gate
 /// are the protection.
-async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo) {
+///
+/// `report_channel` is the in-guild channel to delete last (so progress stays
+/// readable), or `None` for a remote wipe run from a DM or another server,
+/// where there is no channel of the target's to keep and the command's own
+/// channel must be left untouched.
+async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo, report_channel: Option<ChannelId>) {
     let gid = info.id;
     let me = ctx.cache.current_user().id;
     let Some(bot) = fetch_member(ctx, gid, me).await else {
@@ -989,7 +1001,10 @@ async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo) {
         .collect();
     let live_chans: Vec<LiveChannel> =
         live_channels.values().map(|c| LiveChannel { id: c.id.get(), kind: channel_kind_num(c.kind) }).collect();
-    let plan = backups::plan(&live_roles, &live_chans, true, true, msg.channel_id.get());
+    // Keep the reporting channel out of the plan only when it is inside the
+    // target guild (a local wipe); a remote wipe deletes every channel.
+    let keep = report_channel.map(|c| c.get()).unwrap_or(0);
+    let plan = backups::plan(&live_roles, &live_chans, true, true, keep);
     let author = msg.author.id;
     let channel = msg.channel_id;
     // No confirmation step: the command's name is secret and bot-owner only,
@@ -1010,7 +1025,7 @@ async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo) {
         return respond(ctx, msg, Tone::Error, None, "A backup is already running here. Wait for it, or `!backup cancel` it.").await;
     }
     println!("💥 [{gid}] {author} is wiping the server");
-    let mut loader = Loader { ctx, cmd: msg, status: prompt, guild_id: gid, cancel, lines: Vec::new(), report_channel_gone: false };
+    let mut loader = Loader { ctx, cmd: msg, status: prompt, guild_id: gid, cancel, lines: Vec::new(), report_channel, report_channel_gone: false };
     run_wipe(&mut loader, plan).await;
     loads().remove(&gid);
 
@@ -1051,9 +1066,12 @@ async fn run_wipe(l: &mut Loader<'_>, plan: Plan) {
     if l.cancelled() {
         return;
     }
-    // The channel this was run from is the one place still standing; it goes
-    // last so the progress above stays readable, and the report then DMs.
-    l.report_channel_gone = l.cmd.channel_id.delete(&env.ctx.http).await.is_ok();
+    // The reporting channel (when the wipe is of the server the command was
+    // sent in) is the one place still standing; it goes last so the progress
+    // above stays readable, and the report then DMs. A remote wipe has none.
+    if let Some(rc) = l.report_channel {
+        l.report_channel_gone = rc.delete(&env.ctx.http).await.is_ok();
+    }
 }
 
 async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: LoadOptions) {
@@ -1219,7 +1237,7 @@ async fn load(ctx: &Context, msg: &Message, info: &GuildInfo, b: Backup, o: Load
         return;
     }
     println!("💾 [{gid}] {} is loading backup {} ({})", msg.author.id, b.id, b.guild_name);
-    let mut loader = Loader { ctx, cmd: msg, status, guild_id: gid, cancel, lines: Vec::new(), report_channel_gone: false };
+    let mut loader = Loader { ctx, cmd: msg, status, guild_id: gid, cancel, lines: Vec::new(), report_channel: Some(msg.channel_id), report_channel_gone: false };
     run_load(&mut loader, &b, o, plan).await;
     loads().remove(&gid);
 
@@ -1395,14 +1413,34 @@ fn parse_load(args: &[&str]) -> Result<(String, LoadOptions), String> {
 /// Handle the standalone wipe command (e.g. `!wipe`). Bot owner only; for
 /// anyone else it stays silent so the command's name isn't given away.
 pub async fn handle_wipe(ctx: &Context, msg: &Message) {
-    let Some(guild_id) = msg.guild_id else { return };
     if !crate::common::permissions::is_owner(msg.author.id) {
         return;
     }
-    let Some(info) = GuildInfo::from_cache(ctx, guild_id) else {
-        return respond(ctx, msg, Tone::Error, None, "I'm still loading this server's details. Give it a few seconds and try again.").await;
+    // `!wipe` with no argument wipes the server it's sent in; `!wipe <server id>`
+    // wipes that server from anywhere, including a DM or another server.
+    let words: Vec<&str> = msg.content.split_whitespace().collect();
+    let target = match words.get(1) {
+        Some(arg) => match arg.parse::<u64>() {
+            Ok(raw) => GuildId::new(raw),
+            Err(_) => {
+                return respond(ctx, msg, Tone::Error, None, &format!("`{arg}` isn't a server ID. Give me the ID of a server I'm in.")).await
+            }
+        },
+        None => match msg.guild_id {
+            Some(g) => g,
+            None => {
+                return respond(ctx, msg, Tone::Error, None, &format!("In a DM I need to know which server: `{} <server id>`.", *WIPE_TRIGGER)).await
+            }
+        },
     };
-    wipe(ctx, msg, &info).await;
+    let Some(info) = GuildInfo::from_cache(ctx, target) else {
+        return respond(ctx, msg, Tone::Error, None, "I'm not in that server, or I'm still loading it. Check the ID and try again in a moment.").await;
+    };
+    // Delete the command's own channel last only when the command was sent in
+    // the very server being wiped; otherwise leave it (and everything else
+    // outside the target) untouched.
+    let report_channel = (msg.guild_id == Some(target)).then_some(msg.channel_id);
+    wipe(ctx, msg, &info, report_channel).await;
 }
 
 /// Handle a `!backup …` message. Server owner and bot owners only.

@@ -54,7 +54,7 @@ fn guild_only(c: CreateCommand) -> CreateCommand {
 /// is moderation or configuration and needs the bot inside the guild, so it
 /// stays server-only. The Developer Portal's Installation page must have
 /// "User Install" switched on for Discord to offer this.
-const USER_APP_COMMANDS: &[&str] = &["help"];
+const USER_APP_COMMANDS: &[&str] = &["help", "status", "servers"];
 
 fn scope(c: CreateCommand) -> CreateCommand {
     if USER_APP_COMMANDS.contains(&command_name(&c).as_str()) {

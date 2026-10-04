@@ -174,13 +174,81 @@ fn is_privileged(user_id: UserId, owner_id: UserId) -> bool {
     is_owner(user_id) || user_id == owner_id
 }
 
+/// The system-status embed, built the same whether `/status` is run in a server
+/// or in a bot owner's DMs.
+async fn system_status_embed(ctx: &Context) -> CreateEmbed {
+    let uptime = crate::START_TIME.get().map(|t| now_ms() - t).unwrap_or(0);
+    let latency = crate::shard_latency(ctx.shard_id).await;
+    let my_avatar = ctx.cache.current_user().face();
+    CreateEmbed::new()
+        .color(theme::palette::AZURE)
+        .title("📊  GUARDIAN • SYSTEM STATUS")
+        .description(match (locked_count(), crate::common::db::write_failures()) {
+            (0, 0) => "🟢 **All systems operational.**".to_string(),
+            _ => "🟠 **Running, with something that needs a look below.**".to_string(),
+        })
+        .thumbnail(my_avatar)
+        .field("⏱️ Uptime", format!("`{}`", format_uptime(uptime)), true)
+        .field("📡 WS Ping", format!("`{latency}`"), true)
+        .field("🧩 Shard", format!("`#{}`", ctx.shard_id), true)
+        .field("🌐 Guilds", format!("`{}`", ctx.cache.guild_count()), true)
+        .field("🧠 Memory", format!("`{} MB`", rss_mb()), true)
+        .field(
+            "🔒 In lockdown",
+            match locked_count() {
+                0 => "`none`".to_string(),
+                n => format!("**{n}** guild{}", plural(n)),
+            },
+            true,
+        )
+        .field(
+            "💾 Saving",
+            match crate::common::db::write_failures() {
+                0 => "🟢 working".to_string(),
+                n => format!("🔴 {n} failed write{}", if n == 1 { "" } else { "s" }),
+            },
+            true,
+        )
+        .field("🦀 Build", concat!("`v", env!("CARGO_PKG_VERSION"), " · Rust`"), true)
+        .footer(theme::footer("Status • /nuketest checks my permissions here"))
+        .timestamp(Timestamp::now())
+}
+
 pub async fn handle(ctx: &Context, i: &CommandInteraction) {
-    // /help is also offered to user-installed apps, so it has to work with no
-    // server, or a server the bot isn't in, behind it.
-    if i.data.name == "help" && i.guild_id.is_none_or(|g| ctx.cache.guild(g).is_none()) {
-        let hours = guild_settings::moderation("").window_hours();
-        let avatar = Some(ctx.cache.current_user().face());
-        return reply_embeds(ctx, i, theme::help_cards(hours, avatar), true).await;
+    // Some commands have no server behind them: a user-installed app runs in
+    // DMs, and even in a server the bot may not be a member of it. Handle those
+    // here, before anything tries to read guild data.
+    let no_guild = i.guild_id.is_none_or(|g| ctx.cache.guild(g).is_none());
+    if no_guild {
+        match i.data.name.as_str() {
+            // Open to anyone, anywhere.
+            "help" => {
+                let hours = guild_settings::moderation("").window_hours();
+                let avatar = Some(ctx.cache.current_user().face());
+                return reply_embeds(ctx, i, theme::help_cards(hours, avatar), true).await;
+            }
+            // Owner-only, and work without a server, so a bot owner can run them
+            // straight from the bot's DMs.
+            "status" if is_owner(i.user.id) => {
+                return reply_embed(ctx, i, system_status_embed(ctx).await, true).await;
+            }
+            "servers" if is_owner(i.user.id) => {
+                defer(ctx, i).await;
+                let result = crate::systems::server_list::dm_server_list(ctx, i.user.id).await;
+                return edit_text(ctx, i, result).await;
+            }
+            "status" | "servers" => return reply_text(ctx, i, OWNER_ONLY).await,
+            // Everything else acts on a server, which a DM doesn't give it. A
+            // bot owner can still reach another server's wipe with `!wipe <id>`.
+            _ => {
+                return reply_text(
+                    ctx,
+                    i,
+                    "That command works on a server, so run it in the server you mean.",
+                )
+                .await
+            }
+        }
     }
     let Some(guild_id) = i.guild_id else {
         return reply_text(ctx, i, "You can only use this in a server.").await;
@@ -1321,47 +1389,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if !privileged {
                 return reply_text(ctx, i, OWNER_ONLY).await;
             }
-            let uptime = crate::START_TIME.get().map(|t| now_ms() - t).unwrap_or(0);
-            let latency = crate::shard_latency(ctx.shard_id).await;
-            let my_avatar = ctx.cache.current_user().face();
-            reply_embed(
-                ctx,
-                i,
-                CreateEmbed::new()
-                    .color(theme::palette::AZURE)
-                    .title("📊  GUARDIAN • SYSTEM STATUS")
-                    .description(match (locked_count(), crate::common::db::write_failures()) {
-                        (0, 0) => "🟢 **All systems operational.**".to_string(),
-                        _ => "🟠 **Running, with something that needs a look below.**".to_string(),
-                    })
-                    .thumbnail(my_avatar)
-                    .field("⏱️ Uptime", format!("`{}`", format_uptime(uptime)), true)
-                    .field("📡 WS Ping", format!("`{latency}`"), true)
-                    .field("🧩 Shard", format!("`#{}`", ctx.shard_id), true)
-                    .field("🌐 Guilds", format!("`{}`", ctx.cache.guild_count()), true)
-                    .field("🧠 Memory", format!("`{} MB`", rss_mb()), true)
-                    .field(
-                        "🔒 In lockdown",
-                        match locked_count() {
-                            0 => "`none`".to_string(),
-                            n => format!("**{n}** guild{}", plural(n)),
-                        },
-                        true,
-                    )
-                    .field(
-                        "💾 Saving",
-                        match crate::common::db::write_failures() {
-                            0 => "🟢 working".to_string(),
-                            n => format!("🔴 {n} failed write{}", if n == 1 { "" } else { "s" }),
-                        },
-                        true,
-                    )
-                    .field("🦀 Build", concat!("`v", env!("CARGO_PKG_VERSION"), " · Rust`"), true)
-                    .footer(theme::footer("Status • /nuketest checks my permissions here"))
-                    .timestamp(Timestamp::now()),
-                true,
-            )
-            .await;
+            reply_embed(ctx, i, system_status_embed(ctx).await, true).await;
         }
 
         // ── /antiraid ──────────────────────────────────────────

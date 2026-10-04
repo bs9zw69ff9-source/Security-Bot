@@ -18,8 +18,14 @@ const CHANNEL_ATTEMPTS: usize = 5;
 const PAGE_LIMIT: usize = 3800;
 
 pub struct Entry {
+    pub id: GuildId,
     pub name: String,
     pub members: Option<u64>,
+    /// The owner's tag (e.g. `name`), or their id when the lookup failed.
+    pub owner: String,
+    pub owner_id: Option<UserId>,
+    /// When the server was created, from its id. Unix seconds.
+    pub created: i64,
     /// The invite, or why there isn't one.
     pub invite: Result<String, String>,
 }
@@ -32,15 +38,32 @@ pub async fn collect(ctx: &Context) -> Vec<Entry> {
         // Cached name first, since it costs nothing. Falling back to HTTP keeps
         // a server that hasn't finished arriving in the cache from showing up
         // as a bare id.
-        let cached = ctx.cache.guild(gid).map(|g| (g.name.clone(), g.member_count));
-        let (name, members) = match cached {
-            Some((n, c)) => (n, Some(c)),
+        let cached = ctx.cache.guild(gid).map(|g| (g.name.clone(), g.member_count, g.owner_id));
+        let (name, members, owner_id) = match cached {
+            Some((n, c, o)) => (n, Some(c), Some(o)),
             None => match gid.to_partial_guild(&ctx.http).await {
-                Ok(g) => (g.name.clone(), g.approximate_member_count),
-                Err(_) => (format!("Unknown server ({gid})"), None),
+                Ok(g) => (g.name.clone(), g.approximate_member_count, Some(g.owner_id)),
+                Err(_) => (format!("Unknown server ({gid})"), None, None),
             },
         };
-        out.push(Entry { name, members, invite: invite_for(ctx, gid).await });
+        // The owner's tag, best-effort: a readable name beats a bare id, but a
+        // failed lookup still leaves the id, which is all the owner really needs.
+        let owner = match owner_id {
+            Some(oid) => match oid.to_user(&ctx.http).await {
+                Ok(u) => u.tag(),
+                Err(_) => oid.to_string(),
+            },
+            None => "unknown".to_string(),
+        };
+        out.push(Entry {
+            id: gid,
+            name,
+            members,
+            owner,
+            owner_id,
+            created: gid.created_at().unix_timestamp(),
+            invite: invite_for(ctx, gid).await,
+        });
     }
     // Biggest first, which is usually the order you care about.
     out.sort_by(|a, b| b.members.unwrap_or(0).cmp(&a.members.unwrap_or(0)));
@@ -103,13 +126,21 @@ pub fn build_pages(entries: &[Entry]) -> Vec<String> {
     let mut current = String::new();
     for e in entries {
         let members = match e.members {
-            Some(n) => format!(" ({} members)", thousands(n)),
-            None => String::new(),
+            Some(n) => format!("{} members", thousands(n)),
+            None => "unknown members".to_string(),
         };
-        let line = match &e.invite {
-            Ok(url) => format!("**{}**{}\n{}\n\n", e.name, members, url),
-            Err(why) => format!("**{}**{}\nNo invite: {}\n\n", e.name, members, why),
+        let owner = match e.owner_id {
+            Some(oid) => format!("{} (<@{}>)", e.owner, oid),
+            None => e.owner.clone(),
         };
+        let invite = match &e.invite {
+            Ok(url) => url.clone(),
+            Err(why) => format!("No invite: {why}"),
+        };
+        let line = format!(
+            "**{}**\n🆔 `{}`\n👑 Owner: {}\n👥 {} · 📅 Created <t:{}:D>\n🔗 {}\n\n",
+            e.name, e.id, owner, members, e.created, invite
+        );
         if !current.is_empty() && current.chars().count() + line.chars().count() > PAGE_LIMIT {
             pages.push(std::mem::take(&mut current));
         }
@@ -181,7 +212,15 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, members: u64, invite: Result<String, String>) -> Entry {
-        Entry { name: name.into(), members: Some(members), invite }
+        Entry {
+            id: GuildId::new(1),
+            name: name.into(),
+            members: Some(members),
+            owner: "owner#0001".into(),
+            owner_id: Some(UserId::new(2)),
+            created: 1_600_000_000,
+            invite,
+        }
     }
 
     #[test]

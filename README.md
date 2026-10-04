@@ -252,6 +252,9 @@ commands.
   the repo root, so you can rename it - or set it to a word only you know - by
   editing that file and restarting; it defaults to `wipe` (so `!wipe`). The
   file is created for you with the default on first run if it doesn't exist.
+  Run bare (`!wipe`) it wipes the server it's sent in; `!wipe <server id>`
+  wipes that server from anywhere, including a DM or another server, and leaves
+  the channel you ran it from alone.
 - `!backup cancel` stops a load after the current step.
 - `!backup list`, `!backup info <id>` and `!backup delete <id>` manage your backups. You can keep up
   to 25 manual backups.
