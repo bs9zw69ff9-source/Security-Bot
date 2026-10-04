@@ -978,6 +978,11 @@ fn invite_channel(b: &Backup, chan_map: &HashMap<String, ChannelId>) -> Option<C
 /// channel must be left untouched.
 async fn wipe(ctx: &Context, msg: &Message, info: &GuildInfo, report_channel: Option<ChannelId>) {
     let gid = info.id;
+    // The blacklist is the hard stop: a protected server is never wiped, no
+    // matter who runs it or how, and before anything is read or posted.
+    if crate::common::config::is_wipe_protected(gid.get()) {
+        return respond(ctx, msg, Tone::Denied, None, &format!("**{}** is on the wipe blacklist (`WIPE_BLACKLIST`), so I won't wipe it.", info.name)).await;
+    }
     let me = ctx.cache.current_user().id;
     let Some(bot) = fetch_member(ctx, gid, me).await else {
         return respond(ctx, msg, Tone::Error, None, "I couldn't check my own permissions here. Try again in a moment.").await;

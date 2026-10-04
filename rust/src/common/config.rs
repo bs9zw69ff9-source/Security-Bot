@@ -62,6 +62,17 @@ pub static BOT_OWNER_IDS: Lazy<HashSet<String>> = Lazy::new(|| {
     ids.into_iter().collect()
 });
 
+/// Guild IDs that `!wipe` must never touch, even for a bot owner: a safety net
+/// so a mistyped or careless wipe can't take out a server you've marked off.
+/// Comma-separated in WIPE_BLACKLIST. Non-numeric entries are ignored.
+pub static WIPE_BLACKLIST: Lazy<HashSet<u64>> =
+    Lazy::new(|| env_csv("WIPE_BLACKLIST").iter().filter_map(|s| s.parse::<u64>().ok()).collect());
+
+/// Whether a guild is blacklisted from `!wipe`.
+pub fn is_wipe_protected(guild_id: u64) -> bool {
+    WIPE_BLACKLIST.contains(&guild_id)
+}
+
 pub struct Config {
     pub log_channel_id: String,
     pub alert_channel_id: String,
