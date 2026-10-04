@@ -24,7 +24,8 @@ use crate::state::tickets::{
 };
 
 /// The questions the open-ticket form asks, mirroring the Appy ticket form:
-/// what kind of ticket it is, what they need, and whether they have evidence.
+/// what they need and whether they have evidence. The ticket's type is already
+/// known from the button they pressed, so it isn't asked again.
 /// Discord modals have no help text under a field, so the hint that sits below
 /// each Appy question lives in the placeholder here.
 struct Question {
@@ -37,12 +38,6 @@ struct Question {
 }
 
 const TICKET_QUESTIONS: &[Question] = &[
-    Question {
-        label: "Is this a ban appeal or support ticket?",
-        placeholder: "Type \"support\" for support or \"ban appeal\" for a ban appeal",
-        paragraph: false,
-        required: true,
-    },
     Question {
         label: "How can we help?",
         placeholder: "Please explain your answer in full detail",
