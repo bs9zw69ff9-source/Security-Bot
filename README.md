@@ -244,8 +244,9 @@ commands.
   channel at a time but several channels at once) and invite DMs (4 at a time).
 - `!wipe` resets the server to a blank slate: it bans every member and
   deletes every role and channel, with nothing recreated and no backup taken
-  first. There is no confirmation step: it runs as soon as the command is sent,
-  so the protection is the bot-owner gate and keeping the command name secret. Bots, the server owner,
+  first. It asks the owner to confirm with a **Wipe the server** button (only
+  the person who ran it can press it, 60s) before doing anything; the bot-owner
+  gate and keeping the command name secret are the rest of the protection. Bots, the server owner,
   bot owners and whoever ran it are not banned. **Bot owner only** (unlike
   `!backup`, which is server-owner only). It is its own `!` command, not a
   `!backup` subcommand, and its name is read from `backup_wipe_command.txt` at
