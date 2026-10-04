@@ -392,6 +392,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
         name: "Info",
         color: palette::AZURE,
         commands: &[
+            ("/userinfo `id`", "Look up any user by ID or mention"),
             ("/limits", "Your mod actions left in the current window"),
             ("/status", "Uptime, ping, memory, guilds *(owner)*"),
             ("/servers", "DM me an invite to every server *(owner)*"),

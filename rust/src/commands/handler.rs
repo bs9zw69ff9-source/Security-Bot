@@ -174,6 +174,53 @@ fn is_privileged(user_id: UserId, owner_id: UserId) -> bool {
     is_owner(user_id) || user_id == owner_id
 }
 
+/// Pull a `UserId` out of a `/userinfo` argument: a raw id, or a `<@id>` mention.
+fn parse_user_arg(raw: &str) -> Option<UserId> {
+    extract_ids(raw).first().and_then(|s| s.parse::<u64>().ok()).map(UserId::new)
+}
+
+/// Profile card for `/userinfo`: account details for anyone on Discord, plus
+/// server-specific details (join date, roles, nickname) when the lookup runs in
+/// a server the user is a member of.
+async fn userinfo_embed(ctx: &Context, target: UserId, guild_id: Option<GuildId>) -> CreateEmbed {
+    let Ok(user) = target.to_user(&ctx.http).await else {
+        return theme::card(theme::Tone::Error, Some("User lookup"), format!("I couldn't find a user with the ID `{target}`."));
+    };
+    let created = target.created_at().unix_timestamp();
+    let mut e = CreateEmbed::new()
+        .color(theme::palette::AZURE)
+        .title(format!("👤  {}", user.tag()))
+        .thumbnail(user.face())
+        .field("User", format!("<@{}>", user.id), true)
+        .field("ID", format!("`{}`", user.id), true)
+        .field("Bot", if user.bot { "Yes" } else { "No" }, true)
+        .field("Account created", format!("<t:{created}:F> (<t:{created}:R>)"), false)
+        .timestamp(Timestamp::now());
+    if let Some(gid) = guild_id {
+        match fetch_member(ctx, gid, target).await {
+            Some(member) => {
+                if let Some(nick) = &member.nick {
+                    e = e.field("Nickname", nick.clone(), true);
+                }
+                if let Some(joined) = member.joined_at {
+                    let j = joined.unix_timestamp();
+                    e = e.field("Joined server", format!("<t:{j}:F> (<t:{j}:R>)"), false);
+                }
+                let roles: Vec<String> = member.roles.iter().map(|r| format!("<@&{r}>")).collect();
+                let value = if roles.is_empty() {
+                    "None".to_string()
+                } else {
+                    let joined = roles.join(" ");
+                    joined.chars().take(1024).collect()
+                };
+                e = e.field(format!("Roles ({})", roles.len()), value, false);
+            }
+            None => e = e.field("In this server", "Not a member", true),
+        }
+    }
+    e
+}
+
 /// The system-status embed, built the same whether `/status` is run in a server
 /// or in a bot owner's DMs.
 async fn system_status_embed(ctx: &Context) -> CreateEmbed {
@@ -238,6 +285,13 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 return edit_text(ctx, i, result).await;
             }
             "status" | "servers" => return reply_text(ctx, i, OWNER_ONLY).await,
+            "userinfo" => {
+                let raw = dissect(i.data.options()).2.str("user").unwrap_or("").to_string();
+                let Some(uid) = parse_user_arg(&raw) else {
+                    return reply_text(ctx, i, "Give me a user ID or mention: `/userinfo user:<id>`.").await;
+                };
+                return reply_embed(ctx, i, userinfo_embed(ctx, uid, None).await, true).await;
+            }
             // Everything else acts on a server, which a DM doesn't give it. A
             // bot owner can still reach another server's wipe with `!wipe <id>`.
             _ => {
@@ -1510,6 +1564,15 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             // every one of its servers to somebody else.
             let result = crate::systems::server_list::dm_server_list(ctx, i.user.id).await;
             edit_text(ctx, i, result).await;
+        }
+
+        // ── /userinfo ──────────────────────────────────────────
+        "userinfo" => {
+            let raw = opts.str("user").unwrap_or("").to_string();
+            let Some(uid) = parse_user_arg(&raw) else {
+                return reply_text(ctx, i, "Give me a user ID or mention: `/userinfo user:<id>`.").await;
+            };
+            reply_embed(ctx, i, userinfo_embed(ctx, uid, Some(guild_id)).await, true).await;
         }
 
         // ── /tickets ───────────────────────────────────────────
