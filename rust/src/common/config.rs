@@ -257,3 +257,31 @@ pub fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The baked-in guild must be immune no matter what the environment says -
+    /// this is the "can't be turned off from `.env`" guarantee.
+    #[test]
+    fn baked_in_guild_is_always_protected() {
+        assert_eq!(ALWAYS_WIPE_PROTECTED, &[1541171641218764850]);
+        assert!(ALWAYS_WIPE_PROTECTED.contains(&1541171641218764850));
+        // Merged into the live set even with WIPE_BLACKLIST unset.
+        assert!(WIPE_BLACKLIST.contains(&1541171641218764850));
+        assert!(is_wipe_protected(1541171641218764850));
+    }
+
+    /// A guild that is neither baked in nor in WIPE_BLACKLIST is wipeable.
+    /// Probe for an id guaranteed to be outside the current set, so the test
+    /// holds even if WIPE_BLACKLIST happens to be set in the environment.
+    #[test]
+    fn unlisted_guild_is_not_protected() {
+        let mut probe = 42u64;
+        while WIPE_BLACKLIST.contains(&probe) {
+            probe += 1;
+        }
+        assert!(!is_wipe_protected(probe));
+    }
+}
