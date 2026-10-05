@@ -40,6 +40,14 @@ pub async fn mute_user(
     if !info.roles.contains_key(&mute_role) {
         return false;
     }
+    // Checked here, where the role is actually handed out, not only where it
+    // is configured: `/setup quick` adopts any role named "Muted", and a role's
+    // permissions can change after it's set. A "mute role" anti-nuke trusts,
+    // or one with real power, would turn /mute into a way to grant it.
+    if let Some(why) = crate::common::permissions::unsafe_grant_reason(info, mute_role, false) {
+        eprintln!("⚠️ [{guild_id}] refusing to mute with role {mute_role}: {why}");
+        return false;
+    }
 
     // Everything we can actually take off: not @everyone, not the mute role,
     // not managed, and below our own top role.

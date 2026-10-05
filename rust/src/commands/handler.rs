@@ -16,7 +16,9 @@ use crate::common::embeds::{
 };
 use crate::common::guildinfo::{channel_in_guild, fetch_member, GuildInfo};
 use crate::common::theme::{self, ModAction, Subject};
-use crate::common::permissions::{can_act_on, is_guild_admin, is_mod, is_owner, is_whitelisted, try_dm_embed};
+use crate::common::permissions::{
+    can_act_on, is_guild_admin, is_mod, is_owner, is_whitelisted, role_at_or_above, try_dm_embed, unsafe_grant_reason,
+};
 use crate::state::anti_ping::{ap, AntiPing};
 use crate::state::applications::{get_application, get_applications, update_application};
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
@@ -62,6 +64,17 @@ fn render_note(rendered: &Result<(), String>) -> String {
     match rendered {
         Ok(()) => String::new(),
         Err(e) => format!("\n\n⚠️ {e}"),
+    }
+}
+/// Card colour for a chain-of-command change: red if it wasn't saved, amber if
+/// it was but the board couldn't be updated, green otherwise.
+fn chain_color(saved: bool, rendered: &Result<(), String>) -> u32 {
+    if !saved {
+        colors::DANGER
+    } else if rendered.is_err() {
+        colors::WARN
+    } else {
+        colors::SUCCESS
     }
 }
 const NO_MUTE_ROLE: &str =
@@ -369,6 +382,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 .unwrap_or(false);
             if !mute_role_ok {
                 return reply_text(ctx, i, NO_MUTE_ROLE).await;
+            }
+            // mute_user refuses these too; saying so here gives the reason and
+            // doesn't spend one of the caller's mod actions.
+            let unsafe_mute = gc(&gid).mute_role_id.parse::<u64>().ok().and_then(|r| unsafe_grant_reason(&info, RoleId::new(r), false));
+            if let Some(why) = unsafe_mute {
+                return reply_text(ctx, i, &format!("I won't mute with the configured mute role: {why}. Point me at a plain mute role with `/setup roles mute_role:@Role`.")).await;
             }
             if !exempt {
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "mute");
@@ -707,13 +726,19 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             reply_embed(ctx, i, e, false).await;
         }
 
-        // ── /panic (owner only) - toggles: run again to lift ────
+        // ── /panic (admins) - toggles: run again to lift ────────
         "panic" => {
             if !manager {
                 return reply_text(ctx, i, MANAGER_ONLY).await;
             }
             defer(ctx, i).await;
             if is_lockdown(&gid) {
+                // Anti-raid's own lockdown also keeps new accounts out. It ends
+                // on its timer or through /antiraid, both owner territory, so an
+                // admin can lift a panic but not that.
+                if !privileged && lockdown_reason(&gid).as_deref() != Some("panic") {
+                    return edit_text(ctx, i, "Only the bot owner or the server owner can lift anti-raid's lockdown early - this isn't a panic one. It lifts itself when its timer runs out.").await;
+                }
                 let unlocked = unlock_all_text_channels(ctx, guild_id).await;
                 clear_lockdown(&gid);
                 alert_owner(
@@ -1164,7 +1189,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     defer(ctx, i).await;
                     let mod_role = opts.role("mod_role");
                     let r = quick_setup_guild(ctx, guild_id, mod_role).await;
-                    let mut e = build_setup_embed(guild_id, &info.name, &[]);
+                    let mut e = build_setup_embed(guild_id, &info.name, &[], privileged);
                     e = e.color(theme::palette::SKY).description(format!(
                         "⚡ **Quick setup finished.**\n{}{}\nNext: `/setup logs` for a channel per log type.",
                         if r.created.is_empty() { String::new() } else { format!("🆕 **Created:** {}\n", r.created.join(", ")) },
@@ -1177,10 +1202,21 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     let r = setup_log_channels(ctx, guild_id, opts.role("mod_role")).await;
                     edit_embed(ctx, i, build_log_setup_embed(guild_id, &r)).await;
                 }
-                "view" => reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &[]), true).await,
+                "view" => reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &[], privileged), true).await,
                 "roles" => {
                     if [opts.role("mod_role"), opts.role("mute_role")].into_iter().flatten().any(|r| !role_here(&info, r)) {
                         return reply_text(ctx, i, "That role isn't part of this server.").await;
+                    }
+                    if let Some(r) = opts.role("mute_role") {
+                        // The bot hands this role to everyone who gets muted, so it
+                        // must be one it is safe to give out, and, for an admin,
+                        // one they could give out themselves.
+                        if let Some(why) = unsafe_grant_reason(&info, r, false) {
+                            return reply_text(ctx, i, &format!("<@&{r}> can't be the mute role: {why}.")).await;
+                        }
+                        if !privileged && role_at_or_above(&info, &member, r) {
+                            return reply_text(ctx, i, &format!("Only the bot owner or the server owner can make <@&{r}> the mute role, since it isn't below your own highest role.")).await;
+                        }
                     }
                     let mut changes = Vec::new();
                     if let Some(r) = opts.role("mod_role") {
@@ -1194,7 +1230,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     if changes.is_empty() {
                         return reply_text(ctx, i, "Give me at least one role to set.").await;
                     }
-                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes), true).await;
+                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes, privileged), true).await;
                 }
                 "channels" => {
                     let picked = [opts.channel("log_channel"), opts.channel("alert_channel"), opts.channel("msg_log_channel")];
@@ -1217,7 +1253,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     if changes.is_empty() {
                         return reply_text(ctx, i, "Give me at least one channel to set.").await;
                     }
-                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes), true).await;
+                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes, privileged), true).await;
                 }
                 "whitelist" => {
                     let action = opts.str("action").unwrap_or("add");
@@ -1256,7 +1292,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         });
                         changes.push(format!("Whitelist {}role <@&{r}>", if action == "add" { "+" } else { "−" }));
                     }
-                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes), true).await;
+                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes, privileged), true).await;
                 }
                 "failsafe" => {
                     let action = opts.str("action").unwrap_or("add");
@@ -1276,7 +1312,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     });
                     let changes =
                         vec![format!("Failsafe {}role <@&{r}>", if action == "add" { "+" } else { "−" })];
-                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes), true).await;
+                    reply_embed(ctx, i, build_setup_embed(guild_id, &info.name, &changes, privileged), true).await;
                 }
                 _ => {}
             }
@@ -1976,6 +2012,17 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 }
                 "addrole" => {
                     let Some(r) = opts.role("role") else { return };
+                    // Accepting an application has the bot grant this role, so an
+                    // admin can't use it to hand out a role above their own, or
+                    // one anti-nuke trusts.
+                    if !privileged {
+                        if let Some(why) = unsafe_grant_reason(&info, r, true) {
+                            return reply_text(ctx, i, &format!("Only the bot owner or the server owner can have <@&{r}> granted on acceptance: {why}.")).await;
+                        }
+                        if role_at_or_above(&info, &member, r) {
+                            return reply_text(ctx, i, &format!("Only the bot owner or the server owner can have <@&{r}> granted on acceptance, since it isn't below your own highest role.")).await;
+                        }
+                    }
                     let id = r.to_string();
                     update_application(&gid, &key, |a| {
                         if !a.accepted_role_ids.contains(&id) {
@@ -2066,9 +2113,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     if role_ids.is_empty() {
                         return reply_text(ctx, i, "Give at least one role, mentioned or by ID.").await;
                     }
+                    // Rendering reads the whole member list and can wait its turn
+                    // behind another render, well past Discord's 3s reply window.
+                    defer(ctx, i).await;
                     let saved = update_chain(&gid, &key, |b| b.groups = vec![ChainGroup { label: None, role_ids: role_ids.clone() }]);
                     let rendered = render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` now tracks **{}** role(s), top rank first:\n{}{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved), render_note(&rendered)), Some("Chain of Command")), true).await;
+                    edit_embed(ctx, i, embed(chain_color(saved, &rendered), format!("Board `{key}` now tracks **{}** role(s), top rank first:\n{}{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved), render_note(&rendered)), Some("Chain of Command"))).await;
                 }
                 "setgroup" => {
                     let label = opts.str("label").unwrap_or("").trim().to_string();
@@ -2083,6 +2133,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     if role_ids.is_empty() {
                         return reply_text(ctx, i, "Give at least one role, mentioned or by ID.").await;
                     }
+                    defer(ctx, i).await;
                     let saved = update_chain(&gid, &key, |b| {
                         let existing = b.groups.iter().position(|g| g.label.as_deref().map(|l| l.eq_ignore_ascii_case(&label)).unwrap_or(false));
                         let group = ChainGroup { label: Some(label.clone()), role_ids: role_ids.clone() };
@@ -2092,19 +2143,20 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         }
                     });
                     let rendered = render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` group **{label}** now tracks **{}** role(s):\n{}{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved), render_note(&rendered)), Some("Chain of Command")), true).await;
+                    edit_embed(ctx, i, embed(chain_color(saved, &rendered), format!("Board `{key}` group **{label}** now tracks **{}** role(s):\n{}{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved), render_note(&rendered)), Some("Chain of Command"))).await;
                 }
                 "removegroup" => {
                     let label = opts.str("label").unwrap_or("").trim().to_string();
-                    let before = get_chain(&gid, &key).groups.len();
-                    let saved = update_chain(&gid, &key, |b| {
-                        b.groups.retain(|g| !g.label.as_deref().map(|l| l.eq_ignore_ascii_case(&label)).unwrap_or(false))
-                    });
-                    if get_chain(&gid, &key).groups.len() == before {
+                    let is_it = |g: &ChainGroup| g.label.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&label));
+                    // Checked before touching anything, so asking about a board
+                    // that doesn't exist doesn't leave an empty one behind.
+                    if !get_chain(&gid, &key).groups.iter().any(is_it) {
                         return reply_text(ctx, i, &format!("Board `{key}` has no group called **{label}**.")).await;
                     }
+                    defer(ctx, i).await;
+                    let saved = update_chain(&gid, &key, |b| b.groups.retain(|g| !is_it(g)));
                     let rendered = render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Removed group **{label}** from board `{key}`.{}{}", save_note(saved), render_note(&rendered)), Some("Chain of Command")), true).await;
+                    edit_embed(ctx, i, embed(chain_color(saved, &rendered), format!("Removed group **{label}** from board `{key}`.{}{}", save_note(saved), render_note(&rendered)), Some("Chain of Command"))).await;
                 }
                 "setup" => {
                     let cfg = get_chain(&gid, &key);
@@ -2115,16 +2167,23 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     // setup to retitle or re-post it used to drag it into
                     // whichever channel the command was typed in, leaving the
                     // real board behind, frozen.
-                    let current = cfg.channel_id.parse::<u64>().ok().map(ChannelId::new);
+                    // A stored channel that's been deleted doesn't count, so setup
+                    // can still re-post from where it's typed.
+                    let current = crate::common::guildinfo::guild_channel(ctx, guild_id, &cfg.channel_id);
                     let channel = opts.channel("channel").or(current).unwrap_or(i.channel_id);
                     let title = opts.str("title").map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
                     defer(ctx, i).await;
-                    // The board being replaced, when this moves it to another channel.
-                    let moved_from = current
-                        .filter(|c| *c != channel)
-                        .zip(cfg.message_id.parse::<u64>().ok().map(MessageId::new));
+                    // The board being replaced, read inside the update itself so
+                    // a render that re-posted it a moment ago is the one taken down.
+                    let mut moved_from: Option<(ChannelId, MessageId)> = None;
                     let saved = update_chain(&gid, &key, |b| {
                         if channel.to_string() != b.channel_id {
+                            moved_from = b
+                                .channel_id
+                                .parse::<u64>()
+                                .ok()
+                                .map(ChannelId::new)
+                                .zip(b.message_id.parse::<u64>().ok().map(MessageId::new));
                             b.channel_id = channel.to_string();
                             b.message_id.clear();
                         }
@@ -2133,16 +2192,17 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         }
                     });
                     let rendered = render_chain_of_command(ctx, guild_id, &key).await;
-                    // Once the new board is up, take the old one down, or it sits
-                    // there stale while its footer claims it updates itself.
-                    if rendered.is_ok() {
-                        if let Some((old_channel, old_message)) = moved_from {
-                            let _ = old_channel.delete_message(&ctx.http, old_message).await;
-                        }
+                    // Once moved, the old message is tracked by nothing and can
+                    // never be updated again, so it goes whether or not the new
+                    // one posted. Left up, it would sit there stale while its
+                    // footer claims it updates itself.
+                    if let Some((old_channel, old_message)) = moved_from {
+                        let _ = old_channel.delete_message(&ctx.http, old_message).await;
                     }
+                    let verb = if moved_from.is_some() { "moved to" } else { "set to" };
                     match rendered {
                         Ok(()) => edit_text(ctx, i, format!("Done - board `{key}` is up in <#{channel}>, and will keep itself updated as roles change.{}", save_note(saved))).await,
-                        Err(e) => edit_text(ctx, i, format!("⚠️ Board `{key}` is set to <#{channel}>, but {e}{}", save_note(saved))).await,
+                        Err(e) => edit_text(ctx, i, format!("⚠️ Board `{key}` is {verb} <#{channel}>, but: {e}{}", save_note(saved))).await,
                     }
                 }
                 "refresh" => {

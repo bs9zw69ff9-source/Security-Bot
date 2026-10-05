@@ -18,7 +18,11 @@ fn or_not_set(value: &str, prefix: &str) -> String {
     }
 }
 
-pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]) -> CreateEmbed {
+/// `show_protection` is false for a server admin who isn't an owner: the
+/// anti-nuke whitelist and failsafe roles are owner-only, like `/config`, and
+/// listing them would tell a rogue admin exactly which accounts and roles to
+/// go after.
+pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String], show_protection: bool) -> CreateEmbed {
     let g = gc(&guild_id.to_string());
     let description = if changes.is_empty() {
         "🚀 `/setup quick` does the basics in one step, then `/setup logs` adds a 🗃️│ channel per log type.\nFine-tune with `/setup roles` · `channels` · `whitelist` · `failsafe`.".to_string()
@@ -46,7 +50,7 @@ pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]
     ];
     let done = progress.iter().filter(|x| **x).count();
 
-    CreateEmbed::new()
+    let e = CreateEmbed::new()
         .color(if changes.is_empty() { theme::palette::SAPPHIRE } else { theme::palette::SKY })
         .author(CreateEmbedAuthor::new(format!("⚙️ SETUP • {}", guild_name.to_uppercase())))
         .title(format!(
@@ -89,20 +93,23 @@ pub fn build_setup_embed(guild_id: GuildId, guild_name: &str, changes: &[String]
                 if logs == 0 { "\nRun `/setup logs`" } else { "" }
             ),
             true,
-        )
-        .field("🏅 Whitelisted Users", list(&g.nuke_whitelist_user_ids, "<@"), true)
-        .field("🏅 Whitelisted Roles", list(&g.nuke_whitelist_role_ids, "<@&"), true)
-        .field(
-            "🧨 Failsafe Roles",
-            if g.failsafe_role_ids.is_empty() {
-                "None - `/setup failsafe`".to_string()
-            } else {
-                list(&g.failsafe_role_ids, "<@&")
-            },
-            true,
-        )
-        .footer(theme::footer("Setup • spam, raid and nuke thresholds come from .env"))
-        .timestamp(Timestamp::now())
+        );
+    let e = if show_protection {
+        e.field("🏅 Whitelisted Users", list(&g.nuke_whitelist_user_ids, "<@"), true)
+            .field("🏅 Whitelisted Roles", list(&g.nuke_whitelist_role_ids, "<@&"), true)
+            .field(
+                "🧨 Failsafe Roles",
+                if g.failsafe_role_ids.is_empty() {
+                    "None - `/setup failsafe`".to_string()
+                } else {
+                    list(&g.failsafe_role_ids, "<@&")
+                },
+                true,
+            )
+    } else {
+        e.field("🏅 Anti-nuke whitelist & failsafe", "🔒 Only the bot owner or the server owner can see these", false)
+    };
+    e.footer(theme::footer("Setup • spam, raid and nuke thresholds come from .env")).timestamp(Timestamp::now())
 }
 
 pub struct QuickSetupResult {

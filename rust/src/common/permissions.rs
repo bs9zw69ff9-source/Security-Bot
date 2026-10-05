@@ -5,7 +5,7 @@ use serenity::http::Http;
 use serenity::model::guild::Member;
 use serenity::model::id::{RoleId, UserId};
 
-use super::config::BOT_OWNER_IDS;
+use super::config::{BOT_OWNER_IDS, DANGER_PERMS_MASK};
 use super::guildinfo::GuildInfo;
 use crate::state::guild_settings::gc;
 
@@ -44,6 +44,35 @@ pub fn is_guild_admin(member: &Member, info: &GuildInfo) -> bool {
     std::iter::once(&everyone)
         .chain(member.roles.iter())
         .any(|r| info.roles.get(r).is_some_and(|role| role.permissions.administrator()))
+}
+
+/// Why the bot shouldn't hand `role` out, if it shouldn't.
+///
+/// The bot outranks most roles, so whatever it assigns gets around Discord's
+/// rule that you can only give out roles below your own. A role anti-nuke
+/// trusts (whitelisted, or a failsafe target) would make whoever got it immune
+/// to anti-nuke; one with a dangerous permission would make them powerful.
+/// `allow_dangerous` is for roles that are meant to carry power, such as the
+/// staff role an accepted application grants.
+pub fn unsafe_grant_reason(info: &GuildInfo, role: RoleId, allow_dangerous: bool) -> Option<&'static str> {
+    let g = gc(&info.id.to_string());
+    let id = role.to_string();
+    if g.nuke_whitelist_role_ids.contains(&id) {
+        return Some("it's on the anti-nuke whitelist");
+    }
+    if g.failsafe_role_ids.contains(&id) {
+        return Some("it's one of the failsafe roles");
+    }
+    if !allow_dangerous && info.roles.get(&role).is_some_and(|r| r.permissions.intersects(*DANGER_PERMS_MASK)) {
+        return Some("it carries a dangerous permission (Administrator, Manage Server, Roles, Channels or Webhooks, Ban or Kick)");
+    }
+    None
+}
+
+/// Whether `role` sits at or above `member`'s highest role, i.e. one they
+/// couldn't hand out themselves.
+pub fn role_at_or_above(info: &GuildInfo, member: &Member, role: RoleId) -> bool {
+    info.roles.get(&role).is_some_and(|r| r.position >= info.member_highest(member))
 }
 
 pub fn is_whitelisted(member: &Member, guild_owner_id: UserId) -> bool {
@@ -167,6 +196,33 @@ mod tests {
 
         let everyone_admin = guild_with(&[(880_002, admin_role())]);
         assert!(is_guild_admin(&member(everyone_admin.id, 503, &[]), &everyone_admin));
+    }
+
+    /// The bot must not be made to hand out a role anti-nuke trusts, or one
+    /// with real power, on someone else's say-so.
+    #[test]
+    fn trusted_and_powerful_roles_are_unsafe_to_grant() {
+        let info = GuildInfo { id: GuildId::new(880_003), ..guild_with(&[(10, role(1)), (20, admin_role()), (30, role(2)), (40, role(2))]) };
+        let gid = info.id.to_string();
+        crate::state::guild_settings::update(&gid, |s| {
+            s.nuke_whitelist_role_ids.push("30".into());
+            s.failsafe_role_ids.push("40".into());
+        });
+
+        assert_eq!(unsafe_grant_reason(&info, RoleId::new(10), false), None, "a plain role is fine");
+        assert!(unsafe_grant_reason(&info, RoleId::new(20), false).is_some(), "Administrator is dangerous");
+        assert_eq!(unsafe_grant_reason(&info, RoleId::new(20), true), None, "unless power is the point");
+        assert!(unsafe_grant_reason(&info, RoleId::new(30), true).is_some(), "whitelisted, whatever its permissions");
+        assert!(unsafe_grant_reason(&info, RoleId::new(40), true).is_some(), "a failsafe target, likewise");
+    }
+
+    #[test]
+    fn a_role_at_or_above_your_own_is_out_of_reach() {
+        let info = guild_with(&[(10, role(1)), (20, role(3)), (30, role(5))]);
+        let caller = member(info.id, 600, &[20]);
+        assert!(!role_at_or_above(&info, &caller, RoleId::new(10)));
+        assert!(role_at_or_above(&info, &caller, RoleId::new(20)), "your own top role");
+        assert!(role_at_or_above(&info, &caller, RoleId::new(30)));
     }
 
     #[test]
