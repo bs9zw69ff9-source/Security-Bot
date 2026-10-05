@@ -117,7 +117,9 @@ pub fn can_act_on(info: &GuildInfo, actor: &Member, target: &Member) -> Result<(
     // role ladder). What's left below is Discord's limit, not the bot's.
     let actor_is_bot_owner = is_owner(actor.user.id);
     if !actor_is_bot_owner && is_whitelisted(target, info.owner_id) {
-        return Err("That user's whitelisted, so they're protected.".into());
+        // Deliberately not "whitelisted": that would tell anyone made staff
+        // exactly who anti-nuke trusts.
+        return Err("That user is protected, so they're off-limits.".into());
     }
     if target.user.id == actor.user.id {
         return Err("You can't do that to yourself.".into());

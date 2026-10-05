@@ -124,7 +124,7 @@ pub fn all() -> Vec<CreateCommand> {
             )
             .add_option(opt(CommandOptionType::Channel, "channel", "Channel to lock/unlock (defaults to current)")),
 
-        CreateCommand::new("panic").description("EMERGENCY: lock every text channel at once (owner only)"),
+        CreateCommand::new("panic").description("EMERGENCY: lock every text channel at once (admins)"),
 
         CreateCommand::new("warn")
             .description("Issue a warning to a member")

@@ -120,13 +120,20 @@ pub struct QuickSetupResult {
 /// `/setup quick` - auto-provision a working Muted role + Guardian log
 /// category/channels for THIS guild only. Reuses an existing role/channel
 /// matched by name instead of duplicating it if run more than once.
-pub async fn quick_setup_guild(ctx: &Context, guild_id: GuildId, mod_role: Option<RoleId>) -> QuickSetupResult {
+/// `adoptable` decides whether an existing role named "Muted" may be reused as
+/// the mute role; when it may not, a fresh one is made instead.
+pub async fn quick_setup_guild(
+    ctx: &Context,
+    guild_id: GuildId,
+    mod_role: Option<RoleId>,
+    adoptable: impl Fn(RoleId) -> bool,
+) -> QuickSetupResult {
     let mut created = Vec::new();
     let mut reused = Vec::new();
 
     // 1) Muted role: reuse by name if present, else create with no base perms.
     let existing_mute = ctx.cache.guild(guild_id).and_then(|g| {
-        g.roles.iter().find(|(_, r)| !r.managed && r.name.to_lowercase() == "muted").map(|(id, _)| *id)
+        g.roles.iter().find(|(id, r)| !r.managed && r.name.to_lowercase() == "muted" && adoptable(**id)).map(|(id, _)| *id)
     });
     let mute_role = match existing_mute {
         Some(id) => {

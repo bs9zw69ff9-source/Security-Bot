@@ -48,6 +48,11 @@ pub struct LockdownState {
     /// "nothing".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed: Vec<LockedChannel>,
+    /// Started by a bot owner or the server owner, so only one of them may
+    /// lift it early. A server admin can lift a panic another admin started,
+    /// but not one an owner started to contain them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_locked: bool,
 }
 
 static STATE: Lazy<Mutex<HashMap<String, LockdownState>>> = Lazy::new(|| Mutex::new(db::load_all("lockdown_state")));
@@ -69,6 +74,11 @@ pub fn lockdown_reason(guild_id: &str) -> Option<String> {
     lock().get(guild_id).map(|s| s.reason.clone())
 }
 
+/// Whether the active lockdown was started by an owner.
+pub fn is_owner_locked(guild_id: &str) -> bool {
+    lock().get(guild_id).is_some_and(|s| s.owner_locked)
+}
+
 pub fn locked_count() -> usize {
     lock().len()
 }
@@ -82,11 +92,16 @@ pub fn get(guild_id: &str) -> Option<LockdownState> {
 /// `locked_at`. The check and the set happen under one lock, so two raid
 /// triggers arriving together can't both start a lockdown pass.
 pub fn try_set_lockdown(guild_id: &str, reason: &str, expires_at: Option<i64>) -> Option<i64> {
+    try_set_lockdown_by(guild_id, reason, expires_at, false)
+}
+
+/// [`try_set_lockdown`], recording whether an owner started it.
+pub fn try_set_lockdown_by(guild_id: &str, reason: &str, expires_at: Option<i64>, owner_locked: bool) -> Option<i64> {
     let mut map = lock();
     if map.contains_key(guild_id) {
         return None;
     }
-    let state = LockdownState { reason: reason.to_string(), locked_at: now_ms(), expires_at, changed: Vec::new() };
+    let state = LockdownState { reason: reason.to_string(), locked_at: now_ms(), expires_at, changed: Vec::new(), owner_locked };
     let locked_at = state.locked_at;
     map.insert(guild_id.to_string(), state.clone());
     drop(map);
@@ -131,6 +146,28 @@ pub fn clear_lockdown(guild_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An owner's panic is marked as theirs, so an admin can't lift it, while
+    /// one an admin started (or anti-raid's) isn't.
+    #[test]
+    fn an_owner_started_lockdown_is_marked_as_theirs() {
+        try_set_lockdown_by("test-ld-owner", "panic", None, true).unwrap();
+        assert!(is_owner_locked("test-ld-owner"));
+        clear_lockdown("test-ld-owner");
+
+        try_set_lockdown_by("test-ld-admin", "panic", None, false).unwrap();
+        assert!(!is_owner_locked("test-ld-admin"));
+        clear_lockdown("test-ld-admin");
+        assert!(!is_owner_locked("test-ld-admin"), "no lockdown, nothing to protect");
+    }
+
+    /// Lockdowns saved before the owner flag existed still load, as not owner's.
+    #[test]
+    fn a_lockdown_saved_without_the_owner_flag_still_loads() {
+        let old: LockdownState = serde_json::from_str(r#"{"reason":"panic","lockedAt":1,"expiresAt":null}"#).unwrap();
+        assert!(!old.owner_locked);
+        assert!(!serde_json::to_string(&old).unwrap().contains("ownerLocked"), "and isn't written out when false");
+    }
 
     #[test]
     fn only_the_first_claim_starts_a_lockdown() {

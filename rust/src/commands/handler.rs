@@ -24,7 +24,9 @@ use crate::state::applications::{get_application, get_applications, update_appli
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
 use crate::state::guild_settings::{self, gc, update as update_guild};
 use crate::state::tunables::{Module, Tunable};
-use crate::state::lockdown::{clear_lockdown, is_lockdown, locked_count, lockdown_reason, record_changes, try_set_lockdown};
+use crate::state::lockdown::{
+    clear_lockdown, is_lockdown, is_owner_locked, locked_count, lockdown_reason, record_changes, try_set_lockdown_by,
+};
 use crate::state::mod_rates::{check_mod_limit, record_mod_action};
 use crate::state::muted_roles::stashed_count;
 use crate::state::tickets::{get_ticket_config, update_ticket_config, TicketType};
@@ -429,6 +431,20 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             if gc(&gid).mute_role_id.is_empty() {
                 return reply_text(ctx, i, NO_MUTE_ROLE).await;
             }
+            // Unmuting hands back every role the mute took. For a non-owner that
+            // must not include a role above their own, or one anti-nuke trusts:
+            // otherwise anyone made staff could undo an owner containing a rogue
+            // admin, and give them their Administrator role back.
+            if !privileged {
+                let stash = crate::state::muted_roles::get(&gid, &target_id.to_string()).map(|s| s.roles).unwrap_or_default();
+                let out_of_reach = stash
+                    .iter()
+                    .filter_map(|r| r.parse::<u64>().ok().map(RoleId::new))
+                    .any(|r| role_at_or_above(&info, &member, r) || unsafe_grant_reason(&info, r, true).is_some());
+                if out_of_reach {
+                    return reply_text(ctx, i, &format!("Only the bot owner or the server owner can unmute <@{target_id}>: unmuting would give back roles that are out of your reach.")).await;
+                }
+            }
             let stashed = stashed_count(&gid, &target_id.to_string());
             unmute_user(ctx, guild_id, target_id, &format!("Manual unmute by {}", i.user.tag())).await;
             reply_embed(
@@ -733,11 +749,17 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
             defer(ctx, i).await;
             if is_lockdown(&gid) {
-                // Anti-raid's own lockdown also keeps new accounts out. It ends
-                // on its timer or through /antiraid, both owner territory, so an
-                // admin can lift a panic but not that.
-                if !privileged && lockdown_reason(&gid).as_deref() != Some("panic") {
-                    return edit_text(ctx, i, "Only the bot owner or the server owner can lift anti-raid's lockdown early - this isn't a panic one. It lifts itself when its timer runs out.").await;
+                // An admin may lift a panic another admin started. Not anti-raid's
+                // own lockdown, which also keeps new accounts out and ends on its
+                // timer or through /antiraid (owner territory), and not a panic an
+                // owner started, which may be there to contain that very admin.
+                if !privileged {
+                    if lockdown_reason(&gid).as_deref() != Some("panic") {
+                        return edit_text(ctx, i, "Only the bot owner or the server owner can lift anti-raid's lockdown early - this isn't a panic one. It lifts itself when its timer runs out.").await;
+                    }
+                    if is_owner_locked(&gid) {
+                        return edit_text(ctx, i, "Only the bot owner or the server owner can lift this panic, since one of them started it.").await;
+                    }
                 }
                 let unlocked = unlock_all_text_channels(ctx, guild_id).await;
                 clear_lockdown(&gid);
@@ -756,7 +778,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 )
                 .await;
             }
-            if try_set_lockdown(&gid, "panic", None).is_none() {
+            if try_set_lockdown_by(&gid, "panic", None, privileged).is_none() {
                 return edit_text(ctx, i, "A lockdown started at the same moment. Run `/panic` again to lift it.").await;
             }
             let outcome = lock_all_text_channels(ctx, guild_id).await;
@@ -1188,7 +1210,11 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 "quick" => {
                     defer(ctx, i).await;
                     let mod_role = opts.role("mod_role");
-                    let r = quick_setup_guild(ctx, guild_id, mod_role).await;
+                    // Quick setup adopts any role already called "Muted". Only one
+                    // that's safe to hand out and, for an admin, below their own
+                    // top role; otherwise it makes a fresh one.
+                    let adoptable = |r: RoleId| unsafe_grant_reason(&info, r, false).is_none() && (privileged || !role_at_or_above(&info, &member, r));
+                    let r = quick_setup_guild(ctx, guild_id, mod_role, adoptable).await;
                     let mut e = build_setup_embed(guild_id, &info.name, &[], privileged);
                     e = e.color(theme::palette::SKY).description(format!(
                         "⚡ **Quick setup finished.**\n{}{}\nNext: `/setup logs` for a channel per log type.",
@@ -1211,11 +1237,15 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         // The bot hands this role to everyone who gets muted, so it
                         // must be one it is safe to give out, and, for an admin,
                         // one they could give out themselves.
-                        if let Some(why) = unsafe_grant_reason(&info, r, false) {
-                            return reply_text(ctx, i, &format!("<@&{r}> can't be the mute role: {why}.")).await;
+                        // A non-owner just hears no: saying why would tell them
+                        // which roles are whitelisted or failsafe, which the
+                        // setup card hides from them.
+                        let unsafe_role = unsafe_grant_reason(&info, r, false);
+                        if !privileged && (unsafe_role.is_some() || role_at_or_above(&info, &member, r)) {
+                            return reply_text(ctx, i, &format!("Only the bot owner or the server owner can make <@&{r}> the mute role.")).await;
                         }
-                        if !privileged && role_at_or_above(&info, &member, r) {
-                            return reply_text(ctx, i, &format!("Only the bot owner or the server owner can make <@&{r}> the mute role, since it isn't below your own highest role.")).await;
+                        if let Some(why) = unsafe_role {
+                            return reply_text(ctx, i, &format!("<@&{r}> can't be the mute role: {why}.")).await;
                         }
                     }
                     let mut changes = Vec::new();
@@ -2015,13 +2045,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     // Accepting an application has the bot grant this role, so an
                     // admin can't use it to hand out a role above their own, or
                     // one anti-nuke trusts.
-                    if !privileged {
-                        if let Some(why) = unsafe_grant_reason(&info, r, true) {
-                            return reply_text(ctx, i, &format!("Only the bot owner or the server owner can have <@&{r}> granted on acceptance: {why}.")).await;
-                        }
-                        if role_at_or_above(&info, &member, r) {
-                            return reply_text(ctx, i, &format!("Only the bot owner or the server owner can have <@&{r}> granted on acceptance, since it isn't below your own highest role.")).await;
-                        }
+                    if !privileged && (unsafe_grant_reason(&info, r, true).is_some() || role_at_or_above(&info, &member, r)) {
+                        return reply_text(ctx, i, &format!("Only the bot owner or the server owner can have <@&{r}> granted on acceptance.")).await;
                     }
                     let id = r.to_string();
                     update_application(&gid, &key, |a| {
