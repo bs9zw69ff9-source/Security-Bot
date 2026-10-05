@@ -361,10 +361,10 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
         name: "Protection",
         color: palette::NAVY,
         commands: &[
-            ("/panic", "Lock **every** text channel at once *(owner)*"),
+            ("/panic", "Lock **every** text channel at once *(admin)*"),
             ("/antiraid `status|enable|disable`", "Raid protection for this server *(owner)*"),
-            ("/antiping", "Stop pings to protected staff & VIPs *(owner)*"),
-            ("/nuketest", "Check anti-nuke and my permissions *(owner)*"),
+            ("/antiping", "Stop pings to protected staff & VIPs *(admin)*"),
+            ("/nuketest", "Check anti-nuke and my permissions *(admin)*"),
         ],
     },
     HelpSection {
@@ -375,7 +375,8 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
             ("/setup quick", "Mute role + log channels in one step"),
             ("/setup logs", "A 🗃️│ channel for every log type"),
             ("/setup view", "Everything that's configured here"),
-            ("/setup roles · channels · whitelist · failsafe", "Set individual pieces"),
+            ("/setup roles · channels", "Set individual pieces"),
+            ("/setup whitelist · failsafe", "Anti-nuke whitelist & `!failsafe` roles *(owner)*"),
             ("/config", "This server's thresholds & module switches *(owner)*"),
         ],
     },
@@ -385,7 +386,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
         color: palette::CYAN,
         commands: &[
             ("/police manual setup", "Post the officer guide & procedures manual"),
-            ("/chainofcommand setup · setroles · setgroup", "Auto-updating chain-of-command board *(owner)*"),
+            ("/chainofcommand setup · setroles · setgroup", "Auto-updating chain-of-command board *(admin)*"),
         ],
     },
     HelpSection {
@@ -395,8 +396,8 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
         commands: &[
             ("/userinfo `id`", "Look up any user by ID or mention"),
             ("/limits", "Your mod actions left in the current window"),
-            ("/status", "Uptime, ping, memory, guilds *(owner)*"),
-            ("/servers", "DM me an invite to every server *(owner)*"),
+            ("/status", "Uptime, ping, memory, guilds *(admin)*"),
+            ("/servers", "DM me an invite to every server *(bot owner)*"),
             ("/help", "This menu"),
         ],
     },

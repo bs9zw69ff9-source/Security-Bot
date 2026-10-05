@@ -6,7 +6,7 @@ use serenity::builder::{
 };
 use serenity::client::Context;
 use serenity::model::application::{CommandInteraction, ResolvedOption, ResolvedValue};
-use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use serenity::model::{Permissions, Timestamp};
 
 use crate::common::config::{now_ms, BOT_OWNER_IDS};
@@ -16,7 +16,7 @@ use crate::common::embeds::{
 };
 use crate::common::guildinfo::{channel_in_guild, fetch_member, GuildInfo};
 use crate::common::theme::{self, ModAction, Subject};
-use crate::common::permissions::{can_act_on, is_mod, is_owner, is_whitelisted, try_dm_embed};
+use crate::common::permissions::{can_act_on, is_guild_admin, is_mod, is_owner, is_whitelisted, try_dm_embed};
 use crate::state::anti_ping::{ap, AntiPing};
 use crate::state::applications::{get_application, get_applications, update_application};
 use crate::state::chain_of_command::{get_chain, get_chain_keys, update_chain, ChainGroup};
@@ -40,6 +40,8 @@ use crate::systems::tickets::{post_or_edit_panel, refresh_ticket_panel, types_by
 
 const STAFF_ONLY: &str = "This one is staff only - you need the mod role.";
 const OWNER_ONLY: &str = "This one's owner only.";
+/// For commands any server admin can run; see `manager` in `handle`.
+const MANAGER_ONLY: &str = "Only the bot owner, the server owner or a server admin can use this one.";
 
 /// Appended when a configuration change was applied in memory but never
 /// reached the database. Without it the reply says "saved" and the setting is
@@ -52,6 +54,14 @@ fn save_note(saved: bool) -> &'static str {
         ""
     } else {
         NOT_SAVED
+    }
+}
+/// A chain-of-command board that couldn't be rendered, as a line to append to
+/// a reply. The settings themselves are saved either way.
+fn render_note(rendered: &Result<(), String>) -> String {
+    match rendered {
+        Ok(()) => String::new(),
+        Err(e) => format!("\n\n⚠️ {e}"),
     }
 }
 const NO_MUTE_ROLE: &str =
@@ -329,6 +339,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
     let staff = is_mod(&member, info.owner_id);
     let exempt = is_whitelisted(&member, info.owner_id);
     let privileged = is_privileged(i.user.id, info.owner_id);
+    // Server management: anyone `privileged`, plus whoever holds Administrator
+    // in this server. The anti-nuke controls (/config, /antiraid, /setup
+    // whitelist and failsafe) stay on `privileged` alone, because they are what
+    // stops a rogue or compromised admin, and an admin who could edit them could
+    // simply switch the protection off first.
+    let manager = privileged || is_guild_admin(&member, &info);
 
     match i.data.name.as_str() {
         // ── /mute ──────────────────────────────────────────────
@@ -693,8 +709,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /panic (owner only) - toggles: run again to lift ────
         "panic" => {
-            if !privileged {
-                return reply_text(ctx, i, OWNER_ONLY).await;
+            if !manager {
+                return reply_text(ctx, i, MANAGER_ONLY).await;
             }
             defer(ctx, i).await;
             if is_lockdown(&gid) {
@@ -962,8 +978,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /antiping ──────────────────────────────────────────
         "antiping" => {
-            if !privileged {
-                return reply_text(ctx, i, "Only the bot owner or the server owner can change these settings.").await;
+            if !manager {
+                return reply_text(ctx, i, "Only the bot owner, the server owner or a server admin can change these settings.").await;
             }
             let a = ap(&gid);
             match subcmd.as_deref().unwrap_or("") {
@@ -1137,8 +1153,11 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /setup ─────────────────────────────────────────────
         "setup" => {
-            if !privileged {
-                return reply_text(ctx, i, "Only the bot owner or the server owner can change these settings.").await;
+            if !manager {
+                return reply_text(ctx, i, "Only the bot owner, the server owner or a server admin can change these settings.").await;
+            }
+            if matches!(subcmd.as_deref(), Some("whitelist" | "failsafe")) && !privileged {
+                return reply_text(ctx, i, "Only the bot owner or the server owner can change the anti-nuke whitelist and failsafe roles, since they're what stops a rogue admin.").await;
             }
             match subcmd.as_deref().unwrap_or("") {
                 "quick" => {
@@ -1401,8 +1420,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /nuketest ──────────────────────────────────────────
         "nuketest" => {
-            if !privileged {
-                return reply_text(ctx, i, OWNER_ONLY).await;
+            if !manager {
+                return reply_text(ctx, i, MANAGER_ONLY).await;
             }
             let me = ctx.cache.current_user().id;
             let my_perms = ctx
@@ -1440,8 +1459,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /status ────────────────────────────────────────────
         "status" => {
-            if !privileged {
-                return reply_text(ctx, i, OWNER_ONLY).await;
+            if !manager {
+                return reply_text(ctx, i, MANAGER_ONLY).await;
             }
             reply_embed(ctx, i, system_status_embed(ctx).await, true).await;
         }
@@ -1577,8 +1596,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /tickets ───────────────────────────────────────────
         "tickets" => {
-            if !privileged {
-                return reply_text(ctx, i, "Only the bot owner or the server owner can set up tickets.").await;
+            if !manager {
+                return reply_text(ctx, i, "Only the bot owner, the server owner or a server admin can set up tickets.").await;
             }
             let cfg = get_ticket_config(&gid);
             match subcmd.as_deref().unwrap_or("") {
@@ -1790,8 +1809,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /applications ──────────────────────────────────────
         "applications" => {
-            if !privileged {
-                return reply_text(ctx, i, "Only the bot owner or the server owner can set up applications.").await;
+            if !manager {
+                return reply_text(ctx, i, "Only the bot owner, the server owner or a server admin can set up applications.").await;
             }
             let sub = subcmd.as_deref().unwrap_or("");
 
@@ -1992,8 +2011,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /police manual setup ────────────────────────────────
         "police" => {
-            if !privileged {
-                return reply_text(ctx, i, "Only the bot owner or the server owner can set up the police manual.").await;
+            if !manager {
+                return reply_text(ctx, i, "Only the bot owner, the server owner or a server admin can set up the police manual.").await;
             }
             if group.as_deref() == Some("manual") && subcmd.as_deref() == Some("setup") {
                 let channel = opts.channel("channel").unwrap_or(i.channel_id);
@@ -2010,8 +2029,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
 
         // ── /chainofcommand ─────────────────────────────────────
         "chainofcommand" => {
-            if !privileged {
-                return reply_text(ctx, i, "Only the bot owner or the server owner can set up the chain of command.").await;
+            if !manager {
+                return reply_text(ctx, i, "Only the bot owner, the server owner or a server admin can set up the chain of command.").await;
             }
             let sub = subcmd.as_deref().unwrap_or("");
 
@@ -2048,8 +2067,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         return reply_text(ctx, i, "Give at least one role, mentioned or by ID.").await;
                     }
                     let saved = update_chain(&gid, &key, |b| b.groups = vec![ChainGroup { label: None, role_ids: role_ids.clone() }]);
-                    render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` now tracks **{}** role(s), top rank first:\n{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved)), Some("Chain of Command")), true).await;
+                    let rendered = render_chain_of_command(ctx, guild_id, &key).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` now tracks **{}** role(s), top rank first:\n{}{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved), render_note(&rendered)), Some("Chain of Command")), true).await;
                 }
                 "setgroup" => {
                     let label = opts.str("label").unwrap_or("").trim().to_string();
@@ -2072,8 +2091,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             None => b.groups.push(group),
                         }
                     });
-                    render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` group **{label}** now tracks **{}** role(s):\n{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved)), Some("Chain of Command")), true).await;
+                    let rendered = render_chain_of_command(ctx, guild_id, &key).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Board `{key}` group **{label}** now tracks **{}** role(s):\n{}{}{}", role_ids.len(), numbered_roles(&role_ids), save_note(saved), render_note(&rendered)), Some("Chain of Command")), true).await;
                 }
                 "removegroup" => {
                     let label = opts.str("label").unwrap_or("").trim().to_string();
@@ -2084,17 +2103,26 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     if get_chain(&gid, &key).groups.len() == before {
                         return reply_text(ctx, i, &format!("Board `{key}` has no group called **{label}**.")).await;
                     }
-                    render_chain_of_command(ctx, guild_id, &key).await;
-                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Removed group **{label}** from board `{key}`.{}", save_note(saved)), Some("Chain of Command")), true).await;
+                    let rendered = render_chain_of_command(ctx, guild_id, &key).await;
+                    reply_embed(ctx, i, embed(if saved { colors::SUCCESS } else { colors::DANGER }, format!("Removed group **{label}** from board `{key}`.{}{}", save_note(saved), render_note(&rendered)), Some("Chain of Command")), true).await;
                 }
                 "setup" => {
                     let cfg = get_chain(&gid, &key);
                     if cfg.groups.is_empty() {
                         return reply_text(ctx, i, &format!("Board `{key}` has no roles configured yet - run `/chainofcommand setroles` or `setgroup` first.")).await;
                     }
-                    let channel = opts.channel("channel").unwrap_or(i.channel_id);
+                    // Without `channel:`, the board stays where it is. Re-running
+                    // setup to retitle or re-post it used to drag it into
+                    // whichever channel the command was typed in, leaving the
+                    // real board behind, frozen.
+                    let current = cfg.channel_id.parse::<u64>().ok().map(ChannelId::new);
+                    let channel = opts.channel("channel").or(current).unwrap_or(i.channel_id);
                     let title = opts.str("title").map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
                     defer(ctx, i).await;
+                    // The board being replaced, when this moves it to another channel.
+                    let moved_from = current
+                        .filter(|c| *c != channel)
+                        .zip(cfg.message_id.parse::<u64>().ok().map(MessageId::new));
                     let saved = update_chain(&gid, &key, |b| {
                         if channel.to_string() != b.channel_id {
                             b.channel_id = channel.to_string();
@@ -2104,8 +2132,18 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             b.title = t.clone();
                         }
                     });
-                    render_chain_of_command(ctx, guild_id, &key).await;
-                    edit_text(ctx, i, format!("Done - board `{key}` is up in <#{channel}>, and will keep itself updated as roles change.{}", save_note(saved))).await;
+                    let rendered = render_chain_of_command(ctx, guild_id, &key).await;
+                    // Once the new board is up, take the old one down, or it sits
+                    // there stale while its footer claims it updates itself.
+                    if rendered.is_ok() {
+                        if let Some((old_channel, old_message)) = moved_from {
+                            let _ = old_channel.delete_message(&ctx.http, old_message).await;
+                        }
+                    }
+                    match rendered {
+                        Ok(()) => edit_text(ctx, i, format!("Done - board `{key}` is up in <#{channel}>, and will keep itself updated as roles change.{}", save_note(saved))).await,
+                        Err(e) => edit_text(ctx, i, format!("⚠️ Board `{key}` is set to <#{channel}>, but {e}{}", save_note(saved))).await,
+                    }
                 }
                 "refresh" => {
                     let cfg = get_chain(&gid, &key);
@@ -2113,8 +2151,10 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         return reply_text(ctx, i, &format!("Board `{key}` isn't fully configured yet - run `setroles`/`setgroup` and `setup` first.")).await;
                     }
                     defer(ctx, i).await;
-                    render_chain_of_command(ctx, guild_id, &key).await;
-                    edit_text(ctx, i, "Refreshed.").await;
+                    match render_chain_of_command(ctx, guild_id, &key).await {
+                        Ok(()) => edit_text(ctx, i, "Refreshed.").await,
+                        Err(e) => edit_text(ctx, i, format!("⚠️ {e}")).await,
+                    }
                 }
                 "view" => {
                     let cfg = get_chain(&gid, &key);

@@ -269,6 +269,11 @@ impl EventHandler for Handler {
         }
         if claim_boot(guild.id) {
             boot_guild(&ctx, guild.id).await;
+        } else {
+            // Already booted in this process: a reconnect re-sends every
+            // guild. Roles may have changed while the connection was down, so
+            // bring its boards up to date (debounced, and a no-op without any).
+            systems::chain_of_command::schedule_chain_of_command_refresh(&ctx, guild.id);
         }
     }
 

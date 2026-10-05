@@ -91,11 +91,11 @@ pub fn get_chain(guild_id: &str, key: &str) -> Board {
 pub fn update_chain<F: FnOnce(&mut Board)>(guild_id: &str, key: &str, f: F) -> bool {
     let mut map = lock();
     let boards = map.entry(guild_id.to_string()).or_default();
-    let board = boards.entry(key.to_string()).or_default();
-    f(board);
-    let snapshot = boards.clone();
-    drop(map);
-    db::put("chain_of_command", guild_id, &snapshot)
+    f(boards.entry(key.to_string()).or_default());
+    // Written while the lock is still held. Released first, two updates could
+    // reach the database out of order, and a restart would load the older one:
+    // a lost setting, or a lost message id and a second copy of the board.
+    db::put("chain_of_command", guild_id, &*boards)
 }
 
 /// All role ids tracked by any board in a guild - used to decide whether a
@@ -116,12 +116,18 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+/// Whether a board has ever been set up under `key`, even if it's empty now.
+fn board_exists(guild_id: &str, key: &str) -> bool {
+    lock().get(guild_id).is_some_and(|b| b.contains_key(key))
+}
+
 /// One-time seed: the requested chain-of-command role hierarchy for the HOME
-/// guild (GUILD_ID) only, top rank first, as the "default" board. Never
-/// overwrites an existing configuration.
+/// guild (GUILD_ID) only, top rank first, as the "default" board. Runs only if
+/// that board has never existed, so one you've emptied stays that way across
+/// restarts instead of being seeded back.
 pub fn migrate_chain_of_command_to_home_guild() {
     let Some(home) = GUILD_ID.as_ref() else { return };
-    if !get_chain(home, "default").groups.is_empty() {
+    if board_exists(home, "default") {
         return;
     }
     update_chain(home, "default", |b| {
@@ -144,10 +150,12 @@ pub fn migrate_chain_of_command_to_home_guild() {
 }
 
 /// One-time seed: the police chain-of-command board for the HOME guild only -
-/// its own channel, and two labeled groups (Ranks, then Sub Classes).
+/// its own channel, and two labeled groups (Ranks, then Sub Classes). Like the
+/// default board, never re-applied to a board that already exists: re-seeding
+/// an emptied one used to reset its channel and post it back on every restart.
 pub fn migrate_police_chain_of_command_to_home_guild() {
     let Some(home) = GUILD_ID.as_ref() else { return };
-    if !get_chain(home, "police").groups.is_empty() {
+    if board_exists(home, "police") {
         return;
     }
     update_chain(home, "police", |b| {

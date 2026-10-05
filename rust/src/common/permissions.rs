@@ -3,7 +3,7 @@
 use serenity::builder::CreateMessage;
 use serenity::http::Http;
 use serenity::model::guild::Member;
-use serenity::model::id::UserId;
+use serenity::model::id::{RoleId, UserId};
 
 use super::config::BOT_OWNER_IDS;
 use super::guildinfo::GuildInfo;
@@ -29,6 +29,21 @@ pub fn is_mod(member: &Member, guild_owner_id: UserId) -> bool {
         return false;
     }
     member.roles.iter().any(|r| r.to_string() == mod_role_id)
+}
+
+/// Holds the Administrator permission in this server.
+///
+/// A slash command's member record carries the caller's computed permissions,
+/// so that is used when present. A fetched member has none, so fall back to
+/// their roles plus @everyone from the cached guild.
+pub fn is_guild_admin(member: &Member, info: &GuildInfo) -> bool {
+    if let Some(p) = member.permissions {
+        return p.administrator();
+    }
+    let everyone = RoleId::new(info.id.get());
+    std::iter::once(&everyone)
+        .chain(member.roles.iter())
+        .any(|r| info.roles.get(r).is_some_and(|role| role.permissions.administrator()))
 }
 
 pub fn is_whitelisted(member: &Member, guild_owner_id: UserId) -> bool {
@@ -114,6 +129,44 @@ mod tests {
             hoist: false,
             mentionable: false,
         }
+    }
+
+    fn admin_role() -> RoleInfo {
+        RoleInfo { permissions: serenity::model::Permissions::ADMINISTRATOR, ..role(3) }
+    }
+
+    fn guild_with(roles: &[(u64, RoleInfo)]) -> GuildInfo {
+        GuildInfo {
+            id: GuildId::new(880_002),
+            name: String::new(),
+            owner_id: UserId::new(1),
+            roles: roles.iter().map(|(id, r)| (RoleId::new(*id), r.clone())).collect(),
+            bot_highest: 9,
+        }
+    }
+
+    /// The permissions on a slash command's member record are authoritative.
+    #[test]
+    fn interaction_permissions_decide_admin() {
+        let info = guild_with(&[]);
+        let mut m = member(info.id, 500, &[]);
+        m.permissions = Some(serenity::model::Permissions::ADMINISTRATOR | serenity::model::Permissions::SEND_MESSAGES);
+        assert!(is_guild_admin(&m, &info));
+        m.permissions = Some(serenity::model::Permissions::MANAGE_GUILD | serenity::model::Permissions::BAN_MEMBERS);
+        assert!(!is_guild_admin(&m, &info), "Manage Server alone is not Administrator");
+    }
+
+    /// Without them (a fetched member), it comes from the member's roles,
+    /// @everyone included.
+    #[test]
+    fn roles_decide_admin_when_the_member_has_no_permissions() {
+        let info = guild_with(&[(10, role(1)), (20, admin_role())]);
+        assert!(is_guild_admin(&member(info.id, 500, &[10, 20]), &info));
+        assert!(!is_guild_admin(&member(info.id, 501, &[10]), &info));
+        assert!(!is_guild_admin(&member(info.id, 502, &[]), &info));
+
+        let everyone_admin = guild_with(&[(880_002, admin_role())]);
+        assert!(is_guild_admin(&member(everyone_admin.id, 503, &[]), &everyone_admin));
     }
 
     #[test]
