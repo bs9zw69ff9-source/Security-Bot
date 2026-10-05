@@ -70,7 +70,7 @@ fn scope(c: CreateCommand) -> CreateCommand {
 
 /// Commands left out of registration. Their definitions and handlers stay in
 /// place; taking a name off this list brings the command back.
-const DISABLED: &[&str] = &["tickets", "applications", "chainofcommand"];
+const DISABLED: &[&str] = &["tickets", "applications"];
 
 fn command_name(c: &CreateCommand) -> String {
     serde_json::to_value(c).ok().and_then(|v| v["name"].as_str().map(str::to_string)).unwrap_or_default()

@@ -385,6 +385,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
         color: palette::CYAN,
         commands: &[
             ("/police manual setup", "Post the officer guide & procedures manual"),
+            ("/chainofcommand setup · setroles · setgroup", "Auto-updating chain-of-command board *(owner)*"),
         ],
     },
     HelpSection {
