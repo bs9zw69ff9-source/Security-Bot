@@ -21,6 +21,10 @@ fn mention_roles(ids: &[String]) -> String {
     }
 }
 
+/// Guilds already told this run that their mute role is unsafe to hand out.
+static MUTE_PAUSE_WARNED: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<GuildId>>> =
+    once_cell::sync::Lazy::new(Default::default);
+
 /// Apply the mute role, stashing every role we're able to strip so unmute can
 /// hand them back. Returns false when the guild has no usable mute role.
 pub async fn mute_user(
@@ -44,8 +48,20 @@ pub async fn mute_user(
     // is configured: `/setup quick` adopts any role named "Muted", and a role's
     // permissions can change after it's set. A "mute role" anti-nuke trusts,
     // or one with real power, would turn /mute into a way to grant it.
-    if let Some(why) = crate::common::permissions::unsafe_grant_reason(info, mute_role, false) {
+    if let Some(why) = crate::common::permissions::mute_role_problem(info, mute_role) {
         eprintln!("⚠️ [{guild_id}] refusing to mute with role {mute_role}: {why}");
+        // Auto-mutes stop working until this is fixed, so the owner hears
+        // about it - once per run, not on every spam message.
+        if MUTE_PAUSE_WARNED.lock().unwrap_or_else(|e| e.into_inner()).insert(guild_id) {
+            crate::common::embeds::alert_owner(
+                ctx,
+                guild_id,
+                &format!("Mutes are paused here: I won't hand out the mute role <@&{mute_role}> because {why}. Fix it, or pick another with `/setup roles mute_role:@Role`."),
+                crate::common::embeds::colors::WARN,
+                "Mutes Paused",
+            )
+            .await;
+        }
         return false;
     }
 

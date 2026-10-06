@@ -17,7 +17,8 @@ use crate::common::embeds::{
 use crate::common::guildinfo::{channel_in_guild, fetch_member, GuildInfo};
 use crate::common::theme::{self, ModAction, Subject};
 use crate::common::permissions::{
-    can_act_on, is_guild_admin, is_mod, is_owner, is_whitelisted, role_at_or_above, try_dm_embed, unsafe_grant_reason,
+    can_act_on, is_guild_admin, is_mod, is_owner, is_whitelisted, mute_role_problem, role_at_or_above, try_dm_embed,
+    unsafe_grant_reason,
 };
 use crate::state::anti_ping::{ap, AntiPing};
 use crate::state::applications::{get_application, get_applications, update_application};
@@ -387,9 +388,15 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
             // mute_user refuses these too; saying so here gives the reason and
             // doesn't spend one of the caller's mod actions.
-            let unsafe_mute = gc(&gid).mute_role_id.parse::<u64>().ok().and_then(|r| unsafe_grant_reason(&info, RoleId::new(r), false));
-            if let Some(why) = unsafe_mute {
-                return reply_text(ctx, i, &format!("I won't mute with the configured mute role: {why}. Point me at a plain mute role with `/setup roles mute_role:@Role`.")).await;
+            let mute_problem = gc(&gid).mute_role_id.parse::<u64>().ok().and_then(|r| mute_role_problem(&info, RoleId::new(r)));
+            if let Some(why) = mute_problem {
+                // Only an owner hears the detail: it can say a role is whitelisted.
+                let text = if privileged {
+                    format!("I won't mute with the configured mute role: {why}. Fix it, or pick another with `/setup roles mute_role:@Role`.")
+                } else {
+                    "Muting is paused: the configured mute role isn't safe for me to hand out. The bot owner or the server owner needs to fix it.".to_string()
+                };
+                return reply_text(ctx, i, &text).await;
             }
             if !exempt {
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), "mute");
@@ -1213,7 +1220,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     // Quick setup adopts any role already called "Muted". Only one
                     // that's safe to hand out and, for an admin, below their own
                     // top role; otherwise it makes a fresh one.
-                    let adoptable = |r: RoleId| unsafe_grant_reason(&info, r, false).is_none() && (privileged || !role_at_or_above(&info, &member, r));
+                    let adoptable = |r: RoleId| mute_role_problem(&info, r).is_none() && (privileged || !role_at_or_above(&info, &member, r));
                     let r = quick_setup_guild(ctx, guild_id, mod_role, adoptable).await;
                     let mut e = build_setup_embed(guild_id, &info.name, &[], privileged);
                     e = e.color(theme::palette::SKY).description(format!(
@@ -1240,11 +1247,12 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         // A non-owner just hears no: saying why would tell them
                         // which roles are whitelisted or failsafe, which the
                         // setup card hides from them.
-                        let unsafe_role = unsafe_grant_reason(&info, r, false);
-                        if !privileged && (unsafe_role.is_some() || role_at_or_above(&info, &member, r)) {
+                        if !privileged && (unsafe_grant_reason(&info, r, false).is_some() || role_at_or_above(&info, &member, r)) {
                             return reply_text(ctx, i, &format!("Only the bot owner or the server owner can make <@&{r}> the mute role.")).await;
                         }
-                        if let Some(why) = unsafe_role {
+                        // What's left for a non-owner is only the ranking, which
+                        // isn't a secret.
+                        if let Some(why) = mute_role_problem(&info, r) {
                             return reply_text(ctx, i, &format!("<@&{r}> can't be the mute role: {why}.")).await;
                         }
                     }

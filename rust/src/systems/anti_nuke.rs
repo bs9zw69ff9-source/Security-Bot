@@ -689,6 +689,9 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
         Action::Member(MemberAction::BotAdd) => {
             on_bot_add(ctx, entry, guild_id, executor_id, &cfg).await
         }
+        Action::Member(MemberAction::RoleUpdate) => {
+            on_member_role_update(ctx, entry, guild_id, executor_id).await
+        }
         Action::GuildUpdate => {
             let Some(owner) = owner_id else { return };
             if is_immune(ctx, guild_id, executor_id, owner).await {
@@ -705,6 +708,71 @@ pub async fn on_audit_log_entry(ctx: &Context, entry: &AuditLogEntry, guild_id: 
         }
         _ => {}
     }
+}
+
+/// Roles given in a member role update (the audit log's `$add` change).
+fn roles_added(changes: Option<&[Change]>) -> Vec<RoleId> {
+    changes
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| match c {
+            Change::RolesAdded { new, .. } => new.as_ref(),
+            _ => None,
+        })
+        .flatten()
+        .map(|r| r.id)
+        .collect()
+}
+
+/// A role anti-nuke trusts (whitelisted, or a failsafe target) may only be
+/// handed out by someone trusted by id: a bot owner, the server owner or a
+/// whitelisted user. Those have already returned in `on_audit_log_entry`, so
+/// anyone here is not, including someone trusted only through a whitelisted
+/// role. Otherwise an admin could give one to themselves or an alt and be
+/// immune. The grant is taken straight back and the owner told.
+async fn on_member_role_update(ctx: &Context, entry: &AuditLogEntry, guild_id: GuildId, executor_id: UserId) {
+    // Without the owner we can't tell an owner's grant from anyone else's.
+    if ctx.cache.guild(guild_id).is_none() {
+        return;
+    }
+    let added = roles_added(entry.changes.as_deref());
+    let gid = guild_id.to_string();
+    let trusted: Vec<RoleId> = guild_settings::with(&gid, |g| {
+        added
+            .iter()
+            .copied()
+            .filter(|r| {
+                let id = r.to_string();
+                g.nuke_whitelist_role_ids.contains(&id) || g.failsafe_role_ids.contains(&id)
+            })
+            .collect()
+    });
+    if trusted.is_empty() {
+        return;
+    }
+    let Some(target) = entry.target_id.map(|t| t.get()).filter(|t| *t != 0).map(UserId::new) else { return };
+
+    let mut taken_back = Vec::new();
+    let mut stuck = Vec::new();
+    for role in &trusted {
+        let removed = ctx
+            .http
+            .remove_member_role(guild_id, target, *role, Some("Anti-nuke: only an owner can hand out a trusted role"))
+            .await;
+        if removed.is_ok() { taken_back.push(*role) } else { stuck.push(*role) }
+    }
+    let list = |v: &[RoleId]| v.iter().map(|r| format!("<@&{r}>")).collect::<Vec<_>>().join(", ");
+    let mut desc = format!(
+        "<@{executor_id}> gave <@{target}> {}, which anti-nuke trusts. Only a bot owner, the server owner or a whitelisted user can hand those out.",
+        list(&trusted)
+    );
+    if !taken_back.is_empty() {
+        desc.push_str(&format!("\nTook back: {}", list(&taken_back)));
+    }
+    if !stuck.is_empty() {
+        desc.push_str(&format!("\n⚠️ Couldn't take back (above me?): {}", list(&stuck)));
+    }
+    alert_owner(ctx, guild_id, &desc, colors::NUKE, "Trusted Role Grant Reverted").await;
 }
 
 /// Clean up whatever webhooks this user made, best effort. One request for
@@ -1466,6 +1534,18 @@ mod tests {
             whitelist_from_ids(guild(), owner_id, UserId::new(999)),
             WhitelistCheck::Decided(true)
         );
+    }
+
+    #[test]
+    fn roles_added_reads_only_the_add_change() {
+        // As Discord sends it.
+        let changes: Vec<Change> = serde_json::from_str(
+            r#"[{"key":"$add","new_value":[{"id":"1","name":"a"},{"id":"2","name":"b"}]},
+                {"key":"$remove","new_value":[{"id":"3","name":"c"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(roles_added(Some(&changes)), vec![RoleId::new(1), RoleId::new(2)]);
+        assert!(roles_added(None).is_empty());
     }
 
     #[test]

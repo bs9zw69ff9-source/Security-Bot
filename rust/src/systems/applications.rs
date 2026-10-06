@@ -786,6 +786,12 @@ async fn perform_app_accept(
     let mut failed: Vec<String> = Vec::new();
     if let Some(m) = &applicant {
         let info = crate::common::guildinfo::GuildInfo::from_cache(ctx, guild_id);
+        // Checked as each role is handed out, not just when it was configured:
+        // roles get whitelisted or moved later, and seeded ones were never
+        // checked at all. A reviewer who isn't an owner can't have the bot grant
+        // a role anti-nuke trusts, or one at or above their own top role.
+        let privileged = crate::common::permissions::is_owner(actor.id) || info.as_ref().is_some_and(|i| i.owner_id == actor.id);
+        let reviewer = if privileged { None } else { fetch_member(ctx, guild_id, actor.id).await };
         for role_id in &app.accepted_role_ids {
             let Ok(rid) = role_id.parse::<u64>() else {
                 failed.push(format!("`{role_id}` (missing)"));
@@ -799,6 +805,20 @@ async fn perform_app_accept(
                 }
                 Some(i) if !i.role_editable(role) => {
                     failed.push(format!("{} (above me)", i.role_name(role)));
+                    continue;
+                }
+                Some(i)
+                    if !privileged
+                        && (crate::common::permissions::unsafe_grant_reason(i, role, true).is_some()
+                            || reviewer.as_ref().is_none_or(|r| crate::common::permissions::role_at_or_above(i, r, role))) =>
+                {
+                    failed.push(format!("{} (needs the bot owner or the server owner to grant)", i.role_name(role)));
+                    continue;
+                }
+                // Without the guild's details nothing can be checked, so a
+                // non-owner gets nothing granted rather than everything.
+                None if !privileged => {
+                    failed.push(format!("`{role_id}` (couldn't check it just now)"));
                     continue;
                 }
                 _ => {}

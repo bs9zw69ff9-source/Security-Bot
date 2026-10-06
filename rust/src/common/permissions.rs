@@ -75,6 +75,28 @@ pub fn role_at_or_above(info: &GuildInfo, member: &Member, role: RoleId) -> bool
     info.roles.get(&role).is_some_and(|r| r.position >= info.member_highest(member))
 }
 
+/// Whether `role` is ranked at or above a role that grants Administrator
+/// (other than @everyone and bot-managed roles, which can't be handed out).
+///
+/// A mute strips a member's roles and gives them the mute role, so it becomes
+/// their top role. Ranked above an admin role, anyone who gets muted and is
+/// then handed an Administrator role below it would outrank the admins.
+pub fn outranks_an_admin_role(info: &GuildInfo, role: RoleId) -> bool {
+    let Some(pos) = info.roles.get(&role).map(|r| r.position) else { return false };
+    info.roles.iter().any(|(id, r)| {
+        *id != role && id.get() != info.id.get() && !r.managed && r.permissions.administrator() && r.position <= pos
+    })
+}
+
+/// Why `role` can't serve as the mute role, if it can't.
+pub fn mute_role_problem(info: &GuildInfo, role: RoleId) -> Option<&'static str> {
+    unsafe_grant_reason(info, role, false).or_else(|| {
+        outranks_an_admin_role(info, role).then_some(
+            "it's ranked above an admin role, so a muted member could end up outranking your admins. Drag it below your admin roles in Server Settings → Roles",
+        )
+    })
+}
+
 pub fn is_whitelisted(member: &Member, guild_owner_id: UserId) -> bool {
     if is_owner(member.user.id) {
         return true; // hardcoded owner is always immune
@@ -216,6 +238,21 @@ mod tests {
         assert_eq!(unsafe_grant_reason(&info, RoleId::new(20), true), None, "unless power is the point");
         assert!(unsafe_grant_reason(&info, RoleId::new(30), true).is_some(), "whitelisted, whatever its permissions");
         assert!(unsafe_grant_reason(&info, RoleId::new(40), true).is_some(), "a failsafe target, likewise");
+    }
+
+    /// The mute role becomes a muted member's top role, so it must rank below
+    /// every assignable admin role.
+    #[test]
+    fn a_mute_role_must_rank_below_admin_roles() {
+        let managed_admin = RoleInfo { managed: true, ..admin_role() };
+        let info = guild_with(&[(10, role(1)), (20, RoleInfo { position: 4, ..admin_role() }), (30, role(6)), (40, RoleInfo { position: 0, ..managed_admin })]);
+        assert!(!outranks_an_admin_role(&info, RoleId::new(10)), "below the admin role");
+        assert!(outranks_an_admin_role(&info, RoleId::new(30)), "above it");
+        assert!(mute_role_problem(&info, RoleId::new(30)).is_some());
+        assert_eq!(mute_role_problem(&info, RoleId::new(10)), None);
+
+        let only_managed = guild_with(&[(10, role(3)), (40, RoleInfo { position: 1, managed: true, ..admin_role() })]);
+        assert!(!outranks_an_admin_role(&only_managed, RoleId::new(10)), "a bot's managed role can't be handed out");
     }
 
     #[test]
