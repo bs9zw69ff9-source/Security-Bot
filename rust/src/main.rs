@@ -214,6 +214,8 @@ impl EventHandler for Handler {
                     systems::tickets::handle_ticket_claim(&ctx, &i).await;
                 } else if id == "ticket_close" {
                     systems::tickets::handle_ticket_close(&ctx, &i).await;
+                } else if id == "ticket_closereason" {
+                    systems::tickets::handle_ticket_close_with_reason(&ctx, &i).await;
                 } else if id == "app_pick" {
                     systems::applications::handle_app_pick(&ctx, &i).await;
                 } else if id.starts_with("app_apply_") {
@@ -233,7 +235,9 @@ impl EventHandler for Handler {
                     return;
                 }
                 let id = i.data.custom_id.clone();
-                if let Some(key) = id.strip_prefix("ticket_reason_") {
+                if id == "ticket_closereason_modal" {
+                    systems::tickets::handle_ticket_close_reason_modal(&ctx, &i).await;
+                } else if let Some(key) = id.strip_prefix("ticket_reason_") {
                     // Every input the form returned, in order, so the ticket
                     // keeps one answer per question.
                     let answers: Vec<String> = i

@@ -9,6 +9,7 @@ use serenity::client::Context;
 use serenity::model::application::{ButtonStyle, ComponentInteraction, InputTextStyle, ModalInteraction};
 use serenity::model::channel::{ChannelType, PermissionOverwrite, PermissionOverwriteType};
 use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
+use serenity::model::user::User;
 use serenity::model::{Permissions, Timestamp};
 
 use crate::common::config::now_ms;
@@ -263,6 +264,7 @@ async fn build_transcript(
     ticket: &OpenTicket,
     type_label: &str,
     closer_tag: &str,
+    close_reason: Option<&str>,
 ) -> String {
     let messages = fetch_all_messages(ctx, channel).await;
     let rows = messages
@@ -312,7 +314,7 @@ async fn build_transcript(
 <body>
   <div class="header">
     <h1>🎫 {label} - #{name}</h1>
-    <div class="sub">Opened by &lt;{opener}&gt; · Closed by {closer} · {count} message(s)</div>
+    <div class="sub">Opened by &lt;{opener}&gt; · Closed by {closer} · {count} message(s)</div>{reason}
   </div>
   {rows}
 </body></html>"#,
@@ -320,6 +322,9 @@ async fn build_transcript(
         label = escape_html(type_label),
         opener = escape_html(&ticket.opener_id),
         closer = escape_html(closer_tag),
+        reason = close_reason
+            .map(|r| format!("\n    <div class=\"sub\">Close reason: {}</div>", escape_html(r).replace('\n', "<br>")))
+            .unwrap_or_default(),
         count = messages.len(),
         rows = if rows.is_empty() { "<p><i>No messages were sent in this ticket.</i></p>".to_string() } else { rows },
     )
@@ -607,7 +612,7 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         .await;
 }
 
-/// The Claim / Close row.
+/// The Claim / Close / Close With Reason row.
 ///
 /// `claimed_by` retires the Claim button in place, disabled and relabelled
 /// with who took it, which is how a decided application shows its outcome.
@@ -624,6 +629,7 @@ fn ticket_controls(claimed_by: Option<&str>) -> CreateActionRow {
     CreateActionRow::Buttons(vec![
         claim,
         CreateButton::new("ticket_close").label("Close Ticket").emoji('🔒').style(ButtonStyle::Danger),
+        CreateButton::new("ticket_closereason").label("Close With Reason").emoji('📝').style(ButtonStyle::Danger),
     ])
 }
 
@@ -734,40 +740,125 @@ fn repaint_ticket(old: &serenity::model::channel::Embed, color: u32, field: &str
     e
 }
 
+const CLOSE_DENIED: &str = "Only the team that handles this kind of ticket, or the person who opened it, can close it.";
+
+/// The ticket's handling team, or whoever opened it.
+async fn may_close(ctx: &Context, guild_id: GuildId, user_id: UserId, ticket: &OpenTicket) -> bool {
+    if user_id.to_string() == ticket.opener_id {
+        return true;
+    }
+    let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id).unwrap_or(UserId::new(1));
+    match fetch_member(ctx, guild_id, user_id).await {
+        Some(member) => handles_ticket(&member, owner_id, guild_id, &ticket.type_key),
+        None => false,
+    }
+}
+
+/// What the channel shows while the transcript is saved.
+fn closing_card(reason: Option<&str>) -> CreateEmbed {
+    let mut e = CreateEmbed::new()
+        .color(APPY_RED)
+        .title("Closing this ticket")
+        .description("Saving the transcript, one sec.")
+        .timestamp(Timestamp::now());
+    if let Some(r) = reason {
+        e = e.field("Reason", truncate(r, 1024), false);
+    }
+    e
+}
+
+/// Close button: close straight away, with no reason.
 pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
     let Some(guild_id) = i.guild_id else { return };
     let Some(ticket) = get_open_ticket(&guild_id.to_string(), &i.channel_id.to_string()) else {
         return ephemeral(ctx, i, "This isn't an active ticket channel.").await;
     };
-    let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id).unwrap_or(UserId::new(1));
-    let Some(member) = fetch_member(ctx, guild_id, i.user.id).await else { return };
-    if !handles_ticket(&member, owner_id, guild_id, &ticket.type_key) && i.user.id.to_string() != ticket.opener_id {
-        return ephemeral(ctx, i, "Only the team that handles this kind of ticket, or the person who opened it, can close it.").await;
+    if !may_close(ctx, guild_id, i.user.id, &ticket).await {
+        return ephemeral(ctx, i, CLOSE_DENIED).await;
     }
+    let _ = i
+        .create_response(&ctx.http, CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().embed(closing_card(None))))
+        .await;
+    close_ticket(ctx, guild_id, i.channel_id, &i.user, ticket, None).await;
+}
 
+/// Close With Reason button: ask for the reason first. The ticket closes
+/// when the form is sent; dismissing it leaves the ticket open.
+pub async fn handle_ticket_close_with_reason(ctx: &Context, i: &ComponentInteraction) {
+    let Some(guild_id) = i.guild_id else { return };
+    let Some(ticket) = get_open_ticket(&guild_id.to_string(), &i.channel_id.to_string()) else {
+        return ephemeral(ctx, i, "This isn't an active ticket channel.").await;
+    };
+    if !may_close(ctx, guild_id, i.user.id, &ticket).await {
+        return ephemeral(ctx, i, CLOSE_DENIED).await;
+    }
+    let modal = CreateModal::new("ticket_closereason_modal", "Close Ticket").components(vec![CreateActionRow::InputText(
+        CreateInputText::new(InputTextStyle::Paragraph, "Reason for closing", "reason")
+            .required(true)
+            .max_length(1000)
+            .placeholder("This is sent to the person who opened the ticket and saved in the log"),
+    )]);
+    let _ = i.create_response(&ctx.http, CreateInteractionResponse::Modal(modal)).await;
+}
+
+/// The close-reason form was sent: close the ticket with that reason.
+pub async fn handle_ticket_close_reason_modal(ctx: &Context, i: &ModalInteraction) {
+    let Some(guild_id) = i.guild_id else { return };
+    let reply = |text: &str| {
+        CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(text.to_string()).ephemeral(true))
+    };
+    // Checked again: the ticket may have been closed, or the person's access
+    // changed, while the form was open.
+    let Some(ticket) = get_open_ticket(&guild_id.to_string(), &i.channel_id.to_string()) else {
+        let _ = i.create_response(&ctx.http, reply("This ticket's already closed.")).await;
+        return;
+    };
+    if !may_close(ctx, guild_id, i.user.id, &ticket).await {
+        let _ = i.create_response(&ctx.http, reply(CLOSE_DENIED)).await;
+        return;
+    }
+    let reason = i
+        .data
+        .components
+        .iter()
+        .flat_map(|row| row.components.iter())
+        .find_map(|c| match c {
+            serenity::model::application::ActionRowComponent::InputText(it) if it.custom_id == "reason" => it.value.clone(),
+            _ => None,
+        })
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
     let _ = i
         .create_response(
             &ctx.http,
-            CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().embed(
-                CreateEmbed::new()
-                    .color(APPY_RED)
-                    .title("Closing this ticket")
-                    .description("Saving the transcript, one sec.")
-                    .timestamp(Timestamp::now()),
-            )),
+            CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().embed(closing_card(reason.as_deref()))),
         )
         .await;
+    close_ticket(ctx, guild_id, i.channel_id, &i.user, ticket, reason.as_deref()).await;
+}
 
+/// Everything a close does once it's been acknowledged: transcript and summary
+/// to the type's log channel, a DM to the opener, the security log, then the
+/// channel goes. `reason` is shown in each when given.
+async fn close_ticket(
+    ctx: &Context,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+    closer: &User,
+    ticket: OpenTicket,
+    reason: Option<&str>,
+) {
     let cfg = get_ticket_config(&guild_id.to_string());
     let t = cfg.types.iter().find(|t| t.key == ticket.type_key).cloned();
     let label = t.as_ref().map(|t| t.label.clone()).unwrap_or_else(|| ticket.type_key.clone());
     let channel_name = ctx
         .cache
         .guild(guild_id)
-        .and_then(|g| g.channels.get(&i.channel_id).map(|c| c.name.to_string()))
-        .unwrap_or_else(|| i.channel_id.to_string());
+        .and_then(|g| g.channels.get(&channel_id).map(|c| c.name.to_string()))
+        .unwrap_or_else(|| channel_id.to_string());
 
-    let transcript = build_transcript(ctx, i.channel_id, &channel_name, &ticket, &label, &i.user.tag()).await;
+    let transcript = build_transcript(ctx, channel_id, &channel_name, &ticket, &label, &closer.tag(), reason).await;
+    let reason_field = truncate(reason.unwrap_or("No reason given"), 1024);
 
     let opener_tag = ticket
         .opener_id
@@ -791,7 +882,7 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
             },
             true,
         )
-        .field("Closed by", format!("<@{}>", i.user.id), true)
+        .field("Closed by", format!("<@{}>", closer.id), true)
         .field(
             "Claimed by",
             ticket.claimed_by.as_ref().map(|c| format!("<@{c}>")).unwrap_or_else(|| "Unclaimed".to_string()),
@@ -800,6 +891,7 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
         .field("Opened", format!("<t:{}:F>", ticket.opened_at / 1000), true)
         .field("Duration", format_uptime(now_ms() - ticket.opened_at), true)
         .field("Open reason", truncate(&answers_block(&ticket), 1024), false)
+        .field("Close reason", reason_field.clone(), false)
         .timestamp(Timestamp::now());
 
     if let Some(log_id) = t.as_ref().and_then(|t| t.log_channel_id.parse::<u64>().ok()) {
@@ -824,10 +916,11 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
             .title("Ticket Closed")
             .description(format!(
                 "Your **{label}** ticket in **{guild_name}** was closed by {}.",
-                i.user.tag()
+                closer.tag()
             ))
             .field("Open reason", truncate(&answers_block(&ticket), 1024), false)
-            .footer(CreateEmbedFooter::new(format!("Ticket ID: {}", i.channel_id)))
+            .field("Close reason", reason_field.clone(), false)
+            .footer(CreateEmbedFooter::new(format!("Ticket ID: {}", channel_id)))
             .timestamp(Timestamp::now());
         if let Some(url) = guild_icon {
             dm = dm.thumbnail(url);
@@ -840,17 +933,20 @@ pub async fn handle_ticket_close(ctx: &Context, i: &ComponentInteraction) {
         guild_id,
         "Ticket Closed",
         &format!(
-            "<@{}> closed the **{label}** ticket that <@{}> opened (<#{}>).",
-            i.user.id, ticket.opener_id, i.channel_id
+            "<@{}> closed the **{label}** ticket that <@{}> opened (<#{}>).{}",
+            closer.id,
+            ticket.opener_id,
+            channel_id,
+            reason.map(|r| format!("\n**Reason:** {}", truncate(r, 1000))).unwrap_or_default()
         ),
         colors::NEUTRAL,
     )
     .await;
-    delete_open_ticket(&guild_id.to_string(), &i.channel_id.to_string());
+    delete_open_ticket(&guild_id.to_string(), &channel_id.to_string());
 
-    let _ = i.channel_id.say(&ctx.http, "All done here - this channel will disappear in a few seconds.").await;
+    let _ = channel_id.say(&ctx.http, "All done here - this channel will disappear in a few seconds.").await;
     let http = ctx.http.clone();
-    let channel = i.channel_id;
+    let channel = channel_id;
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let _ = channel.delete(&http).await;
@@ -1006,6 +1102,17 @@ mod tests {
         assert_eq!(split.1[0].key, "partnerships");
 
         crate::common::db::delete("tickets", gid);
+    }
+
+    /// Both close buttons are offered, before and after the ticket is claimed
+    /// (claiming re-renders the row).
+    #[test]
+    fn close_with_reason_sits_next_to_close() {
+        for row in [ticket_controls(None), ticket_controls(Some("mod"))] {
+            let json = serde_json::to_string(&row).unwrap();
+            assert!(json.contains("\"ticket_close\""), "{json}");
+            assert!(json.contains("\"ticket_closereason\""), "{json}");
+        }
     }
 
     /// The form answers render as Appy's "Open reason" block: each question in
