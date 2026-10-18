@@ -58,6 +58,8 @@ pub struct AppConfig {
     pub nypd_questions_v3: bool,
     /// Guards the one-time NYPD review-channel correction below.
     pub nypd_review_v2: bool,
+    /// Guards the one-time "Two gangsters" → "Two gang members" rewording.
+    pub nypd_gang_members_v1: bool,
     /// Guards the one-time wasteland-faction seed below.
     pub wasteland_seed_v1: bool,
     /// Guards the one-time addition of the second set of faction roles.
@@ -151,7 +153,7 @@ fn nypd_questions_v3() -> Vec<String> {
         "What times can you be active?",
         "Do you have previous police RP experience? If so, where?",
         "In your opinion, when is lethal force permitted?",
-        "Scenario 1: Two gangsters are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?",
+        "Scenario 1: Two gang members are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?",
         "Scenario 2: A player kills someone, and is pleading that it was unintentional, what do you charge them with, and do you permit them to make an argument?",
         "Scenario 3: You see an officer accepting a bribe, how do you respond?",
         "Should police step into a staff situation such as RDM?",
@@ -359,6 +361,38 @@ pub fn migrate_nypd_questions_v3() {
     }
     save(home);
     println!("📝 Applied expanded NYPD application questions for home guild ({home})");
+}
+
+/// NYPD Scenario 1 as first worded, and as it reads now.
+const NYPD_SCENARIO1_OLD: &str = "Scenario 1: Two gangsters are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?";
+const NYPD_SCENARIO1_NEW: &str = "Scenario 1: Two gang members are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?";
+
+/// Swap the old Scenario 1 wording for the new one. Only an exact match is
+/// changed, so a question an admin has since rewritten is left alone.
+fn reword_nypd_scenario1(questions: &mut [String]) {
+    for q in questions.iter_mut().filter(|q| *q == NYPD_SCENARIO1_OLD) {
+        *q = NYPD_SCENARIO1_NEW.to_string();
+    }
+}
+
+/// Reword NYPD Scenario 1 from "Two gangsters" to "Two gang members" on a
+/// guild that already has the v3 questions saved, since changing the v3 list
+/// only reaches fresh installs. Runs once, guarded by nypdGangMembersV1.
+pub fn migrate_nypd_gang_members_wording() {
+    let Some(home) = GUILD_ID.as_ref() else { return };
+    {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(home) else { return };
+        if cfg.nypd_gang_members_v1 || cfg.apps.is_empty() {
+            return;
+        }
+        if let Some(app) = cfg.apps.get_mut("nypd") {
+            reword_nypd_scenario1(&mut app.questions);
+        }
+        cfg.nypd_gang_members_v1 = true;
+    }
+    save(home);
+    println!("📝 Reworded NYPD Scenario 1 (\"Two gang members\") for home guild ({home})");
 }
 
 /// Correct the NYPD review channel on an already-seeded home guild.
@@ -700,5 +734,27 @@ pub fn migrate_wasteland_staff_role_v1() {
     save(WASTELAND_GUILD);
     if added {
         println!("\u{1f4dd} Staff applications now grant <@&{WASTELAND_STAFF_ROLE}> on accept");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The saved question is reworded only when it still reads exactly as
+    /// seeded; everything else, including an admin's own edit, is untouched.
+    #[test]
+    fn scenario1_is_reworded_only_where_unchanged() {
+        let mut qs = vec!["Time Zone:".to_string(), NYPD_SCENARIO1_OLD.to_string(), "Scenario 1: my own wording".to_string()];
+        reword_nypd_scenario1(&mut qs);
+        assert_eq!(qs, vec!["Time Zone:".to_string(), NYPD_SCENARIO1_NEW.to_string(), "Scenario 1: my own wording".to_string()]);
+    }
+
+    /// Fresh installs get the new wording straight from the v3 list.
+    #[test]
+    fn the_v3_list_already_has_the_new_wording() {
+        let qs = nypd_questions_v3();
+        assert!(qs.iter().any(|q| q == NYPD_SCENARIO1_NEW));
+        assert!(!qs.iter().any(|q| q.contains("gangsters")));
     }
 }

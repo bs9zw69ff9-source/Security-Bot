@@ -25,6 +25,7 @@ pub fn run_migrations() {
     applications::migrate_family_questions_v2();
     applications::migrate_nypd_questions_v2();
     applications::migrate_nypd_questions_v3();
+    applications::migrate_nypd_gang_members_wording();
     applications::migrate_nypd_review_channel_v2();
     applications::migrate_unseed_wasteland_from_wrong_guild();
     applications::migrate_wasteland_applications();
