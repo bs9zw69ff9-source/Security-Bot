@@ -492,15 +492,17 @@ place, questions, roles and channels, and buttons on applications submitted
 before the rename keep working.
 
 **The GWPD server** (`1561145119384535062`) is set up by its own id, not by
-`GUILD_ID`, and gets only the GWPD application and a ticket panel:
+`GUILD_ID`, and gets the GWPD and Staff applications and a ticket panel:
 
 | What | Channel |
 |------|---------|
-| GWPD application panel | `1561145645295865997` |
-| Submitted GWPD applications (review) | `1561145645295865997` |
+| GWPD + Staff application panel (one panel, two buttons) | `1561145645295865997` |
+| Submitted GWPD and Staff applications (review) | `1561145645295865997` |
 | Ticket panel | `1561145649196572752` |
 
-The panel and the applications share one channel. (The panel was first put
+The panel and the applications share one channel. The Staff application uses
+the same 14 staff questions as the wasteland server, with no age or
+time-in-server requirement. (The panel was first put
 in `1561145643370815608`; a server set up before the move has it moved over
 and the old panel deleted on boot.)
 

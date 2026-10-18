@@ -81,6 +81,8 @@ pub struct AppConfig {
     pub gwpd_seed_v1: bool,
     /// Guards the one-time move of the GWPD panel to its own channel.
     pub gwpd_panel_v2: bool,
+    /// Guards the one-time staff application seed for the GWPD server.
+    pub gwpd_staff_v1: bool,
     /// Panels left behind when an application moved channel, deleted on the
     /// next boot (see ensure_application_panels).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -634,6 +636,37 @@ pub fn migrate_gwpd_panel_v2() {
     }
 }
 
+/// The GWPD server's staff application: on the same panel as the GWPD one,
+/// with submitted staff applications going to the same channel. The questions
+/// are the general RP staff set the wasteland server uses; no age or
+/// time-in-server requirement. Runs once, guarded by gwpdStaffV1. A staff
+/// application already set up there keeps its questions, roles and
+/// requirements and only has its channels pointed here.
+pub fn migrate_gwpd_staff_application() {
+    {
+        let mut map = lock();
+        let cfg = map.entry(GWPD_GUILD.to_string()).or_default();
+        if cfg.gwpd_staff_v1 {
+            return;
+        }
+        let app = cfg.apps.entry("staff".to_string()).or_insert_with(|| Application {
+            key: "staff".into(),
+            label: "Staff".into(),
+            emoji: "\u{1f6e1}\u{fe0f}".into(),
+            questions: wasteland_staff_questions(),
+            ..Default::default()
+        });
+        if app.panel_channel_id != GWPD_PANEL {
+            app.panel_channel_id = GWPD_PANEL.into();
+            app.panel_message_id.clear();
+        }
+        app.review_channel_id = GWPD_REVIEW.into();
+        cfg.gwpd_staff_v1 = true;
+    }
+    save(GWPD_GUILD);
+    println!("📝 Set up the staff application alongside GWPD for {GWPD_GUILD}");
+}
+
 /// The wasteland factions, for one specific server.
 ///
 /// Unlike the other seeds this is not tied to GUILD_ID: these four belong to
@@ -1013,13 +1046,14 @@ mod tests {
         assert!(cfg.gwpd_questions_v2 && cfg.gwpd_questions_v3 && cfg.gwpd_review_v2 && cfg.gwpd_gang_members_v1);
     }
 
-    /// The new server gets exactly the GWPD application, with the requested
-    /// panel and review channels.
+    /// The new server gets the GWPD application, with the requested panel and
+    /// review channels, and nothing from the other servers.
     #[test]
-    fn the_gwpd_server_gets_only_the_gwpd_application() {
+    fn the_gwpd_server_gets_the_gwpd_application() {
         migrate_gwpd_guild();
         let apps = get_applications(GWPD_GUILD);
-        assert_eq!(apps.keys().cloned().collect::<Vec<_>>(), vec![POLICE_KEY.to_string()]);
+        assert_eq!(apps.keys().next().map(String::as_str), Some(POLICE_KEY));
+        assert!(apps.keys().all(|k| k == POLICE_KEY || k == "staff"), "nothing but GWPD and staff: {:?}", apps.keys());
         let gwpd = &apps[POLICE_KEY];
         assert_eq!(gwpd.label, "GWPD");
         assert_eq!(gwpd.panel_channel_id, "1561145645295865997");
@@ -1047,5 +1081,21 @@ mod tests {
 
         cfg.apps.get_mut(POLICE_KEY).unwrap().panel_channel_id = "777".into();
         assert!(!move_gwpd_panel(&mut cfg), "a channel someone chose since is kept");
+    }
+
+    /// Staff joins GWPD on the GWPD server: same channel for the panel and
+    /// for submitted applications, so the two share one panel.
+    #[test]
+    fn the_gwpd_server_gets_a_staff_application_beside_gwpd() {
+        migrate_gwpd_guild();
+        migrate_gwpd_staff_application();
+        let apps = get_applications(GWPD_GUILD);
+        assert_eq!(apps.keys().cloned().collect::<Vec<_>>(), vec![POLICE_KEY.to_string(), "staff".to_string()], "GWPD first on the panel");
+        let staff = &apps["staff"];
+        assert_eq!(staff.label, "Staff");
+        assert_eq!(staff.panel_channel_id, "1561145645295865997");
+        assert_eq!(staff.review_channel_id, "1561145645295865997");
+        assert_eq!(staff.panel_channel_id, apps[POLICE_KEY].panel_channel_id, "one shared panel");
+        assert_eq!(staff.questions, wasteland_staff_questions());
     }
 }
