@@ -63,6 +63,8 @@ pub struct TicketConfig {
     pub category_seed_v1: bool,
     /// Guards the one-time ticket seed for the wasteland server.
     pub wasteland_seed_v1: bool,
+    /// Guards the one-time ticket seed for the GWPD server.
+    pub gwpd_seed_v1: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, TicketConfig>>> = Lazy::new(|| Mutex::new(db::load_all("tickets")));
@@ -260,9 +262,86 @@ pub fn migrate_wasteland_tickets() {
     println!("🎫 Seeded the ticket panel and five ticket types for {WASTELAND_GUILD}");
 }
 
+/// The GWPD server's tickets: the same five options as the wasteland panel,
+/// with "Faction Report" as "Police Report", and staff reports locked to one
+/// role.
+const GWPD_TICKET_PANEL: &str = "1561145649196572752";
+/// The only role (besides whoever opened it) given access to a staff report,
+/// so a report about a staff member isn't open to the staff in general. The
+/// server owner and Administrators still see every channel; Discord gives no
+/// way to hide one from them.
+const GWPD_STAFF_REPORT_ROLE: &str = "1561441031738761236";
+
+/// Runs once, guarded by gwpdSeedV1. Types already set up there are kept, with
+/// a "Faction Report" renamed to "Police Report" and the staff-report role
+/// enforced; missing ones are added. No category is set, so the first ticket
+/// creates a "Tickets" category, and no log channel, since none was given:
+/// until one is set, closed tickets aren't logged anywhere.
+pub fn migrate_gwpd_tickets() {
+    let guild = crate::state::applications::GWPD_GUILD;
+    if get_ticket_config(guild).gwpd_seed_v1 {
+        return;
+    }
+    let wanted: [(&str, &str, &str, Option<&str>); 5] = [
+        ("report_player", "Report Player", "🚨", None),
+        ("staff_report", "Staff Report", "🛡️", Some(GWPD_STAFF_REPORT_ROLE)),
+        ("police_report", "Police Report", "👮", None),
+        ("general_support", "General Support", "🎫", None),
+        ("ban_appeal", "Ban Appeal", "⚖️", None),
+    ];
+    update_ticket_config(guild, |c| {
+        c.gwpd_seed_v1 = true;
+        // The home server's category backfill must never point this server's
+        // tickets at the other server's category.
+        c.category_seed_v1 = true;
+        c.panel_channel_id = GWPD_TICKET_PANEL.to_string();
+        if !c.types.iter().any(|t| t.key == "police_report") {
+            if let Some(t) = c.types.iter_mut().find(|t| t.key == "faction_report") {
+                t.key = "police_report".to_string();
+                t.label = "Police Report".to_string();
+                t.emoji = "👮".to_string();
+            }
+        }
+        for (key, label, emoji, role) in wanted {
+            let roles: Vec<String> = role.map(|r| vec![r.to_string()]).unwrap_or_default();
+            match c.types.iter_mut().find(|t| t.key == key) {
+                Some(t) => {
+                    if role.is_some() {
+                        t.support_role_ids = roles;
+                    }
+                }
+                None => c.types.push(TicketType {
+                    key: key.to_string(),
+                    label: label.to_string(),
+                    emoji: emoji.to_string(),
+                    support_role_ids: roles,
+                    ..Default::default()
+                }),
+            }
+        }
+    });
+    println!("🎫 Set up the ticket panel and five ticket types for {guild}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GWPD server's panel: the five options in order, Police Report in
+    /// place of Faction Report, and staff reports open to just the one role.
+    #[test]
+    fn the_gwpd_server_gets_its_ticket_panel() {
+        migrate_gwpd_tickets();
+        let cfg = get_ticket_config(crate::state::applications::GWPD_GUILD);
+        assert_eq!(cfg.panel_channel_id, "1561145649196572752");
+        let labels: Vec<&str> = cfg.types.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["Report Player", "Staff Report", "Police Report", "General Support", "Ban Appeal"]);
+        assert!(!cfg.types.iter().any(|t| t.label.contains("Faction")));
+        let staff = cfg.types.iter().find(|t| t.key == "staff_report").unwrap();
+        assert_eq!(staff.support_roles("999"), vec!["1561441031738761236".to_string()], "only that role, not the mod role");
+        let police = cfg.types.iter().find(|t| t.key == "police_report").unwrap();
+        assert!(police.support_role_ids.is_empty(), "the rest fall back to the mod role");
+    }
 
     fn ticket_type(key: &str, roles: &[&str]) -> TicketType {
         TicketType {

@@ -1210,10 +1210,10 @@ mod tests {
     /// people can see it exists rather than assuming it was removed.
     #[test]
     fn a_closed_application_is_shown_disabled_not_hidden() {
-        let json = row_json(&[app("staff", "Staff", true, 6), app("nypd", "NYPD", false, 14)]);
+        let json = row_json(&[app("staff", "Staff", true, 6), app("gwpd", "GWPD", false, 14)]);
         assert!(json.contains("Staff (closed)"), "closed apps stay listed: {json}");
         assert!(json.contains(r#""disabled":true"#), "and cannot be clicked: {json}");
-        assert!(json.contains("NYPD"));
+        assert!(json.contains("GWPD"));
     }
 
     /// Discord allows five buttons per row, so more than that has to wrap.

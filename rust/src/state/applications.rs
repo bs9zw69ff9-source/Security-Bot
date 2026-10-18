@@ -54,12 +54,23 @@ pub struct AppConfig {
     pub req_defaults_v1: bool,
     pub staff_questions_v2: bool,
     pub family_questions_v2: bool,
-    pub nypd_questions_v2: bool,
-    pub nypd_questions_v3: bool,
-    /// Guards the one-time NYPD review-channel correction below.
-    pub nypd_review_v2: bool,
+    // The police flags keep the names they were first saved under (from when
+    // the department was the NYPD), so a database that already has them set
+    // isn't read as "never ran".
+    #[serde(rename = "nypdQuestionsV2")]
+    pub gwpd_questions_v2: bool,
+    #[serde(rename = "nypdQuestionsV3")]
+    pub gwpd_questions_v3: bool,
+    /// Guards the one-time police review-channel correction below.
+    #[serde(rename = "nypdReviewV2")]
+    pub gwpd_review_v2: bool,
     /// Guards the one-time "Two gangsters" → "Two gang members" rewording.
-    pub nypd_gang_members_v1: bool,
+    #[serde(rename = "nypdGangMembersV1")]
+    pub gwpd_gang_members_v1: bool,
+    /// Guards the one-time NYPD → GWPD rename.
+    pub gwpd_rename_v1: bool,
+    /// Guards the one-time GWPD application seed for the GWPD server.
+    pub gwpd_seed_v1: bool,
     /// Guards the one-time wasteland-faction seed below.
     pub wasteland_seed_v1: bool,
     /// Guards the one-time addition of the second set of faction roles.
@@ -68,6 +79,23 @@ pub struct AppConfig {
     pub wasteland_staff_v1: bool,
     /// Guards the one-time addition of the staff accept role.
     pub wasteland_staff_role_v1: bool,
+}
+
+/// The police application's key. It was "nypd" until the department became
+/// the GWPD: a saved "nypd" is renamed on boot, and a lookup by the old key
+/// (an Accept button on an application submitted before the rename, say)
+/// still finds it.
+pub const POLICE_KEY: &str = "gwpd";
+const LEGACY_POLICE_KEY: &str = "nypd";
+
+/// The key an application is saved under, mapping the old police key onto
+/// the renamed one when only that exists.
+fn resolve<'a>(apps: &IndexMap<String, Application>, key: &'a str) -> &'a str {
+    if key == LEGACY_POLICE_KEY && !apps.contains_key(key) && apps.contains_key(POLICE_KEY) {
+        POLICE_KEY
+    } else {
+        key
+    }
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, AppConfig>>> = Lazy::new(|| Mutex::new(db::load_all("applications")));
@@ -92,7 +120,7 @@ pub fn get_applications(guild_id: &str) -> IndexMap<String, Application> {
 }
 
 pub fn get_application(guild_id: &str, key: &str) -> Option<Application> {
-    lock().get(guild_id).and_then(|c| c.apps.get(key).cloned())
+    lock().get(guild_id).and_then(|c| c.apps.get(resolve(&c.apps, key)).cloned())
 }
 
 /// Merge a patch into one application (creating it if new), then persist.
@@ -103,7 +131,8 @@ pub fn update_application<F: FnOnce(&mut Application)>(guild_id: &str, key: &str
     {
         let mut map = lock();
         let cfg = map.entry(guild_id.to_string()).or_default();
-        let app = cfg.apps.entry(key.to_string()).or_default();
+        let key = resolve(&cfg.apps, key).to_string();
+        let app = cfg.apps.entry(key).or_default();
         f(app);
     }
     save(guild_id)
@@ -134,7 +163,7 @@ fn staff_questions_v2() -> Vec<String> {
         "How are you better than other applicants",
     ])
 }
-fn nypd_questions_v2() -> Vec<String> {
+fn gwpd_questions_v2() -> Vec<String> {
     strings(&[
         "Pavlov Username:",
         "Discord Username:",
@@ -144,7 +173,7 @@ fn nypd_questions_v2() -> Vec<String> {
         "Do you have previous police RP experience? If so, where?",
     ])
 }
-fn nypd_questions_v3() -> Vec<String> {
+fn gwpd_questions_v3() -> Vec<String> {
     strings(&[
         "Pavlov Username:",
         "Discord Username:",
@@ -228,10 +257,10 @@ pub fn migrate_applications_to_home_guild() {
         },
     );
     apps.insert(
-        "nypd".into(),
+        POLICE_KEY.into(),
         Application {
-            key: "nypd".into(),
-            label: "NYPD".into(),
+            key: POLICE_KEY.into(),
+            label: "GWPD".into(),
             emoji: "👮".into(),
             panel_channel_id: "1528754445968740472".into(),
             panel_message_id: String::new(),
@@ -242,7 +271,7 @@ pub fn migrate_applications_to_home_guild() {
             questions: strings(&[
                 "How old are you?",
                 "Whats your discord and ingame name",
-                "Why do you want to join the NYPD?",
+                "Why do you want to join the GWPD?",
                 "How will you help?",
                 "What would you do if someone is robbing a gun store?",
                 "A higher up is giving an unlawful order, what will you do?",
@@ -255,7 +284,7 @@ pub fn migrate_applications_to_home_guild() {
 
     lock().insert(home.clone(), AppConfig { apps, req_defaults_v1: true, ..Default::default() });
     save(home);
-    println!("📝 Seeded default application types (gambino, colombo, staff, nypd) for home guild ({home})");
+    println!("📝 Seeded default application types (gambino, colombo, staff, gwpd) for home guild ({home})");
 }
 
 /// Backfill the per-application age / member-time requirements onto the home
@@ -272,7 +301,7 @@ pub fn migrate_application_requirements() {
             ("gambino", 14, "3 days"),
             ("colombo", 14, "3 days"),
             ("staff", 15, "2 weeks"),
-            ("nypd", 14, "1 week"),
+            (POLICE_KEY, 14, "1 week"),
         ];
         for (key, age, time) in desired {
             if let Some(app) = cfg.apps.get_mut(key) {
@@ -283,7 +312,7 @@ pub fn migrate_application_requirements() {
         cfg.req_defaults_v1 = true;
     }
     save(home);
-    println!("📝 Applied per-application requirements (staff 15/2wk, family 14/3d, nypd 14/1wk) for home guild ({home})");
+    println!("📝 Applied per-application requirements (staff 15/2wk, family 14/3d, gwpd 14/1wk) for home guild ({home})");
 }
 
 /// Backfill the new staff application questions. Runs once, guarded by
@@ -326,101 +355,210 @@ pub fn migrate_family_questions_v2() {
     println!("📝 Applied updated crime-family application questions for home guild ({home})");
 }
 
-/// Backfill the first NYPD question set. Runs once, guarded by nypdQuestionsV2.
-pub fn migrate_nypd_questions_v2() {
+/// The police application, under its current key or the old one: these
+/// backfills ran before the rename and must still find it on a server that
+/// hasn't been renamed yet.
+fn police_app(cfg: &mut AppConfig) -> Option<&mut Application> {
+    if cfg.apps.contains_key(POLICE_KEY) {
+        cfg.apps.get_mut(POLICE_KEY)
+    } else {
+        cfg.apps.get_mut(LEGACY_POLICE_KEY)
+    }
+}
+
+/// Backfill the first police question set. Runs once, guarded by gwpd_questions_v2.
+pub fn migrate_gwpd_questions_v2() {
     let Some(home) = GUILD_ID.as_ref() else { return };
     {
         let mut map = lock();
         let Some(cfg) = map.get_mut(home) else { return };
-        if cfg.nypd_questions_v2 || cfg.apps.is_empty() {
+        if cfg.gwpd_questions_v2 || cfg.apps.is_empty() {
             return;
         }
-        if let Some(app) = cfg.apps.get_mut("nypd") {
-            app.questions = nypd_questions_v2();
+        if let Some(app) = police_app(cfg) {
+            app.questions = gwpd_questions_v2();
         }
-        cfg.nypd_questions_v2 = true;
+        cfg.gwpd_questions_v2 = true;
     }
     save(home);
-    println!("📝 Applied updated NYPD application questions for home guild ({home})");
+    println!("📝 Applied updated GWPD application questions for home guild ({home})");
 }
 
-/// Backfill the expanded 14-question NYPD set. Runs once, guarded by
-/// nypdQuestionsV3.
-pub fn migrate_nypd_questions_v3() {
+/// Backfill the expanded 14-question police set. Runs once, guarded by
+/// gwpd_questions_v3.
+pub fn migrate_gwpd_questions_v3() {
     let Some(home) = GUILD_ID.as_ref() else { return };
     {
         let mut map = lock();
         let Some(cfg) = map.get_mut(home) else { return };
-        if cfg.nypd_questions_v3 || cfg.apps.is_empty() {
+        if cfg.gwpd_questions_v3 || cfg.apps.is_empty() {
             return;
         }
-        if let Some(app) = cfg.apps.get_mut("nypd") {
-            app.questions = nypd_questions_v3();
+        if let Some(app) = police_app(cfg) {
+            app.questions = gwpd_questions_v3();
         }
-        cfg.nypd_questions_v3 = true;
+        cfg.gwpd_questions_v3 = true;
     }
     save(home);
-    println!("📝 Applied expanded NYPD application questions for home guild ({home})");
+    println!("📝 Applied expanded GWPD application questions for home guild ({home})");
 }
 
-/// NYPD Scenario 1 as first worded, and as it reads now.
-const NYPD_SCENARIO1_OLD: &str = "Scenario 1: Two gangsters are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?";
-const NYPD_SCENARIO1_NEW: &str = "Scenario 1: Two gang members are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?";
+/// Police Scenario 1 as first worded, and as it reads now.
+const GWPD_SCENARIO1_OLD: &str = "Scenario 1: Two gangsters are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?";
+const GWPD_SCENARIO1_NEW: &str = "Scenario 1: Two gang members are verbally fighting and are pushing towards becoming violent, what are your steps to de-escalate the situation?";
 
 /// Swap the old Scenario 1 wording for the new one. Only an exact match is
 /// changed, so a question an admin has since rewritten is left alone.
-fn reword_nypd_scenario1(questions: &mut [String]) {
-    for q in questions.iter_mut().filter(|q| *q == NYPD_SCENARIO1_OLD) {
-        *q = NYPD_SCENARIO1_NEW.to_string();
+fn reword_scenario1(questions: &mut [String]) {
+    for q in questions.iter_mut().filter(|q| *q == GWPD_SCENARIO1_OLD) {
+        *q = GWPD_SCENARIO1_NEW.to_string();
     }
 }
 
-/// Reword NYPD Scenario 1 from "Two gangsters" to "Two gang members" on a
+/// Reword police Scenario 1 from "Two gangsters" to "Two gang members" on a
 /// guild that already has the v3 questions saved, since changing the v3 list
-/// only reaches fresh installs. Runs once, guarded by nypdGangMembersV1.
-pub fn migrate_nypd_gang_members_wording() {
+/// only reaches fresh installs. Runs once, guarded by gwpd_gang_members_v1.
+pub fn migrate_gwpd_gang_members_wording() {
     let Some(home) = GUILD_ID.as_ref() else { return };
     {
         let mut map = lock();
         let Some(cfg) = map.get_mut(home) else { return };
-        if cfg.nypd_gang_members_v1 || cfg.apps.is_empty() {
+        if cfg.gwpd_gang_members_v1 || cfg.apps.is_empty() {
             return;
         }
-        if let Some(app) = cfg.apps.get_mut("nypd") {
-            reword_nypd_scenario1(&mut app.questions);
+        if let Some(app) = police_app(cfg) {
+            reword_scenario1(&mut app.questions);
         }
-        cfg.nypd_gang_members_v1 = true;
+        cfg.gwpd_gang_members_v1 = true;
     }
     save(home);
-    println!("📝 Reworded NYPD Scenario 1 (\"Two gang members\") for home guild ({home})");
+    println!("📝 Reworded GWPD Scenario 1 (\"Two gang members\") for home guild ({home})");
 }
 
-/// Correct the NYPD review channel on an already-seeded home guild.
+/// Correct the police review channel on an already-seeded home guild.
 ///
 /// The original seed pointed at 1528754488339464192; submitted police
 /// applications are meant to land in 1537589602456699031. Questions, roles and
 /// panel channel are untouched - this moves the review destination only.
 ///
-/// Runs once, guarded by nypdReviewV2, and only rewrites the channel if it is
+/// Runs once, guarded by gwpd_review_v2, and only rewrites the channel if it is
 /// still the old seeded value, so a channel an admin has since set with
 /// `/applications setreview` is left alone.
-pub fn migrate_nypd_review_channel_v2() {
+pub fn migrate_gwpd_review_channel_v2() {
     let Some(home) = GUILD_ID.as_ref() else { return };
     {
         let mut map = lock();
         let Some(cfg) = map.get_mut(home) else { return };
-        if cfg.nypd_review_v2 || cfg.apps.is_empty() {
+        if cfg.gwpd_review_v2 || cfg.apps.is_empty() {
             return;
         }
-        if let Some(app) = cfg.apps.get_mut("nypd") {
+        if let Some(app) = police_app(cfg) {
             if app.review_channel_id == "1528754488339464192" {
                 app.review_channel_id = "1537589602456699031".to_string();
             }
         }
-        cfg.nypd_review_v2 = true;
+        cfg.gwpd_review_v2 = true;
     }
     save(home);
-    println!("📝 Pointed NYPD application reviews at the police review channel for home guild ({home})");
+    println!("📝 Pointed GWPD application reviews at the police review channel for home guild ({home})");
+}
+
+/// Rename the "nypd" application to "gwpd" in place, keeping its spot in the
+/// panel order, with NYPD → GWPD in its label and questions. False when there
+/// is no "nypd" to rename, or a "gwpd" already exists that it would collide with.
+fn rename_police_app(apps: &mut IndexMap<String, Application>) -> bool {
+    if !apps.contains_key(LEGACY_POLICE_KEY) || apps.contains_key(POLICE_KEY) {
+        return false;
+    }
+    *apps = std::mem::take(apps)
+        .into_iter()
+        .map(|(k, mut a)| {
+            if k != LEGACY_POLICE_KEY {
+                return (k, a);
+            }
+            a.key = POLICE_KEY.to_string();
+            a.label = a.label.replace("NYPD", "GWPD");
+            for q in &mut a.questions {
+                *q = q.replace("NYPD", "GWPD");
+            }
+            (POLICE_KEY.to_string(), a)
+        })
+        .collect();
+    true
+}
+
+/// The department is the GWPD now, not the NYPD. Every server with a saved
+/// "nypd" application has it renamed (see [`rename_police_app`]); its panel
+/// is re-rendered with the new name on the same boot. Runs once per server,
+/// guarded by gwpdRenameV1.
+pub fn migrate_nypd_to_gwpd() {
+    let renamed: Vec<String> = {
+        let mut map = lock();
+        map.iter_mut()
+            .filter(|(_, cfg)| !cfg.gwpd_rename_v1)
+            .filter_map(|(gid, cfg)| {
+                if !rename_police_app(&mut cfg.apps) {
+                    return None;
+                }
+                cfg.gwpd_rename_v1 = true;
+                Some(gid.clone())
+            })
+            .collect()
+    };
+    for gid in renamed {
+        save(&gid);
+        println!("📝 Renamed the NYPD application to GWPD for {gid}");
+    }
+}
+
+/// The GWPD's own server: its application panel, and the channel submitted
+/// GWPD applications go to for review. Nothing else is set up there.
+///
+/// Tied to this server's id rather than GUILD_ID, like the wasteland seeds.
+pub const GWPD_GUILD: &str = "1561145119384535062";
+const GWPD_PANEL: &str = "1561145643370815608";
+const GWPD_REVIEW: &str = "1561145645295865997";
+
+/// Runs once, guarded by gwpdSeedV1. The application takes the current police
+/// questions and requirements (age 14, a week in the server). If one is already
+/// set up there it keeps its questions, roles and requirements and only has
+/// the two channels pointed here.
+///
+/// It also marks the home-guild police backfills as done for this server, so
+/// that if GUILD_ID were ever pointed here they couldn't swap in old questions
+/// or channels from the other server.
+pub fn migrate_gwpd_guild() {
+    {
+        let mut map = lock();
+        let cfg = map.entry(GWPD_GUILD.to_string()).or_default();
+        if cfg.gwpd_seed_v1 {
+            return;
+        }
+        rename_police_app(&mut cfg.apps);
+        let app = cfg.apps.entry(POLICE_KEY.to_string()).or_insert_with(|| Application {
+            key: POLICE_KEY.into(),
+            label: "GWPD".into(),
+            emoji: "👮".into(),
+            questions: gwpd_questions_v3(),
+            min_age: Some(14),
+            min_member_time: Some("1 week".into()),
+            ..Default::default()
+        });
+        if app.panel_channel_id != GWPD_PANEL {
+            app.panel_channel_id = GWPD_PANEL.into();
+            app.panel_message_id.clear();
+        }
+        app.review_channel_id = GWPD_REVIEW.into();
+        cfg.gwpd_seed_v1 = true;
+        cfg.gwpd_rename_v1 = true;
+        cfg.req_defaults_v1 = true;
+        cfg.gwpd_questions_v2 = true;
+        cfg.gwpd_questions_v3 = true;
+        cfg.gwpd_gang_members_v1 = true;
+        cfg.gwpd_review_v2 = true;
+    }
+    save(GWPD_GUILD);
+    println!("📝 Set up the GWPD application panel and review channel for {GWPD_GUILD}");
 }
 
 /// The wasteland factions, for one specific server.
@@ -745,16 +883,75 @@ mod tests {
     /// seeded; everything else, including an admin's own edit, is untouched.
     #[test]
     fn scenario1_is_reworded_only_where_unchanged() {
-        let mut qs = vec!["Time Zone:".to_string(), NYPD_SCENARIO1_OLD.to_string(), "Scenario 1: my own wording".to_string()];
-        reword_nypd_scenario1(&mut qs);
-        assert_eq!(qs, vec!["Time Zone:".to_string(), NYPD_SCENARIO1_NEW.to_string(), "Scenario 1: my own wording".to_string()]);
+        let mut qs = vec!["Time Zone:".to_string(), GWPD_SCENARIO1_OLD.to_string(), "Scenario 1: my own wording".to_string()];
+        reword_scenario1(&mut qs);
+        assert_eq!(qs, vec!["Time Zone:".to_string(), GWPD_SCENARIO1_NEW.to_string(), "Scenario 1: my own wording".to_string()]);
     }
 
     /// Fresh installs get the new wording straight from the v3 list.
     #[test]
     fn the_v3_list_already_has_the_new_wording() {
-        let qs = nypd_questions_v3();
-        assert!(qs.iter().any(|q| q == NYPD_SCENARIO1_NEW));
+        let qs = gwpd_questions_v3();
+        assert!(qs.iter().any(|q| q == GWPD_SCENARIO1_NEW));
         assert!(!qs.iter().any(|q| q.contains("gangsters")));
+    }
+
+    fn app(key: &str, label: &str) -> Application {
+        Application { key: key.into(), label: label.into(), questions: vec!["Why do you want to join the NYPD?".into()], ..Default::default() }
+    }
+
+    /// The rename keeps the application where it was in the panel order and
+    /// rewords it, leaving the others alone.
+    #[test]
+    fn nypd_is_renamed_to_gwpd_in_place() {
+        let mut apps: IndexMap<String, Application> = IndexMap::new();
+        apps.insert("staff".into(), app("staff", "Staff"));
+        apps.insert("nypd".into(), app("nypd", "NYPD"));
+        apps.insert("gambino".into(), app("gambino", "Gambino"));
+        assert!(rename_police_app(&mut apps));
+        assert_eq!(apps.keys().cloned().collect::<Vec<_>>(), vec!["staff", "gwpd", "gambino"]);
+        let gwpd = &apps["gwpd"];
+        assert_eq!((gwpd.key.as_str(), gwpd.label.as_str()), ("gwpd", "GWPD"));
+        assert_eq!(gwpd.questions, vec!["Why do you want to join the GWPD?".to_string()]);
+        assert_eq!(apps["staff"].questions, vec!["Why do you want to join the NYPD?".to_string()], "only the police app is touched");
+        assert!(!rename_police_app(&mut apps), "nothing left to rename");
+    }
+
+    /// An Accept or Deny button on an application submitted before the rename
+    /// carries the old key, and must still find the application.
+    #[test]
+    fn the_old_police_key_still_finds_the_application() {
+        let gid = "999999999999999981";
+        update_application(gid, POLICE_KEY, |a| a.label = "GWPD".into());
+        assert_eq!(get_application(gid, "nypd").map(|a| a.label), Some("GWPD".to_string()));
+        update_application(gid, "nypd", |a| a.emoji = "👮".into());
+        assert_eq!(get_application(gid, POLICE_KEY).map(|a| a.emoji), Some("👮".to_string()), "an update by the old key lands on the renamed app");
+        assert!(get_application(gid, "nypd").is_some());
+        assert_eq!(get_applications(gid).len(), 1, "and doesn't create a second one");
+        lock().remove(gid);
+        db::delete("applications", gid);
+    }
+
+    /// The police flags must keep their saved names, or a server that already
+    /// ran those backfills would run them again and lose its questions.
+    #[test]
+    fn police_flags_keep_their_saved_names() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"nypdQuestionsV2":true,"nypdQuestionsV3":true,"nypdReviewV2":true,"nypdGangMembersV1":true}"#).unwrap();
+        assert!(cfg.gwpd_questions_v2 && cfg.gwpd_questions_v3 && cfg.gwpd_review_v2 && cfg.gwpd_gang_members_v1);
+    }
+
+    /// The new server gets exactly the GWPD application, with the requested
+    /// panel and review channels.
+    #[test]
+    fn the_gwpd_server_gets_only_the_gwpd_application() {
+        migrate_gwpd_guild();
+        let apps = get_applications(GWPD_GUILD);
+        assert_eq!(apps.keys().cloned().collect::<Vec<_>>(), vec![POLICE_KEY.to_string()]);
+        let gwpd = &apps[POLICE_KEY];
+        assert_eq!(gwpd.label, "GWPD");
+        assert_eq!(gwpd.panel_channel_id, "1561145643370815608");
+        assert_eq!(gwpd.review_channel_id, "1561145645295865997");
+        assert_eq!(gwpd.questions, gwpd_questions_v3());
+        assert!(!gwpd.questions.iter().any(|q| q.contains("NYPD")));
     }
 }

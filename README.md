@@ -406,7 +406,7 @@ To put every application on one panel, run
 `/applications setpanelchannel key:all channel:#your-channel`. It moves them
 all, deletes the panels left behind in the channels they came from, and posts
 the combined one. So the two family applications (Gambino + Colombo, which share
-a channel) appear as a single panel with two buttons, while Staff and NYPD
+a channel) appear as a single panel with two buttons, while Staff and GWPD
 each get their own single-button panel. `/applications panel key:<key>`
 posts/refreshes the whole panel for that application's channel.
 
@@ -439,7 +439,7 @@ posts/refreshes the whole panel for that application's channel.
    duration, when they joined the guild, and when they submitted). Staff
    get four buttons: **Accept**, **Deny**, **Accept with reason**, and
    **Deny with reason**. The applicant gets a confirmation in their DMs.
-3. **Accept** (staff, or on `nypd`/`gambino`/`colombo` anyone already
+3. **Accept** (staff, or on `gwpd`/`gambino`/`colombo` anyone already
    holding one of that app's accepted roles) grants the application's
    configured roles to the applicant right away, marks the embed green,
    retires the buttons, and DMs the applicant. **Accept with reason** does
@@ -457,7 +457,7 @@ posts/refreshes the whole panel for that application's channel.
    **Deny with reason** opens a short modal for an optional reason first,
    then DMs the applicant with it.
 
-**Peer review:** on the police and crime-family applications (`nypd`,
+**Peer review:** on the police and crime-family applications (`gwpd`,
 `gambino`, `colombo`), existing members - anyone already holding one of
 that app's own accepted roles, not just staff with the mod role - can
 review new applications for that same app. Staff applications still
@@ -484,7 +484,28 @@ are posted once the bot is up, with zero commands required:
 | `gambino` | family panel | Gambino reviews | 3 roles | 7 |
 | `colombo` | family panel (same as Gambino) | Colombo reviews | 3 roles | 7 |
 | `staff` | staff panel | staff reviews | 1 role | 6 |
-| `nypd` | police panel | NYPD reviews | 3 roles | 14 |
+| `gwpd` | police panel | GWPD reviews | 3 roles | 14 |
+
+The police application was `nypd` (NYPD) until the department became the
+GWPD. A saved `nypd` application is renamed to `gwpd` on boot, keeping its
+place, questions, roles and channels, and buttons on applications submitted
+before the rename keep working.
+
+**The GWPD server** (`1561145119384535062`) is set up by its own id, not by
+`GUILD_ID`, and gets only the GWPD application and a ticket panel:
+
+| What | Channel |
+|------|---------|
+| GWPD application panel | `1561145643370815608` |
+| Submitted GWPD applications (review) | `1561145645295865997` |
+| Ticket panel | `1561145649196572752` |
+
+Its ticket panel has Report Player, Staff Report, Police Report (the
+wasteland panel's "Faction Report"), General Support and Ban Appeal. Staff
+reports are given only to role `1561441031738761236`, not the mod role; the
+other types fall back to the server's mod role. No ticket log channel or
+category is set there yet, and the GWPD application grants no roles on
+accept until roles are added.
 
 Because Gambino and Colombo share the family panel channel, they post as a
 single combined panel with two buttons. On boot the bot reconciles any
@@ -495,7 +516,7 @@ itself up.
 Each panel's description is a **REQUIREMENTS** block whose age and
 member-time minimums are per-application (`app.minAge` / `app.minMemberTime`,
 display-only): Staff is age 15 / member 2 weeks, the crime families are age
-14 / member 3 days, and NYPD is age 14 / member 1 week. These are seeded on
+14 / member 3 days, and GWPD is age 14 / member 1 week. These are seeded on
 a fresh install and backfilled once onto an already-seeded home guild.
 
 As with tickets, this seed runs once, only for that one guild, and never

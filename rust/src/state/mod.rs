@@ -16,6 +16,10 @@ pub mod warnings;
 pub fn run_migrations() {
     guild_settings::migrate_env_to_home_guild();
     anti_ping::migrate_env_to_home_guild();
+    // The GWPD server first: it is set up by its own id, and going first means
+    // a GUILD_ID ever pointed at it finds it configured and leaves it alone.
+    tickets::migrate_gwpd_tickets();
+    applications::migrate_gwpd_guild();
     tickets::migrate_tickets_to_home_guild();
     tickets::migrate_ticket_category();
     tickets::migrate_wasteland_tickets();
@@ -23,10 +27,11 @@ pub fn run_migrations() {
     applications::migrate_application_requirements();
     applications::migrate_staff_questions_v2();
     applications::migrate_family_questions_v2();
-    applications::migrate_nypd_questions_v2();
-    applications::migrate_nypd_questions_v3();
-    applications::migrate_nypd_gang_members_wording();
-    applications::migrate_nypd_review_channel_v2();
+    applications::migrate_gwpd_questions_v2();
+    applications::migrate_gwpd_questions_v3();
+    applications::migrate_gwpd_gang_members_wording();
+    applications::migrate_gwpd_review_channel_v2();
+    applications::migrate_nypd_to_gwpd();
     applications::migrate_unseed_wasteland_from_wrong_guild();
     applications::migrate_wasteland_applications();
     applications::migrate_wasteland_roles_v2();
