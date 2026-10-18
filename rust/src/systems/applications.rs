@@ -319,7 +319,27 @@ pub async fn retire_panels_outside(ctx: &Context, guild_id: GuildId, keep: &str)
 /// Post each channel's panel if it isn't already up. For a shared channel this
 /// also reconciles leftover separate/duplicate panels down to a single message.
 pub async fn ensure_application_panels(ctx: &Context, guild_id: GuildId) {
-    for (channel_id, apps) in apps_by_panel_channel(&guild_id.to_string()) {
+    // Panels left behind when an application moved channel come down first,
+    // so the old channel doesn't keep a second Apply button. One that couldn't
+    // be checked just now is kept and tried again on the next boot.
+    let gid = guild_id.to_string();
+    let retired = crate::state::applications::retired_panels(&gid);
+    if !retired.is_empty() {
+        let mut keep = Vec::new();
+        for p in retired {
+            let (Ok(c), Ok(m)) = (p.channel_id.parse::<u64>(), p.message_id.parse::<u64>()) else { continue };
+            match ChannelId::new(c).delete_message(&ctx.http, MessageId::new(m)).await {
+                Ok(()) => println!("🧹 Took down a moved application panel in #{c}"),
+                Err(e) if crate::common::embeds::is_unknown_message(&e) => {}
+                Err(e) => {
+                    eprintln!("⚠️ couldn't take down the old application panel {m} in {c} ({e}); trying again next boot");
+                    keep.push(p);
+                }
+            }
+        }
+        crate::state::applications::set_retired_panels(&gid, keep);
+    }
+    for (channel_id, apps) in apps_by_panel_channel(&gid) {
         let Ok(raw) = channel_id.parse::<u64>() else { continue };
         let channel = ChannelId::new(raw);
 

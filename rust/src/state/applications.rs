@@ -46,6 +46,14 @@ pub struct Application {
     pub closed: bool,
 }
 
+/// A posted panel message that no longer belongs where it is.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RetiredPanel {
+    pub channel_id: String,
+    pub message_id: String,
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
@@ -71,6 +79,12 @@ pub struct AppConfig {
     pub gwpd_rename_v1: bool,
     /// Guards the one-time GWPD application seed for the GWPD server.
     pub gwpd_seed_v1: bool,
+    /// Guards the one-time move of the GWPD panel to its own channel.
+    pub gwpd_panel_v2: bool,
+    /// Panels left behind when an application moved channel, deleted on the
+    /// next boot (see ensure_application_panels).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retired_panels: Vec<RetiredPanel>,
     /// Guards the one-time wasteland-faction seed below.
     pub wasteland_seed_v1: bool,
     /// Guards the one-time addition of the second set of faction roles.
@@ -117,6 +131,24 @@ fn save(guild_id: &str) -> bool {
 
 pub fn get_applications(guild_id: &str) -> IndexMap<String, Application> {
     lock().get(guild_id).map(|c| c.apps.clone()).unwrap_or_default()
+}
+
+/// Panels waiting to be taken down in this guild.
+pub fn retired_panels(guild_id: &str) -> Vec<RetiredPanel> {
+    lock().get(guild_id).map(|c| c.retired_panels.clone()).unwrap_or_default()
+}
+
+/// Replace the list of panels still to take down (what's left after a pass).
+pub fn set_retired_panels(guild_id: &str, panels: Vec<RetiredPanel>) {
+    {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(guild_id) else { return };
+        if cfg.retired_panels == panels {
+            return;
+        }
+        cfg.retired_panels = panels;
+    }
+    save(guild_id);
 }
 
 pub fn get_application(guild_id: &str, key: &str) -> Option<Application> {
@@ -516,7 +548,11 @@ pub fn migrate_nypd_to_gwpd() {
 ///
 /// Tied to this server's id rather than GUILD_ID, like the wasteland seeds.
 pub const GWPD_GUILD: &str = "1561145119384535062";
-const GWPD_PANEL: &str = "1561145643370815608";
+/// The panel shares the review channel: applicants apply where the
+/// applications land.
+const GWPD_PANEL: &str = "1561145645295865997";
+/// Where the panel was first put, before it moved to GWPD_PANEL.
+const GWPD_OLD_PANEL: &str = "1561145643370815608";
 const GWPD_REVIEW: &str = "1561145645295865997";
 
 /// Runs once, guarded by gwpdSeedV1. The application takes the current police
@@ -550,6 +586,8 @@ pub fn migrate_gwpd_guild() {
         }
         app.review_channel_id = GWPD_REVIEW.into();
         cfg.gwpd_seed_v1 = true;
+        // Seeded straight into the current channel, so there's nothing to move.
+        cfg.gwpd_panel_v2 = true;
         cfg.gwpd_rename_v1 = true;
         cfg.req_defaults_v1 = true;
         cfg.gwpd_questions_v2 = true;
@@ -559,6 +597,41 @@ pub fn migrate_gwpd_guild() {
     }
     save(GWPD_GUILD);
     println!("📝 Set up the GWPD application panel and review channel for {GWPD_GUILD}");
+}
+
+/// Point the GWPD panel at its new channel if it's still in the old one,
+/// queueing any panel already posted there to be taken down. True if it moved.
+fn move_gwpd_panel(cfg: &mut AppConfig) -> bool {
+    let Some(app) = cfg.apps.get_mut(POLICE_KEY) else { return false };
+    if app.panel_channel_id != GWPD_OLD_PANEL {
+        return false;
+    }
+    let message_id = std::mem::take(&mut app.panel_message_id);
+    app.panel_channel_id = GWPD_PANEL.into();
+    if !message_id.is_empty() {
+        cfg.retired_panels.push(RetiredPanel { channel_id: GWPD_OLD_PANEL.into(), message_id });
+    }
+    true
+}
+
+/// Move the GWPD panel from 1561145643370815608 to 1561145645295865997 on a
+/// server that was already set up. The new panel posts on the same boot and
+/// the old one is deleted. Runs once, guarded by gwpdPanelV2, and leaves a
+/// panel someone has since put somewhere else alone.
+pub fn migrate_gwpd_panel_v2() {
+    let moved = {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(GWPD_GUILD) else { return };
+        if cfg.gwpd_panel_v2 {
+            return;
+        }
+        cfg.gwpd_panel_v2 = true;
+        move_gwpd_panel(cfg)
+    };
+    save(GWPD_GUILD);
+    if moved {
+        println!("📝 Moved the GWPD application panel to {GWPD_PANEL} for {GWPD_GUILD}");
+    }
 }
 
 /// The wasteland factions, for one specific server.
@@ -949,9 +1022,30 @@ mod tests {
         assert_eq!(apps.keys().cloned().collect::<Vec<_>>(), vec![POLICE_KEY.to_string()]);
         let gwpd = &apps[POLICE_KEY];
         assert_eq!(gwpd.label, "GWPD");
-        assert_eq!(gwpd.panel_channel_id, "1561145643370815608");
+        assert_eq!(gwpd.panel_channel_id, "1561145645295865997");
         assert_eq!(gwpd.review_channel_id, "1561145645295865997");
         assert_eq!(gwpd.questions, gwpd_questions_v3());
         assert!(!gwpd.questions.iter().any(|q| q.contains("NYPD")));
+    }
+
+    /// A server set up before the move has its panel pointed at the new
+    /// channel and the posted one queued for deletion; one already moved, or
+    /// put somewhere else on purpose, is left alone.
+    #[test]
+    fn the_gwpd_panel_moves_and_the_old_one_is_retired() {
+        let mut cfg = AppConfig::default();
+        cfg.apps.insert(
+            POLICE_KEY.into(),
+            Application { key: POLICE_KEY.into(), panel_channel_id: GWPD_OLD_PANEL.into(), panel_message_id: "42".into(), ..Default::default() },
+        );
+        assert!(move_gwpd_panel(&mut cfg));
+        let app = &cfg.apps[POLICE_KEY];
+        assert_eq!(app.panel_channel_id, "1561145645295865997");
+        assert!(app.panel_message_id.is_empty(), "a fresh panel posts in the new channel");
+        assert_eq!(cfg.retired_panels, vec![RetiredPanel { channel_id: "1561145643370815608".into(), message_id: "42".into() }]);
+        assert!(!move_gwpd_panel(&mut cfg), "already moved");
+
+        cfg.apps.get_mut(POLICE_KEY).unwrap().panel_channel_id = "777".into();
+        assert!(!move_gwpd_panel(&mut cfg), "a channel someone chose since is kept");
     }
 }

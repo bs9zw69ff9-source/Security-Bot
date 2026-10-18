@@ -496,9 +496,13 @@ before the rename keep working.
 
 | What | Channel |
 |------|---------|
-| GWPD application panel | `1561145643370815608` |
+| GWPD application panel | `1561145645295865997` |
 | Submitted GWPD applications (review) | `1561145645295865997` |
 | Ticket panel | `1561145649196572752` |
+
+The panel and the applications share one channel. (The panel was first put
+in `1561145643370815608`; a server set up before the move has it moved over
+and the old panel deleted on boot.)
 
 Its ticket panel has Report Player, Staff Report, Police Report (the
 wasteland panel's "Faction Report"), General Support and Ban Appeal. Staff

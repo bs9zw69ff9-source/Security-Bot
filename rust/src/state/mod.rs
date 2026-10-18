@@ -20,6 +20,7 @@ pub fn run_migrations() {
     // a GUILD_ID ever pointed at it finds it configured and leaves it alone.
     tickets::migrate_gwpd_tickets();
     applications::migrate_gwpd_guild();
+    applications::migrate_gwpd_panel_v2();
     tickets::migrate_tickets_to_home_guild();
     tickets::migrate_ticket_category();
     tickets::migrate_wasteland_tickets();
