@@ -506,8 +506,17 @@ and the old panel deleted on boot.)
 
 Its ticket panel has Report Player, Staff Report, Police Report (the
 wasteland panel's "Faction Report"), General Support and Ban Appeal. Staff
-reports are given only to role `1561441031738761236`, not the mod role; the
-other types fall back to the server's mod role. No ticket log channel or
+reports are given only to role `1561441031738761236`, not the mod role, and
+are confidential: the channel name and topic don't name the reporter, the
+security log leaves out who opened one and why it closed, and message logging
+doesn't copy what's said in it. The other types fall back to the server's mod
+role.
+
+Because the GWPD panel shares the review channel, applicants can see the
+review buttons there. In a channel like that only the bot owner, the server
+owner, Administrators, staff (the mod role) and holders of the application's
+accepted roles can Accept or Deny, and nobody can review their own
+application anywhere. No ticket log channel or
 category is set there yet, and the GWPD application grants no roles on
 accept until roles are added.
 

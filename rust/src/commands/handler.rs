@@ -1713,6 +1713,8 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                         type_category
                     };
                     let panel_channel_id = existing.as_ref().map(|t| t.panel_channel_id.clone()).unwrap_or_default();
+                    // Editing a type keeps it out of the shared logs if it was.
+                    let confidential = existing.as_ref().is_some_and(|t| t.confidential);
                     let saved = update_ticket_config(&gid, |c| {
                         c.types.retain(|t| t.key != key);
                         c.types.push(TicketType {
@@ -1724,6 +1726,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                             category_id: category_id.clone(),
                             panel_channel_id: panel_channel_id.clone(),
                             panel_message_id: String::new(),
+                            confidential,
                         });
                     });
                     refresh_ticket_panel(ctx, guild_id).await;

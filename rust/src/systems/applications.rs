@@ -1018,12 +1018,17 @@ async fn repaint_review(
 
 /// Resolve the reviewer + app, shared by all four buttons.
 ///
-/// There is no permission check here on purpose: whoever can see the review
-/// channel can review. The channel's own permissions are the gate, which is
-/// where it belongs, since that is the thing a server actually configures. The
-/// role check that used to live here also meant a reviewer had to be resolvable
-/// through the cache or an HTTP fetch, and when that came back empty the button
-/// just did nothing at all with no message.
+/// Normally there is no permission check here on purpose: whoever can see the
+/// review channel can review. The channel's own permissions are the gate,
+/// which is where it belongs, since that is the thing a server actually
+/// configures. Two exceptions:
+///
+/// - Nobody reviews their own application.
+/// - When the review channel also holds an Apply panel, applicants can see it,
+///   so seeing it no longer makes someone a reviewer. There the buttons are for
+///   the bot owner, the server owner, Administrators, staff (the mod role) and
+///   holders of the application's accepted roles. The roles come from the
+///   member record the click carries, so no lookup can come back empty.
 async fn review_guard(
     ctx: &Context,
     i: &ComponentInteraction,
@@ -1035,7 +1040,35 @@ async fn review_guard(
         reply_ephemeral(ctx, i, GONE).await;
         return None;
     };
+    if user_id == i.user.id.to_string() {
+        reply_ephemeral(ctx, i, "You can't review your own application.").await;
+        return None;
+    }
+    let gid = guild_id.to_string();
+    let shared_with_panel = get_applications(&gid).values().any(|a| a.panel_channel_id == i.channel_id.to_string());
+    if shared_with_panel && !may_review_in_public(ctx, guild_id, i, &app) {
+        reply_ephemeral(ctx, i, "Only staff, an admin or a member of this application's roles can review applications here.").await;
+        return None;
+    }
     Some((guild_id, key, user_id, app))
+}
+
+/// Who may press the review buttons in a channel applicants can also see.
+fn may_review_in_public(ctx: &Context, guild_id: GuildId, i: &ComponentInteraction, app: &Application) -> bool {
+    let owner_id = ctx.cache.guild(guild_id).map(|g| g.owner_id);
+    if crate::common::permissions::is_owner(i.user.id) || owner_id == Some(i.user.id) {
+        return true;
+    }
+    let Some(member) = i.member.as_ref() else { return false };
+    if member.permissions.is_some_and(|p| p.administrator()) {
+        return true;
+    }
+    if let Some(owner) = owner_id {
+        if crate::common::permissions::is_mod(member, owner) {
+            return true;
+        }
+    }
+    member.roles.iter().any(|r| app.accepted_role_ids.contains(&r.to_string()))
 }
 
 pub async fn handle_app_accept(ctx: &Context, i: &ComponentInteraction) {

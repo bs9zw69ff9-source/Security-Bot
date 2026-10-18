@@ -481,6 +481,14 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
     // The type's own support roles, the way an Appy ticket template works, so
     // one server can send reports to one team and partnerships to another.
     // Falls back to the server mod role when the type has none of its own.
+    // The bot itself, explicitly: if it isn't an Administrator, hiding the
+    // channel from @everyone would hide it from the bot too, and the welcome,
+    // the ping and the buttons would all silently fail to post.
+    overwrites.push(PermissionOverwrite {
+        allow: Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES | Permissions::READ_MESSAGE_HISTORY | Permissions::EMBED_LINKS,
+        deny: Permissions::empty(),
+        kind: PermissionOverwriteType::Member(ctx.cache.current_user().id),
+    });
     let support = t.support_roles(&g.mod_role_id);
     for role in &support {
         let Ok(rid) = role.parse::<u64>() else { continue };
@@ -503,10 +511,21 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         .take(20)
         .collect();
     let safe_name = if safe_name.is_empty() { "user".to_string() } else { safe_name };
-    let channel_name = truncate(&format!("{}-{safe_name}", t.key.replace('_', "-")), 90);
-    let topic = format!("{} ticket for {} ({})", t.label, i.user.tag(), i.user.id);
-
-    let audit_reason = format!("Ticket opened by {}", i.user.tag());
+    // A confidential ticket's name, topic and audit entry say nothing about
+    // who opened it: channel names show up in channel logs and the sidebar.
+    let (channel_name, topic, audit_reason) = if t.confidential {
+        (
+            truncate(&format!("{}-{:04}", t.key.replace('_', "-"), i.id.get() % 10_000), 90),
+            format!("{} ticket", t.label),
+            "Ticket opened".to_string(),
+        )
+    } else {
+        (
+            truncate(&format!("{}-{safe_name}", t.key.replace('_', "-")), 90),
+            format!("{} ticket for {} ({})", t.label, i.user.tag(), i.user.id),
+            format!("Ticket opened by {}", i.user.tag()),
+        )
+    };
     let mut builder = CreateChannel::new(channel_name.clone())
         .kind(ChannelType::Text)
         .permissions(overwrites.clone())
@@ -599,7 +618,11 @@ pub async fn create_ticket_channel(ctx: &Context, i: &ModalInteraction, key: &st
         ctx,
         guild_id,
         "Ticket Opened",
-        &format!("<@{}> opened a **{}** ticket over in <#{}>.", i.user.id, t.label, ticket_channel.id),
+        &if t.confidential {
+            format!("A **{}** ticket was opened in <#{}>.", t.label, ticket_channel.id)
+        } else {
+            format!("<@{}> opened a **{}** ticket over in <#{}>.", i.user.id, t.label, ticket_channel.id)
+        },
         colors::INFO,
     )
     .await;
@@ -932,13 +955,19 @@ async fn close_ticket(
         ctx,
         guild_id,
         "Ticket Closed",
-        &format!(
-            "<@{}> closed the **{label}** ticket that <@{}> opened (<#{}>).{}",
-            closer.id,
-            ticket.opener_id,
-            channel_id,
-            reason.map(|r| format!("\n**Reason:** {}", truncate(r, 1000))).unwrap_or_default()
-        ),
+        &if t.as_ref().is_some_and(|t| t.confidential) {
+            // Not who opened it, and not why it closed: the security log is
+            // read by staff a confidential report may be about.
+            format!("<@{}> closed a **{label}** ticket.", closer.id)
+        } else {
+            format!(
+                "<@{}> closed the **{label}** ticket that <@{}> opened (<#{}>).{}",
+                closer.id,
+                ticket.opener_id,
+                channel_id,
+                reason.map(|r| format!("\n**Reason:** {}", truncate(r, 1000))).unwrap_or_default()
+            )
+        },
         colors::NEUTRAL,
     )
     .await;

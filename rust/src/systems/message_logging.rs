@@ -33,6 +33,11 @@ pub fn on_message(ctx: &Context, msg: &Message) {
     if msg.author.id == ctx.cache.current_user().id || is_log_channel(guild_id, msg.channel_id) {
         return;
     }
+    // A confidential ticket (a report about staff) isn't kept, or an edit or
+    // delete in it would land in a log those staff can read.
+    if crate::state::tickets::is_confidential_ticket_channel(&guild_id.to_string(), &msg.channel_id.to_string()) {
+        return;
+    }
     message_store::store(&StoredMessage::from_message(msg, guild_id.get()));
 }
 
@@ -52,6 +57,9 @@ fn who_of(m: &StoredMessage) -> Who {
 fn log_channel(ctx: &Context, guild_id: GuildId, source: ChannelId, key: &str) -> Option<ChannelId> {
     if is_log_channel(guild_id, source) {
         return None; // don't log the log channels themselves
+    }
+    if crate::state::tickets::is_confidential_ticket_channel(&guild_id.to_string(), &source.to_string()) {
+        return None; // nor a confidential ticket (see on_message)
     }
     deliverable_log_channel(ctx, guild_id, key)
 }

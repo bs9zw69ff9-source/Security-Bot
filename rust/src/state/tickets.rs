@@ -8,6 +8,10 @@ use std::sync::Mutex;
 use crate::common::config::GUILD_ID;
 use crate::common::db;
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// One ticket type, modelled on Appy's ticket template: the type carries its
 /// own support roles, category and log channel rather than the whole server
 /// sharing one set.
@@ -37,6 +41,12 @@ pub struct TicketType {
     /// Message id of the panel this type is on, tracked per panel channel.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub panel_message_id: String,
+    /// For reports about staff. Nothing about these tickets reaches the shared
+    /// logs that wider staff can read: the channel name and topic don't carry
+    /// the opener, the security log leaves out who opened it and the close
+    /// reason, and message logging doesn't copy what's said in it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confidential: bool,
 }
 
 impl TicketType {
@@ -65,6 +75,8 @@ pub struct TicketConfig {
     pub wasteland_seed_v1: bool,
     /// Guards the one-time ticket seed for the GWPD server.
     pub gwpd_seed_v1: bool,
+    /// Guards marking the GWPD server's staff reports confidential.
+    pub gwpd_confidential_v1: bool,
 }
 
 static CONFIGS: Lazy<Mutex<HashMap<String, TicketConfig>>> = Lazy::new(|| Mutex::new(db::load_all("tickets")));
@@ -156,6 +168,12 @@ pub fn delete_open_ticket(guild_id: &str, channel_id: &str) {
     let snapshot = guild.clone();
     drop(map);
     db::put("ticket_channels", guild_id, &snapshot);
+}
+
+/// Whether this channel is an open ticket of a confidential type.
+pub fn is_confidential_ticket_channel(guild_id: &str, channel_id: &str) -> bool {
+    let Some(ticket) = get_open_ticket(guild_id, channel_id) else { return false };
+    get_ticket_config(guild_id).types.iter().any(|t| t.key == ticket.type_key && t.confidential)
 }
 
 pub fn find_open_ticket_by_user(guild_id: &str, user_id: &str, type_key: &str) -> Option<String> {
@@ -291,6 +309,7 @@ pub fn migrate_gwpd_tickets() {
     ];
     update_ticket_config(guild, |c| {
         c.gwpd_seed_v1 = true;
+        c.gwpd_confidential_v1 = true;
         // The home server's category backfill must never point this server's
         // tickets at the other server's category.
         c.category_seed_v1 = true;
@@ -304,10 +323,14 @@ pub fn migrate_gwpd_tickets() {
         }
         for (key, label, emoji, role) in wanted {
             let roles: Vec<String> = role.map(|r| vec![r.to_string()]).unwrap_or_default();
+            // Restricted to one role means it's about staff: keep it out of
+            // the shared logs too.
+            let confidential = role.is_some();
             match c.types.iter_mut().find(|t| t.key == key) {
                 Some(t) => {
                     if role.is_some() {
                         t.support_role_ids = roles;
+                        t.confidential = true;
                     }
                 }
                 None => c.types.push(TicketType {
@@ -315,6 +338,7 @@ pub fn migrate_gwpd_tickets() {
                     label: label.to_string(),
                     emoji: emoji.to_string(),
                     support_role_ids: roles,
+                    confidential,
                     ..Default::default()
                 }),
             }
@@ -323,9 +347,48 @@ pub fn migrate_gwpd_tickets() {
     println!("🎫 Set up the ticket panel and five ticket types for {guild}");
 }
 
+/// Mark the GWPD server's staff reports confidential where the seed ran
+/// before that existed. Runs once, guarded by gwpdConfidentialV1.
+pub fn migrate_gwpd_staff_reports_confidential() {
+    let guild = crate::state::applications::GWPD_GUILD;
+    let cfg = get_ticket_config(guild);
+    if cfg.gwpd_confidential_v1 || cfg.types.is_empty() {
+        return;
+    }
+    update_ticket_config(guild, |c| {
+        c.gwpd_confidential_v1 = true;
+        if let Some(t) = c.types.iter_mut().find(|t| t.key == "staff_report") {
+            t.confidential = true;
+        }
+    });
+    println!("🎫 Kept staff reports out of the shared logs for {guild}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Message logging asks this before copying anything, so it must tell a
+    /// confidential ticket apart from an ordinary one and from a plain channel.
+    #[test]
+    fn a_confidential_ticket_channel_is_recognised() {
+        let g = "999999999999999971";
+        update_ticket_config(g, |c| {
+            c.types = vec![
+                TicketType { key: "staff_report".into(), confidential: true, ..Default::default() },
+                TicketType { key: "general_support".into(), ..Default::default() },
+            ];
+        });
+        set_open_ticket(g, "1", OpenTicket { type_key: "staff_report".into(), ..Default::default() });
+        set_open_ticket(g, "2", OpenTicket { type_key: "general_support".into(), ..Default::default() });
+        assert!(is_confidential_ticket_channel(g, "1"));
+        assert!(!is_confidential_ticket_channel(g, "2"));
+        assert!(!is_confidential_ticket_channel(g, "3"), "not a ticket at all");
+        delete_open_ticket(g, "1");
+        assert!(!is_confidential_ticket_channel(g, "1"), "closed");
+        delete_open_ticket(g, "2");
+        db::delete("tickets", g);
+    }
 
     /// The GWPD server's panel: the five options in order, Police Report in
     /// place of Faction Report, and staff reports open to just the one role.
@@ -339,6 +402,8 @@ mod tests {
         assert!(!cfg.types.iter().any(|t| t.label.contains("Faction")));
         let staff = cfg.types.iter().find(|t| t.key == "staff_report").unwrap();
         assert_eq!(staff.support_roles("999"), vec!["1561441031738761236".to_string()], "only that role, not the mod role");
+        assert!(staff.confidential, "and kept out of the shared logs");
+        assert!(cfg.types.iter().filter(|t| t.key != "staff_report").all(|t| !t.confidential));
         let police = cfg.types.iter().find(|t| t.key == "police_report").unwrap();
         assert!(police.support_role_ids.is_empty(), "the rest fall back to the mod role");
     }
