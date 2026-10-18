@@ -488,7 +488,6 @@ async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
         .send_message(
             &ctx.http,
             CreateMessage::new()
-                .content("**Application started**\nJust answer the questions below by sending a message here. Take your time, and be honest.")
                 .embed(
                     CreateEmbed::new()
                         .color(APPY_GREEN)
@@ -545,30 +544,26 @@ async fn dm_notice(ctx: &Context, dm: ChannelId, color: u32, title: &str, descri
     let _ = dm
         .send_message(
             &ctx.http,
-            CreateMessage::new()
-                .content(format!("**{title}**\n{description}"))
-                .embed(CreateEmbed::new().color(color).title(title).description(description)),
+            CreateMessage::new().embed(CreateEmbed::new().color(color).title(title).description(description)),
         )
         .await;
 }
 
-/// One interview question.
+/// One interview question, all inside the embed: which application and how
+/// far through, the question itself, then how to answer. Nothing is sent as
+/// plain message text, so nothing reads twice.
 ///
-/// The question is in the message content, not only in the embed. An embed is
-/// the nicer thing to look at, but it is also the thing that can come out
-/// blank: a client that does not render it leaves the applicant staring at an
-/// empty message from the bot with no idea what is being asked, which is
-/// exactly what happened. Plain content always renders, everywhere. The embed
-/// stays for the look and carries the parts that do not change, so nothing is
-/// said twice.
+/// (It used to sit in the message content, in case a client didn't render the
+/// embed; the server owner asked for it in the embed instead.)
 fn question_prompt(label: &str, question: &str, number: usize, total: usize, cancel: CreateActionRow) -> CreateMessage {
     CreateMessage::new()
-        .content(format!("**Question {number} of {total}**\n{question}"))
         .embed(
             CreateEmbed::new()
                 .color(APPY_BLURPLE)
-                .title(format!("{label} Application"))
-                .description("Answer by sending your reply as a message here. Take your time, and be honest."),
+                .title(format!("{label} Application · Question {number} of {total}"))
+                .description(format!(
+                    "**{question}**\n\nAnswer by sending your reply as a message here. Take your time, and be honest."
+                )),
         )
         .components(vec![cancel])
 }
@@ -1200,11 +1195,10 @@ mod tests {
         assert!(worst_case_embed_size(&questions) <= 6000);
     }
 
-    /// The question has to survive a client that shows no embeds. It lives in
-    /// the message content for that reason, and a refactor that moves it back
-    /// into the embed would leave applicants looking at a blank message.
+    /// The whole question prompt lives in the embed, and only once: no plain
+    /// text beside it repeating the question.
     #[test]
-    fn a_question_is_readable_without_the_embed() {
+    fn a_question_is_in_the_embed_and_said_once() {
         let cancel = CreateActionRow::Buttons(vec![CreateButton::new("app_cancel").label("Cancel")]);
         let json = serde_json::to_string(&question_prompt(
             "NCR",
@@ -1215,12 +1209,12 @@ mod tests {
         ))
         .unwrap();
 
-        let content = json.split("\"content\":\"").nth(1).and_then(|s| s.split("\",").next()).unwrap_or("");
-        assert!(content.contains("How old are you"), "the question is not in the content: {content}");
-        assert!(content.contains("1 of 7"), "the progress is not in the content: {content}");
-        // And the embed must not repeat it, or every question reads twice.
+        assert!(!json.contains("\"content\""), "nothing outside the embed: {json}");
         let embed_part = json.split("\"embeds\":").nth(1).unwrap_or("");
-        assert!(!embed_part.contains("How old are you"), "the question is said twice: {embed_part}");
+        assert!(embed_part.contains("How old are you"), "the question is not in the embed: {embed_part}");
+        assert!(embed_part.contains("Question 1 of 7"), "nor the progress: {embed_part}");
+        assert!(embed_part.contains("NCR Application"), "nor which application: {embed_part}");
+        assert_eq!(json.matches("How old are you").count(), 1, "the question is said twice: {json}");
     }
 
     /// One application, one button.

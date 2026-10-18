@@ -83,6 +83,9 @@ pub struct AppConfig {
     pub gwpd_panel_v2: bool,
     /// Guards the one-time staff application seed for the GWPD server.
     pub gwpd_staff_v1: bool,
+    /// Guards the one-time move of the GWPD server's pending applications to
+    /// their own channels, with their accepted roles.
+    pub gwpd_review_v3: bool,
     /// Panels left behind when an application moved channel, deleted on the
     /// next boot (see ensure_application_panels).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -550,12 +553,20 @@ pub fn migrate_nypd_to_gwpd() {
 ///
 /// Tied to this server's id rather than GUILD_ID, like the wasteland seeds.
 pub const GWPD_GUILD: &str = "1561145119384535062";
-/// The panel shares the review channel: applicants apply where the
-/// applications land.
+/// The GWPD and Staff panel (one panel, two buttons).
 const GWPD_PANEL: &str = "1561145645295865997";
 /// Where the panel was first put, before it moved to GWPD_PANEL.
 const GWPD_OLD_PANEL: &str = "1561145643370815608";
-const GWPD_REVIEW: &str = "1561145645295865997";
+/// Pending GWPD applications. Decided ones stay here too, recoloured with
+/// their outcome: no accepted or denied channel is set.
+const GWPD_REVIEW: &str = "1561145698274119790";
+/// Pending staff applications, likewise.
+const GWPD_STAFF_REVIEW: &str = "1561145699423227924";
+/// Given to an accepted GWPD applicant.
+const GWPD_ACCEPTED_ROLES: [&str; 5] =
+    ["1561145546926989353", "1561145545848782938", "1561145541184987199", "1561145530132996128", "1561145537481285754"];
+/// Given to an accepted staff applicant.
+const GWPD_STAFF_ACCEPTED_ROLES: [&str; 1] = ["1561145522436177921"];
 
 /// Runs once, guarded by gwpdSeedV1. The application takes the current police
 /// questions and requirements (age 14, a week in the server). If one is already
@@ -637,7 +648,7 @@ pub fn migrate_gwpd_panel_v2() {
 }
 
 /// The GWPD server's staff application: on the same panel as the GWPD one,
-/// with submitted staff applications going to the same channel. The questions
+/// with submitted staff applications going to their own pending channel. The questions
 /// are the general RP staff set the wasteland server uses; no age or
 /// time-in-server requirement. Runs once, guarded by gwpdStaffV1. A staff
 /// application already set up there keeps its questions, roles and
@@ -660,11 +671,38 @@ pub fn migrate_gwpd_staff_application() {
             app.panel_channel_id = GWPD_PANEL.into();
             app.panel_message_id.clear();
         }
-        app.review_channel_id = GWPD_REVIEW.into();
+        app.review_channel_id = GWPD_STAFF_REVIEW.into();
         cfg.gwpd_staff_v1 = true;
     }
     save(GWPD_GUILD);
     println!("📝 Set up the staff application alongside GWPD for {GWPD_GUILD}");
+}
+
+/// Give the GWPD server's two applications their own pending channels and
+/// their accepted roles, and keep decided applications in pending (no
+/// accepted or denied channel), where the embed is recoloured with the
+/// outcome. Applies to a server set up before these existed, and finishes a
+/// fresh setup. Runs once, guarded by gwpdReviewV3.
+pub fn migrate_gwpd_review_v3() {
+    {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(GWPD_GUILD) else { return };
+        if cfg.gwpd_review_v3 {
+            return;
+        }
+        let plan: [(&str, &str, &[&str]); 2] =
+            [(POLICE_KEY, GWPD_REVIEW, &GWPD_ACCEPTED_ROLES), ("staff", GWPD_STAFF_REVIEW, &GWPD_STAFF_ACCEPTED_ROLES)];
+        for (key, review, roles) in plan {
+            let Some(app) = cfg.apps.get_mut(key) else { continue };
+            app.review_channel_id = review.into();
+            app.accepted_role_ids = strings(roles);
+            app.accepted_channel_id.clear();
+            app.denied_channel_id.clear();
+        }
+        cfg.gwpd_review_v3 = true;
+    }
+    save(GWPD_GUILD);
+    println!("📝 Gave the GWPD and Staff applications their pending channels and accepted roles for {GWPD_GUILD}");
 }
 
 /// The wasteland factions, for one specific server.
@@ -1057,7 +1095,7 @@ mod tests {
         let gwpd = &apps[POLICE_KEY];
         assert_eq!(gwpd.label, "GWPD");
         assert_eq!(gwpd.panel_channel_id, "1561145645295865997");
-        assert_eq!(gwpd.review_channel_id, "1561145645295865997");
+        assert_eq!(gwpd.review_channel_id, "1561145698274119790");
         assert_eq!(gwpd.questions, gwpd_questions_v3());
         assert!(!gwpd.questions.iter().any(|q| q.contains("NYPD")));
     }
@@ -1094,8 +1132,32 @@ mod tests {
         let staff = &apps["staff"];
         assert_eq!(staff.label, "Staff");
         assert_eq!(staff.panel_channel_id, "1561145645295865997");
-        assert_eq!(staff.review_channel_id, "1561145645295865997");
+        assert_eq!(staff.review_channel_id, "1561145699423227924");
         assert_eq!(staff.panel_channel_id, apps[POLICE_KEY].panel_channel_id, "one shared panel");
         assert_eq!(staff.questions, wasteland_staff_questions());
+    }
+
+    /// The finished GWPD server: each application's pending channel and
+    /// accepted roles, and decided applications kept in pending.
+    #[test]
+    fn the_gwpd_applications_get_their_pending_channels_and_roles() {
+        migrate_gwpd_guild();
+        migrate_gwpd_staff_application();
+        migrate_gwpd_review_v3();
+        let apps = get_applications(GWPD_GUILD);
+        let gwpd = &apps[POLICE_KEY];
+        assert_eq!(gwpd.panel_channel_id, "1561145645295865997");
+        assert_eq!(gwpd.review_channel_id, "1561145698274119790");
+        assert_eq!(
+            gwpd.accepted_role_ids,
+            strings(&["1561145546926989353", "1561145545848782938", "1561145541184987199", "1561145530132996128", "1561145537481285754"])
+        );
+        let staff = &apps["staff"];
+        assert_eq!(staff.panel_channel_id, "1561145645295865997");
+        assert_eq!(staff.review_channel_id, "1561145699423227924");
+        assert_eq!(staff.accepted_role_ids, strings(&["1561145522436177921"]));
+        for app in [gwpd, staff] {
+            assert!(app.accepted_channel_id.is_empty() && app.denied_channel_id.is_empty(), "decided applications stay in pending");
+        }
     }
 }

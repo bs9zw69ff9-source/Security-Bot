@@ -23,6 +23,7 @@ pub fn run_migrations() {
     applications::migrate_gwpd_guild();
     applications::migrate_gwpd_panel_v2();
     applications::migrate_gwpd_staff_application();
+    applications::migrate_gwpd_review_v3();
     tickets::migrate_tickets_to_home_guild();
     tickets::migrate_ticket_category();
     tickets::migrate_wasteland_tickets();

@@ -497,10 +497,15 @@ before the rename keep working.
 | What | Channel |
 |------|---------|
 | GWPD + Staff application panel (one panel, two buttons) | `1561145645295865997` |
-| Submitted GWPD and Staff applications (review) | `1561145645295865997` |
+| Pending GWPD applications | `1561145698274119790` |
+| Pending Staff applications | `1561145699423227924` |
 | Ticket panel | `1561145649196572752` |
 
-The panel and the applications share one channel. The Staff application uses
+Accepting a GWPD application gives five roles (`1561145546926989353`,
+`1561145545848782938`, `1561145541184987199`, `1561145530132996128`,
+`1561145537481285754`); accepting a Staff one gives `1561145522436177921`.
+Decided applications stay in their pending channel: the embed turns green or
+red with an Outcome line, and the buttons are retired. The Staff application uses
 the same 14 staff questions as the wasteland server, with no age or
 time-in-server requirement. (The panel was first put
 in `1561145643370815608`; a server set up before the move has it moved over
@@ -514,13 +519,11 @@ security log leaves out who opened one and why it closed, and message logging
 doesn't copy what's said in it. The other types fall back to the server's mod
 role.
 
-Because the GWPD panel shares the review channel, applicants can see the
-review buttons there. In a channel like that only the bot owner, the server
-owner, Administrators, staff (the mod role) and holders of the application's
-accepted roles can Accept or Deny, and nobody can review their own
-application anywhere. No ticket log channel or
-category is set there yet, and the GWPD application grants no roles on
-accept until roles are added.
+Nobody can review their own application, anywhere. If a pending channel ever
+also holds an Apply panel (applicants can see it), only the bot owner, the
+server owner, Administrators, staff (the mod role) and holders of the
+application's accepted roles can Accept or Deny there. No ticket log channel or
+category is set there yet.
 
 Because Gambino and Colombo share the family panel channel, they post as a
 single combined panel with two buttons. On boot the bot reconciles any
