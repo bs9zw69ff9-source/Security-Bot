@@ -492,11 +492,13 @@ place, questions, roles and channels, and buttons on applications submitted
 before the rename keep working.
 
 **The GWPD server** (`1561145119384535062`) is set up by its own id, not by
-`GUILD_ID`, and gets the GWPD and Staff applications and a ticket panel:
+`GUILD_ID`, and gets the GWPD and Staff applications, each on its own panel,
+and a ticket panel:
 
 | What | Channel |
 |------|---------|
-| GWPD + Staff application panel (one panel, two buttons) | `1561145645295865997` |
+| GWPD application panel | `1561145645295865997` |
+| Staff application panel | `1561145643370815608` |
 | Pending GWPD applications | `1561145698274119790` |
 | Pending Staff applications | `1561145699423227924` |
 | Ticket panel | `1561145649196572752` |

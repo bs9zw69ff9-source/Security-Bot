@@ -86,6 +86,8 @@ pub struct AppConfig {
     /// Guards the one-time move of the GWPD server's pending applications to
     /// their own channels, with their accepted roles.
     pub gwpd_review_v3: bool,
+    /// Guards the one-time move of the GWPD server's staff panel to its own channel.
+    pub gwpd_staff_panel_v2: bool,
     /// Panels left behind when an application moved channel, deleted on the
     /// next boot (see ensure_application_panels).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -553,10 +555,14 @@ pub fn migrate_nypd_to_gwpd() {
 ///
 /// Tied to this server's id rather than GUILD_ID, like the wasteland seeds.
 pub const GWPD_GUILD: &str = "1561145119384535062";
-/// The GWPD and Staff panel (one panel, two buttons).
+/// The GWPD panel.
 const GWPD_PANEL: &str = "1561145645295865997";
-/// Where the panel was first put, before it moved to GWPD_PANEL.
+/// Where the GWPD panel was first put, before it moved to GWPD_PANEL. The
+/// staff panel lives there now; any old GWPD panel left in it is taken down
+/// before the staff one is posted.
 const GWPD_OLD_PANEL: &str = "1561145643370815608";
+/// The staff panel, on its own.
+const GWPD_STAFF_PANEL: &str = "1561145643370815608";
 /// Pending GWPD applications. Decided ones stay here too, recoloured with
 /// their outcome: no accepted or denied channel is set.
 const GWPD_REVIEW: &str = "1561145698274119790";
@@ -647,8 +653,8 @@ pub fn migrate_gwpd_panel_v2() {
     }
 }
 
-/// The GWPD server's staff application: on the same panel as the GWPD one,
-/// with submitted staff applications going to their own pending channel. The questions
+/// The GWPD server's staff application: its own panel, with submitted staff
+/// applications going to their own pending channel. The questions
 /// are the general RP staff set the wasteland server uses; no age or
 /// time-in-server requirement. Runs once, guarded by gwpdStaffV1. A staff
 /// application already set up there keeps its questions, roles and
@@ -667,12 +673,14 @@ pub fn migrate_gwpd_staff_application() {
             questions: wasteland_staff_questions(),
             ..Default::default()
         });
-        if app.panel_channel_id != GWPD_PANEL {
-            app.panel_channel_id = GWPD_PANEL.into();
+        if app.panel_channel_id != GWPD_STAFF_PANEL {
+            app.panel_channel_id = GWPD_STAFF_PANEL.into();
             app.panel_message_id.clear();
         }
         app.review_channel_id = GWPD_STAFF_REVIEW.into();
         cfg.gwpd_staff_v1 = true;
+        // Seeded straight into its own panel channel.
+        cfg.gwpd_staff_panel_v2 = true;
     }
     save(GWPD_GUILD);
     println!("📝 Set up the staff application alongside GWPD for {GWPD_GUILD}");
@@ -703,6 +711,40 @@ pub fn migrate_gwpd_review_v3() {
     }
     save(GWPD_GUILD);
     println!("📝 Gave the GWPD and Staff applications their pending channels and accepted roles for {GWPD_GUILD}");
+}
+
+/// Point the staff application at its own panel channel. True if it moved.
+fn move_staff_panel(cfg: &mut AppConfig) -> bool {
+    let Some(app) = cfg.apps.get_mut("staff") else { return false };
+    if app.panel_channel_id == GWPD_STAFF_PANEL {
+        return false;
+    }
+    app.panel_channel_id = GWPD_STAFF_PANEL.into();
+    // That message is the panel it shared in the GWPD channel, which stays
+    // put; the staff one is posted fresh.
+    app.panel_message_id.clear();
+    true
+}
+
+/// Give the GWPD server's staff application its own panel in
+/// 1561145643370815608, off the panel it shared with GWPD. On the next boot
+/// the GWPD panel is edited down to its one button and a staff panel is posted
+/// in the new channel. Pending staff applications still go to their own
+/// channel. Runs once, guarded by gwpdStaffPanelV2.
+pub fn migrate_gwpd_staff_panel_v2() {
+    let moved = {
+        let mut map = lock();
+        let Some(cfg) = map.get_mut(GWPD_GUILD) else { return };
+        if cfg.gwpd_staff_panel_v2 {
+            return;
+        }
+        cfg.gwpd_staff_panel_v2 = true;
+        move_staff_panel(cfg)
+    };
+    save(GWPD_GUILD);
+    if moved {
+        println!("📝 Gave the GWPD server's staff application its own panel in {GWPD_STAFF_PANEL}");
+    }
 }
 
 /// The wasteland factions, for one specific server.
@@ -1121,8 +1163,7 @@ mod tests {
         assert!(!move_gwpd_panel(&mut cfg), "a channel someone chose since is kept");
     }
 
-    /// Staff joins GWPD on the GWPD server: same channel for the panel and
-    /// for submitted applications, so the two share one panel.
+    /// Staff joins GWPD on the GWPD server, on its own panel.
     #[test]
     fn the_gwpd_server_gets_a_staff_application_beside_gwpd() {
         migrate_gwpd_guild();
@@ -1131,9 +1172,9 @@ mod tests {
         assert_eq!(apps.keys().cloned().collect::<Vec<_>>(), vec![POLICE_KEY.to_string(), "staff".to_string()], "GWPD first on the panel");
         let staff = &apps["staff"];
         assert_eq!(staff.label, "Staff");
-        assert_eq!(staff.panel_channel_id, "1561145645295865997");
+        assert_eq!(staff.panel_channel_id, "1561145643370815608");
         assert_eq!(staff.review_channel_id, "1561145699423227924");
-        assert_eq!(staff.panel_channel_id, apps[POLICE_KEY].panel_channel_id, "one shared panel");
+        assert_ne!(staff.panel_channel_id, apps[POLICE_KEY].panel_channel_id, "its own panel");
         assert_eq!(staff.questions, wasteland_staff_questions());
     }
 
@@ -1153,11 +1194,32 @@ mod tests {
             strings(&["1561145546926989353", "1561145545848782938", "1561145541184987199", "1561145530132996128", "1561145537481285754"])
         );
         let staff = &apps["staff"];
-        assert_eq!(staff.panel_channel_id, "1561145645295865997");
+        assert_eq!(staff.panel_channel_id, "1561145643370815608");
         assert_eq!(staff.review_channel_id, "1561145699423227924");
         assert_eq!(staff.accepted_role_ids, strings(&["1561145522436177921"]));
         for app in [gwpd, staff] {
             assert!(app.accepted_channel_id.is_empty() && app.denied_channel_id.is_empty(), "decided applications stay in pending");
         }
+    }
+
+    /// A staff application that shared the GWPD panel moves to its own, and
+    /// drops the shared panel's message id so a fresh one is posted.
+    #[test]
+    fn the_staff_panel_moves_off_the_shared_one() {
+        let mut cfg = AppConfig::default();
+        cfg.apps.insert(
+            "staff".into(),
+            Application { key: "staff".into(), panel_channel_id: GWPD_PANEL.into(), panel_message_id: "55".into(), ..Default::default() },
+        );
+        cfg.apps.insert(
+            POLICE_KEY.into(),
+            Application { key: POLICE_KEY.into(), panel_channel_id: GWPD_PANEL.into(), panel_message_id: "55".into(), ..Default::default() },
+        );
+        assert!(move_staff_panel(&mut cfg));
+        let staff = &cfg.apps["staff"];
+        assert_eq!(staff.panel_channel_id, "1561145643370815608");
+        assert!(staff.panel_message_id.is_empty(), "a fresh staff panel is posted");
+        assert_eq!(cfg.apps[POLICE_KEY].panel_message_id, "55", "the GWPD panel is kept and edited down");
+        assert!(!move_staff_panel(&mut cfg), "already moved");
     }
 }
