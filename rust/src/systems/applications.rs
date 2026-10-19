@@ -540,13 +540,19 @@ async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
 /// Carries its text in the content as well as the embed, for the same reason
 /// the questions do: an embed that does not render leaves a blank message, and
 /// "your application has been submitted" is not a thing to leave to chance.
+/// A one-embed notice in the applicant's DMs. An empty description sends the
+/// title alone (Discord refuses an embed with an empty description).
 async fn dm_notice(ctx: &Context, dm: ChannelId, color: u32, title: &str, description: String) {
-    let _ = dm
-        .send_message(
-            &ctx.http,
-            CreateMessage::new().embed(CreateEmbed::new().color(color).title(title).description(description)),
-        )
-        .await;
+    let _ = dm.send_message(&ctx.http, CreateMessage::new().embed(notice_embed(color, title, description))).await;
+}
+
+fn notice_embed(color: u32, title: &str, description: String) -> CreateEmbed {
+    let e = CreateEmbed::new().color(color).title(title);
+    if description.is_empty() {
+        e
+    } else {
+        e.description(description)
+    }
 }
 
 /// One interview question, all inside the embed: which application and how
@@ -632,11 +638,9 @@ async fn run_dm_application(ctx: &Context, guild_id: GuildId, user: User, app: A
         }
 
         match outcome {
+            // They cancelled it themselves, so the heading says all there is to say.
             Outcome::Cancel => {
-                dm_notice(ctx, dm, APPY_RED, "Application cancelled", format!(
-                    "All good, I've scrapped your {} application. Nothing got sent. Swing by the panel whenever you want to give it another go.",
-                    app.label
-                )).await;
+                dm_notice(ctx, dm, APPY_RED, "Application cancelled", String::new()).await;
                 return;
             }
             Outcome::Timeout => {
@@ -649,10 +653,7 @@ async fn run_dm_application(ctx: &Context, guild_id: GuildId, user: User, app: A
             Outcome::Reply(msg) => {
                 let mut content = msg.content.trim().to_string();
                 if content.to_lowercase() == "cancel" {
-                    dm_notice(ctx, dm, APPY_RED, "Application cancelled", format!(
-                        "All good, I've scrapped your {} application. Nothing got sent.",
-                        app.label
-                    )).await;
+                    dm_notice(ctx, dm, APPY_RED, "Application cancelled", String::new()).await;
                     return;
                 }
                 // Image/file-only answer.
@@ -1193,6 +1194,17 @@ mod tests {
         let questions: Vec<String> = (0..6).map(|n| format!("Question {n}")).collect();
         assert!(app_answer_cap(&questions) > 800);
         assert!(worst_case_embed_size(&questions) <= 6000);
+    }
+
+    /// A cancel notice is just its heading: no description at all, rather than
+    /// an empty one Discord would refuse.
+    #[test]
+    fn a_notice_with_nothing_to_add_is_just_its_title() {
+        let bare = serde_json::to_string(&notice_embed(APPY_RED, "Application cancelled", String::new())).unwrap();
+        assert!(bare.contains("Application cancelled"));
+        assert!(!bare.contains("description"), "{bare}");
+        let full = serde_json::to_string(&notice_embed(APPY_RED, "Application cancelled", "Timed out.".into())).unwrap();
+        assert!(full.contains("Timed out."));
     }
 
     /// The whole question prompt lives in the embed, and only once: no plain
