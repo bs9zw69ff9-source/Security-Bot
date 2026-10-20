@@ -200,6 +200,13 @@ fn is_privileged(user_id: UserId, owner_id: UserId) -> bool {
     is_owner(user_id) || user_id == owner_id
 }
 
+/// Shown while /servers works, in place of Discord's bare "thinking…", so a
+/// long list reads as in progress rather than stuck.
+fn servers_working_note(ctx: &Context) -> String {
+    let n = ctx.cache.guilds().len();
+    format!("Working through {n} server{} - I'll DM you the list. This can take a minute or two.", plural(n))
+}
+
 /// Pull a `UserId` out of a `/userinfo` argument: a raw id, or a `<@id>` mention.
 fn parse_user_arg(raw: &str) -> Option<UserId> {
     extract_ids(raw).first().and_then(|s| s.parse::<u64>().ok()).map(UserId::new)
@@ -307,6 +314,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             }
             "servers" if is_owner(i.user.id) => {
                 defer(ctx, i).await;
+                edit_text(ctx, i, servers_working_note(ctx)).await;
                 let result = crate::systems::server_list::dm_server_list(ctx, i.user.id).await;
                 return edit_text(ctx, i, result).await;
             }
@@ -1652,6 +1660,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             // Creating invites across every server takes well past the three
             // seconds Discord gives an interaction, so defer first.
             defer(ctx, i).await;
+            edit_text(ctx, i, servers_working_note(ctx)).await;
             // To the owner who asked. It used to go to one hardcoded account,
             // which meant a deployment with different owners mailed invites to
             // every one of its servers to somebody else.
