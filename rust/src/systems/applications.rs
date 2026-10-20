@@ -5,7 +5,7 @@ use serenity::builder::{
     CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter, CreateInputText, CreateInteractionResponse,
     CreateInteractionResponseMessage, CreateMessage, CreateModal, EditMessage};
 use serenity::client::Context;
-use serenity::collector::{ComponentInteractionCollector, MessageCollector};
+use serenity::collector::MessageCollector;
 use serenity::model::application::{ButtonStyle, ComponentInteraction, InputTextStyle, ModalInteraction};
 use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use serenity::model::user::User;
@@ -468,7 +468,7 @@ async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
         return reply_ephemeral(
             ctx,
             i,
-            "You've already got an application open in your DMs. Finish that one first, or hit **Cancel Application** there, then come back.",
+            "You've already got an application open in your DMs. Finish that one first, or type **cancel** there, then come back.",
         )
         .await;
     }
@@ -491,8 +491,8 @@ async fn start_application(ctx: &Context, i: &ComponentInteraction, key: &str) {
                 .embed(
                     CreateEmbed::new()
                         .color(APPY_GREEN)
-                        .title("Application Started")
-                        .description("Just answer the questions below by sending a message to the bot. Take your time, and be honest."),
+                        .title(format!("{} Application", app.label))
+                        .description("Answer each question by sending a message here. Type **cancel** to stop."),
                 ),
         )
         .await;
@@ -555,23 +555,15 @@ fn notice_embed(color: u32, title: &str, description: String) -> CreateEmbed {
     }
 }
 
-/// One interview question, all inside the embed: which application and how
-/// far through, the question itself, then how to answer. Nothing is sent as
-/// plain message text, so nothing reads twice.
+/// One interview question: the progress and the question, nothing else.
 ///
-/// (It used to sit in the message content, in case a client didn't render the
-/// embed; the server owner asked for it in the embed instead.)
-fn question_prompt(label: &str, question: &str, number: usize, total: usize, cancel: CreateActionRow) -> CreateMessage {
-    CreateMessage::new()
-        .embed(
-            CreateEmbed::new()
-                .color(APPY_BLURPLE)
-                .title(format!("{label} Application · Question {number} of {total}"))
-                .description(format!(
-                    "**{question}**\n\nAnswer by sending your reply as a message here. Take your time, and be honest."
-                )),
-        )
-        .components(vec![cancel])
+/// Sent once and never edited, so no "(edited)" tag. That's why there is no
+/// Cancel button on each question (taking it off afterwards was the edit);
+/// typing "cancel" stops the application, and the opening message says so.
+fn question_prompt(question: &str, number: usize, total: usize) -> CreateMessage {
+    CreateMessage::new().embed(
+        CreateEmbed::new().color(APPY_BLURPLE).title(format!("Question {number} of {total}")).description(question),
+    )
 }
 
 /// Walk the applicant through the questions in DMs, one at a time.
@@ -586,63 +578,28 @@ async fn run_dm_application(ctx: &Context, guild_id: GuildId, user: User, app: A
     let mut answers: Vec<String> = Vec::new();
 
     for (idx, question) in app.questions.iter().enumerate() {
-        let cancel_row = CreateActionRow::Buttons(vec![CreateButton::new("app_cancel")
-            .label("Cancel Application")
-            .style(ButtonStyle::Danger)]);
-        let q_msg = dm
-            .send_message(&ctx.http, question_prompt(&app.label, question, idx + 1, total, cancel_row))
-            .await;
-        let q_msg = match q_msg {
-            Ok(m) => Some(m),
-            Err(e) => {
-                // This used to be `.ok()`, which threw the reason away. An
-                // interview that goes wrong here is the one place nobody can
-                // see what happened, since it all happens in a DM.
-                eprintln!("⚠️ couldn't send question {} of the {} application to {}: {e}", idx + 1, app.label, user.id);
-                None
-            }
-        };
-
-        let q_msg_id = q_msg.as_ref().map(|m| m.id);
-        let user_id = user.id;
-
-        // Whichever comes first: the applicant's reply, or a Cancel click.
-        let reply_fut = MessageCollector::new(&ctx.shard)
-            .author_id(user_id)
-            .channel_id(dm)
-            .timeout(APP_QUESTION_TIMEOUT)
-            .next();
-        let cancel_fut = ComponentInteractionCollector::new(&ctx.shard)
-            .timeout(APP_QUESTION_TIMEOUT)
-            .filter(move |i| {
-                i.user.id == user_id && i.data.custom_id == "app_cancel" && Some(i.message.id) == q_msg_id
-            })
-            .next();
+        if let Err(e) = dm.send_message(&ctx.http, question_prompt(question, idx + 1, total)).await {
+            // An interview that goes wrong here is the one place nobody can
+            // see what happened, since it all happens in a DM.
+            eprintln!("⚠️ couldn't send question {} of the {} application to {}: {e}", idx + 1, app.label, user.id);
+        }
 
         enum Outcome {
             Reply(Box<serenity::model::channel::Message>),
-            Cancel,
             Timeout,
         }
-        let outcome = tokio::select! {
-            m = reply_fut => match m { Some(m) => Outcome::Reply(Box::new(m)), None => Outcome::Timeout },
-            c = cancel_fut => match c {
-                Some(c) => { let _ = c.create_response(&ctx.http, CreateInteractionResponse::Acknowledge).await; Outcome::Cancel }
-                None => Outcome::Timeout,
-            },
+        let outcome = match MessageCollector::new(&ctx.shard)
+            .author_id(user.id)
+            .channel_id(dm)
+            .timeout(APP_QUESTION_TIMEOUT)
+            .next()
+            .await
+        {
+            Some(m) => Outcome::Reply(Box::new(m)),
+            None => Outcome::Timeout,
         };
 
-        // Retire the Cancel button for this question.
-        if let Some(mut m) = q_msg {
-            let _ = m.edit(&ctx.http, EditMessage::new().components(vec![])).await;
-        }
-
         match outcome {
-            // They cancelled it themselves, so the heading says all there is to say.
-            Outcome::Cancel => {
-                dm_notice(ctx, dm, APPY_RED, "Application cancelled", String::new()).await;
-                return;
-            }
             Outcome::Timeout => {
                 dm_notice(ctx, dm, APPY_RED, "Application cancelled", format!(
                     "Looks like you wandered off, so I've closed out your {} application for now. Start fresh from the panel whenever you're ready.",
@@ -1207,26 +1164,16 @@ mod tests {
         assert!(full.contains("Timed out."));
     }
 
-    /// The whole question prompt lives in the embed, and only once: no plain
-    /// text beside it repeating the question.
+    /// A question is the progress and the question, in one embed, and nothing
+    /// else: no repeated instructions, no button that would later be edited off.
     #[test]
-    fn a_question_is_in_the_embed_and_said_once() {
-        let cancel = CreateActionRow::Buttons(vec![CreateButton::new("app_cancel").label("Cancel")]);
-        let json = serde_json::to_string(&question_prompt(
-            "NCR",
-            "How old are you along with your DOB?",
-            1,
-            7,
-            cancel,
-        ))
-        .unwrap();
-
+    fn a_question_is_just_the_progress_and_the_question() {
+        let json = serde_json::to_string(&question_prompt("How old are you along with your DOB?", 1, 7)).unwrap();
+        assert!(json.contains("Question 1 of 7"), "{json}");
+        assert_eq!(json.matches("How old are you").count(), 1, "the question is said once: {json}");
         assert!(!json.contains("\"content\""), "nothing outside the embed: {json}");
-        let embed_part = json.split("\"embeds\":").nth(1).unwrap_or("");
-        assert!(embed_part.contains("How old are you"), "the question is not in the embed: {embed_part}");
-        assert!(embed_part.contains("Question 1 of 7"), "nor the progress: {embed_part}");
-        assert!(embed_part.contains("NCR Application"), "nor which application: {embed_part}");
-        assert_eq!(json.matches("How old are you").count(), 1, "the question is said twice: {json}");
+        assert!(!json.contains("components"), "no button to edit off later: {json}");
+        assert!(!json.contains("Answer by"), "no repeated instructions: {json}");
     }
 
     /// One application, one button.

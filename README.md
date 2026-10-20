@@ -422,13 +422,13 @@ posts/refreshes the whole panel for that application's channel.
 
 **The flow, end to end:**
 
-1. An applicant clicks **Apply** on a panel. The bot DMs them an
-   "Application Started" intro, then asks the questions one at a time
-   (Appy-style: a `{label} Application` embed with `n/total.` progress and
-   a red **Cancel Application** button), waiting for a reply to each - no
+1. An applicant clicks **Apply** on a panel. The bot DMs them a
+   `{label} Application` intro that says to type **cancel** to stop, then
+   asks the questions one at a time, each a plain "Question n of total"
+   embed that is never edited afterwards, waiting for a reply to each - no
    limit on the number of questions, and image/file-only answers are
-   captured too. There's a per-question timeout (10 min); clicking Cancel
-   Application (or typing **cancel**) stops it. If their DMs are closed
+   captured too. There's a per-question timeout (10 min); typing
+   **cancel** stops it. If their DMs are closed
    they get a clear ephemeral note telling them to open DMs and retry;
    only one in-progress interview per user at a time.
 2. When the last question is answered, the completed application is posted
