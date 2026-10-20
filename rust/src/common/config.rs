@@ -65,17 +65,14 @@ pub static BOT_OWNER_IDS: Lazy<HashSet<String>> = Lazy::new(|| {
 /// Guild IDs that no destructive command may ever touch, even for a bot owner:
 /// a safety net so a mistyped or careless action can't take out a server you've
 /// marked off. Blocks `!wipe`, a destructive `!backup load`, `!rollback`, and
-/// `!failsafe` alike. Comma-separated in WIPE_BLACKLIST. Non-numeric entries
-/// are ignored.
-///
-/// One guild is always protected, baked in and not removable through the
-/// environment, on top of whatever WIPE_BLACKLIST adds.
-pub const ALWAYS_WIPE_PROTECTED: &[u64] = &[1541171641218764850];
-pub static WIPE_BLACKLIST: Lazy<HashSet<u64>> = Lazy::new(|| {
-    let mut set: HashSet<u64> = env_csv("WIPE_BLACKLIST").iter().filter_map(|s| s.parse::<u64>().ok()).collect();
-    set.extend(ALWAYS_WIPE_PROTECTED.iter().copied());
-    set
-});
+/// `!failsafe` alike. Comma-separated in WIPE_BLACKLIST, which is the only
+/// source: nothing is protected unless it's listed there.
+pub static WIPE_BLACKLIST: Lazy<HashSet<u64>> = Lazy::new(|| parse_wipe_blacklist(&env_csv("WIPE_BLACKLIST")));
+
+/// The guild IDs in a WIPE_BLACKLIST value. Non-numeric entries are ignored.
+fn parse_wipe_blacklist(entries: &[String]) -> HashSet<u64> {
+    entries.iter().filter_map(|s| s.parse::<u64>().ok()).collect()
+}
 
 /// Whether a guild is blacklisted from every destructive command (`!wipe`,
 /// a destructive `!backup load`, `!rollback`, `!failsafe`).
@@ -265,18 +262,16 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    /// The baked-in guild must be immune no matter what the environment says -
-    /// this is the "can't be turned off from `.env`" guarantee.
+    /// Only what WIPE_BLACKLIST lists is protected: an empty value protects
+    /// nothing (no guild is built in any more), and junk entries are skipped.
     #[test]
-    fn baked_in_guild_is_always_protected() {
-        assert_eq!(ALWAYS_WIPE_PROTECTED, &[1541171641218764850]);
-        assert!(ALWAYS_WIPE_PROTECTED.contains(&1541171641218764850));
-        // Merged into the live set even with WIPE_BLACKLIST unset.
-        assert!(WIPE_BLACKLIST.contains(&1541171641218764850));
-        assert!(is_wipe_protected(1541171641218764850));
+    fn the_blacklist_is_only_what_the_env_lists() {
+        assert!(parse_wipe_blacklist(&[]).is_empty(), "nothing is protected by default");
+        let listed = parse_wipe_blacklist(&["1541171641218764850".into(), "not-a-guild".into(), "42".into()]);
+        assert_eq!(listed, HashSet::from([1541171641218764850, 42]));
     }
 
-    /// A guild that is neither baked in nor in WIPE_BLACKLIST is wipeable.
+    /// A guild not in WIPE_BLACKLIST is wipeable.
     /// Probe for an id guaranteed to be outside the current set, so the test
     /// holds even if WIPE_BLACKLIST happens to be set in the environment.
     #[test]
