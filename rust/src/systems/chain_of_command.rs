@@ -8,7 +8,6 @@ use once_cell::sync::Lazy;
 use serenity::builder::{CreateEmbed, CreateMessage, EditMessage};
 use serenity::client::Context;
 use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId};
-use serenity::model::Timestamp;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -111,12 +110,16 @@ pub fn build_chain_of_command_embed(
     let existing_roles: Vec<RoleId> =
         ctx.cache.guild(guild_id).map(|g| g.roles.keys().copied().collect()).unwrap_or_default();
 
+    board_embed(title, chain_description(groups, members, &existing_roles))
+}
+
+/// The board as posted: its title and the roles with their holders, and
+/// nothing else (no footer, no timestamp).
+fn board_embed(title: &str, description: String) -> CreateEmbed {
     CreateEmbed::new()
         .color(crate::common::theme::palette::POWDER)
         .title(effective_title(title))
-        .footer(crate::common::theme::footer("Chain of Command • updates itself as roles change"))
-        .timestamp(Timestamp::now())
-        .description(chain_description(groups, members, &existing_roles))
+        .description(description)
 }
 
 /// The board's description text. Split out from the embed so it can be tested
@@ -447,6 +450,17 @@ mod tests {
         let members = [holder(1, "alice", &[100])];
         let out = chain_description(&groups, &members, &[]);
         assert_eq!(out, "<@&100>\n<@1>");
+    }
+
+    /// A board is its title and its roles. Nothing underneath: no footer and
+    /// no timestamp.
+    #[test]
+    fn a_board_is_just_its_title_and_roles() {
+        let json = serde_json::to_value(board_embed("Staff Chain of Command", "<@&1>\n<@2>".into())).unwrap();
+        assert_eq!(json["title"], "Staff Chain of Command");
+        assert_eq!(json["description"], "<@&1>\n<@2>");
+        assert!(json.get("footer").is_none(), "no footer: {json}");
+        assert!(json.get("timestamp").is_none(), "no timestamp: {json}");
     }
 
     /// The sweep has to recognise the title a board is actually posted with.
