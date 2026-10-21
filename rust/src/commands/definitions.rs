@@ -163,6 +163,7 @@ pub fn all() -> Vec<CreateCommand> {
         CreateCommand::new("userinfo")
             .description("Look up a user by ID or mention")
             .add_option(req(CommandOptionType::String, "user", "User ID or mention to look up")),
+        CreateCommand::new("serverinfo").description("This server's owner, creation date, members, channels, boosts and roles"),
         CreateCommand::new("antiraid")
             .description("Turn the raid protection on or off for this server")
             .add_option(sub("status", "Is anti-raid on, and what are its settings?"))

@@ -10,6 +10,7 @@ pub mod hidden_owner_commands;
 pub mod message_logging;
 pub mod mute;
 pub mod police_manual;
+pub mod server_info;
 pub mod server_list;
 pub mod server_logs;
 pub mod setup_helpers;

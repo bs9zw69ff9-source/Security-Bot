@@ -1668,6 +1668,23 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             edit_text(ctx, i, result).await;
         }
 
+        // ── /serverinfo ────────────────────────────────────────
+        // Anyone can look; only they see it, and so does the View Roles list.
+        "serverinfo" => {
+            let Some(e) = crate::systems::server_info::serverinfo_embed(ctx, guild_id) else {
+                return reply_text(ctx, i, "I'm still loading this server's details. Give it a few seconds and try again.").await;
+            };
+            reply(
+                ctx,
+                i,
+                CreateInteractionResponseMessage::new()
+                    .embed(e)
+                    .components(vec![crate::systems::server_info::view_roles_row()])
+                    .ephemeral(true),
+            )
+            .await;
+        }
+
         // ── /userinfo ──────────────────────────────────────────
         "userinfo" => {
             let raw = opts.str("user").unwrap_or("").to_string();
