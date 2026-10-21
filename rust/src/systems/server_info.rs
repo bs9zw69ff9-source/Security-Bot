@@ -1,6 +1,12 @@
-//! `/serverinfo`: the server's details at a glance, with a View Roles button
-//! that lists every role from the top of the hierarchy down. Both replies are
-//! ephemeral, seen only by whoever asked.
+//! `/serverinfo`: the server's details at a glance, laid out like Dyno's, with
+//! a View Roles button that lists every role from the top of the hierarchy
+//! down. Both replies are ephemeral, seen only by whoever asked.
+//!
+//! Dyno draws its card with Discord's newer "components v2" layout (dividers,
+//! small grey text). That isn't used here: serenity 0.12 can't parse such a
+//! message, and a button click carries the message with it, so View Roles
+//! would fail and the unparseable event would surface as a gateway error. An
+//! ordinary embed with the same fields in the same order is the close match.
 
 use serenity::builder::{
     CreateActionRow, CreateButton, CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage,
@@ -8,7 +14,7 @@ use serenity::builder::{
 use serenity::client::Context;
 use serenity::model::application::{ButtonStyle, ComponentInteraction};
 use serenity::model::channel::ChannelType;
-use serenity::model::guild::{PremiumTier, VerificationLevel};
+use serenity::model::guild::PremiumTier;
 use serenity::model::id::{GuildId, RoleId};
 
 use crate::common::theme::palette;
@@ -23,12 +29,52 @@ const MESSAGE_LIMIT: usize = 5600;
 /// Embeds per message.
 const MAX_PAGES: usize = 10;
 
+/// Stands in for Dyno's divider lines: an embed has no separators, so a rule
+/// of box-drawing characters marks the sections instead.
+const DIVIDER: &str = "────────────────────────";
+
+/// What the card shows.
+struct Facts {
+    owner: String,
+    members: u64,
+    roles: usize,
+    categories: usize,
+    text: usize,
+    voice: usize,
+    threads: usize,
+    boosts: u64,
+    tier: u8,
+    id: GuildId,
+    created: i64,
+}
+
+/// The card's body, laid out like Dyno's: owner, members and roles; the
+/// channel counts and threads; boosts; then the server's ID and creation date.
+fn card_description(f: &Facts) -> String {
+    let created = f.created;
+    format!(
+        "**Owner:** {}\n**Members:** {}\n**Roles:** {}\n{DIVIDER}\n\
+         **Category Channels:** {}\n**Text Channels:** {}\n**Voice Channels:** {}\n\n**Threads:** {}\n{DIVIDER}\n\
+         **Boost Count:** {} Boost{} (Tier {})\n{DIVIDER}\n\
+         ID: {}\nServer Created <t:{created}:F> (<t:{created}:R>)",
+        f.owner,
+        thousands(f.members),
+        f.roles,
+        f.categories,
+        f.text,
+        f.voice,
+        f.threads,
+        f.boosts,
+        if f.boosts == 1 { "" } else { "s" },
+        f.tier,
+        f.id,
+    )
+}
+
 /// The server info card, from the cache. `None` while the server is still
 /// arriving in the cache.
 pub fn serverinfo_embed(ctx: &Context, guild_id: GuildId) -> Option<CreateEmbed> {
     let g = ctx.cache.guild(guild_id)?;
-    let created = guild_id.created_at().unix_timestamp();
-
     let (mut text, mut voice, mut categories) = (0usize, 0usize, 0usize);
     for c in g.channels.values() {
         match c.kind {
@@ -37,43 +83,38 @@ pub fn serverinfo_embed(ctx: &Context, guild_id: GuildId) -> Option<CreateEmbed>
             _ => text += 1,
         }
     }
-    let boosts = g.premium_subscription_count.unwrap_or(0);
-    let level = match g.premium_tier {
-        PremiumTier::Tier1 => "Level 1",
-        PremiumTier::Tier2 => "Level 2",
-        PremiumTier::Tier3 => "Level 3",
-        _ => "no level yet",
+    // The owner's username, as Dyno shows it. A mention when they aren't
+    // cached: Discord still shows it as their name.
+    let owner = ctx.cache.user(g.owner_id).map(|u| u.name.to_string()).unwrap_or_else(|| format!("<@{}>", g.owner_id));
+    let facts = Facts {
+        owner,
+        members: g.member_count,
+        // Every role but @everyone, which every member has.
+        roles: g.roles.keys().filter(|r| r.get() != guild_id.get()).count(),
+        categories,
+        text,
+        voice,
+        threads: g.threads.len(),
+        boosts: g.premium_subscription_count.unwrap_or(0),
+        tier: match g.premium_tier {
+            PremiumTier::Tier1 => 1,
+            PremiumTier::Tier2 => 2,
+            PremiumTier::Tier3 => 3,
+            _ => 0,
+        },
+        id: guild_id,
+        created: guild_id.created_at().unix_timestamp(),
     };
-    // Every role but @everyone, which every member has.
-    let roles = g.roles.keys().filter(|r| r.get() != guild_id.get()).count();
-
-    let mut e = CreateEmbed::new()
-        .color(palette::AZURE)
-        .title(g.name.clone())
-        .field("🆔 Server ID", format!("`{guild_id}`"), true)
-        .field("👑 Owner", format!("<@{}>", g.owner_id), true)
-        .field("👥 Members", thousands(g.member_count), true)
-        .field("📆 Created", format!("<t:{created}:F> (<t:{created}:R>)"), false)
-        .field("💬 Channels", format!("{text} text · {voice} voice · {categories} categories"), true)
-        .field("🚀 Boosts", format!("{boosts} ({level})"), true)
-        .field("🛡️ Verification", verification(g.verification_level), true)
-        .field("😀 Emojis & stickers", format!("{} emojis · {} stickers", g.emojis.len(), g.stickers.len()), true)
-        .field("🔐 Roles", format!("{roles} - tap **View Roles** for the hierarchy"), true);
+    let mut e = CreateEmbed::new().color(palette::AZURE).title(g.name.clone()).description(card_description(&facts));
     if let Some(icon) = g.icon_url() {
         e = e.thumbnail(icon);
-    }
-    if let Some(banner) = g.banner_url() {
-        e = e.image(banner);
-    }
-    if let Some(d) = g.description.as_ref().filter(|d| !d.trim().is_empty()) {
-        e = e.description(d.clone());
     }
     Some(e)
 }
 
 /// The View Roles button under the server info card.
 pub fn view_roles_row() -> CreateActionRow {
-    CreateActionRow::Buttons(vec![CreateButton::new(VIEW_ROLES_ID).label("View Roles").emoji('🔐').style(ButtonStyle::Secondary)])
+    CreateActionRow::Buttons(vec![CreateButton::new(VIEW_ROLES_ID).label("View Roles").style(ButtonStyle::Primary)])
 }
 
 /// View Roles: every role from the top of the hierarchy down, just for the
@@ -155,17 +196,6 @@ fn pack_pages(lines: &[String]) -> (Vec<String>, usize) {
     (pages, 0)
 }
 
-fn verification(level: VerificationLevel) -> &'static str {
-    match level {
-        VerificationLevel::None => "None",
-        VerificationLevel::Low => "Low (verified email)",
-        VerificationLevel::Medium => "Medium (on Discord 5+ minutes)",
-        VerificationLevel::High => "High (in the server 10+ minutes)",
-        VerificationLevel::Higher => "Highest (verified phone)",
-        _ => "Unknown",
-    }
-}
-
 fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -230,6 +260,44 @@ mod tests {
         let (pages, dropped) = pack_pages(&lines);
         assert_eq!(dropped, 0);
         assert_eq!(pages.len(), 1);
+    }
+
+    /// The card reads like Dyno's, section by section.
+    #[test]
+    fn the_card_is_laid_out_like_dynos() {
+        let text = card_description(&Facts {
+            owner: "fki6".into(),
+            members: 51,
+            roles: 54,
+            categories: 13,
+            text: 81,
+            voice: 14,
+            threads: 36,
+            boosts: 11,
+            tier: 2,
+            id: GuildId::new(1561145119384535062),
+            created: 1_760_740_380,
+        });
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "**Owner:** fki6",
+                "**Members:** 51",
+                "**Roles:** 54",
+                DIVIDER,
+                "**Category Channels:** 13",
+                "**Text Channels:** 81",
+                "**Voice Channels:** 14",
+                "",
+                "**Threads:** 36",
+                DIVIDER,
+                "**Boost Count:** 11 Boosts (Tier 2)",
+                DIVIDER,
+                "ID: 1561145119384535062",
+                "Server Created <t:1760740380:F> (<t:1760740380:R>)",
+            ]
+        );
     }
 
     #[test]
