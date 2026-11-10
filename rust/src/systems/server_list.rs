@@ -58,7 +58,7 @@ pub async fn collect(ctx: &Context) -> Vec<Entry> {
     )
     .await;
     // Biggest first, which is usually the order you care about.
-    out.sort_by(|a, b| b.members.unwrap_or(0).cmp(&a.members.unwrap_or(0)));
+    out.sort_by_key(|b| std::cmp::Reverse(b.members.unwrap_or(0)));
     out
 }
 

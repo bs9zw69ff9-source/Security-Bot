@@ -257,7 +257,7 @@ pub fn delete(id: &str, owner: Option<&str>) -> bool {
 /// The backups `owner` can reach, newest first.
 pub fn list(owner: Option<&str>) -> Vec<Meta> {
     let mut out: Vec<Meta> = meta().values().filter(|m| reachable(m, owner)).cloned().collect();
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     out
 }
 

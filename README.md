@@ -183,6 +183,7 @@ invocation of a hidden owner command is written to the local
 | 🌐 Everyone | `/help` `/limits` |
 | 🛡️ Moderator | `/mute` `/unmute` `/kick` `/ban` `/unban` `/purge` `/lockdown` `/warn` `/warnings` `/clearwarns` |
 | 🔒 Server owner / bot owner | `/panic` (toggles lockdown on/off) `/setup` `/police` `/config` `/status` `/antiping` `/nuketest` |
+| 🔑 Bot owner only | `/servers` `/leave` |
 | 👑 Server owner only | `!backup` |
 
 `/tickets`, `/applications` and `/chainofcommand` are switched off: their

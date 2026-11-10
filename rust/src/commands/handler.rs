@@ -318,7 +318,10 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                 let result = crate::systems::server_list::dm_server_list(ctx, i.user.id).await;
                 return edit_text(ctx, i, result).await;
             }
-            "status" | "servers" => return reply_text(ctx, i, OWNER_ONLY).await,
+            "leave" if is_owner(i.user.id) => {
+                return crate::systems::leave::run(ctx, i).await;
+            }
+            "status" | "servers" | "leave" => return reply_text(ctx, i, OWNER_ONLY).await,
             "userinfo" => {
                 let raw = dissect(i.data.options()).2.str("user").unwrap_or("").to_string();
                 let Some(uid) = parse_user_arg(&raw) else {
@@ -1021,7 +1024,7 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
             for (key, emoji, label) in actions {
                 let c = check_mod_limit(&gid, &i.user.id.to_string(), key);
                 let bar = build_bar(c.used, c.limit, 8);
-                let pct = if c.limit == 0 { 0 } else { (c.used * 100) / c.limit };
+                let pct = (c.used * 100).checked_div(c.limit).unwrap_or(0);
                 let warn = if c.remaining == 0 {
                     " 🚫"
                 } else if c.remaining <= (c.limit as f64 * 0.2).ceil() as usize {
@@ -1648,6 +1651,16 @@ pub async fn handle(ctx: &Context, i: &CommandInteraction) {
                     reply_embed(ctx, i, e, true).await;
                 }
             }
+        }
+
+        // ── /leave ─────────────────────────────────────────────
+        // Bot owner only: picks a server from a dropdown and leaves it. Can
+        // run from inside any server too, not just the one being left.
+        "leave" => {
+            if !is_owner(i.user.id) {
+                return reply_text(ctx, i, OWNER_ONLY).await;
+            }
+            crate::systems::leave::run(ctx, i).await;
         }
 
         // ── /servers ───────────────────────────────────────────

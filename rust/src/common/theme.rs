@@ -399,6 +399,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
             ("/limits", "Your mod actions left in the current window"),
             ("/status", "Uptime, ping, memory, guilds *(admin)*"),
             ("/servers", "DM me an invite to every server *(bot owner)*"),
+            ("/leave", "Pick a server from a dropdown and leave it *(bot owner)*"),
             ("/help", "This menu"),
         ],
     },

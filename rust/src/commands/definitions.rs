@@ -54,7 +54,7 @@ fn guild_only(c: CreateCommand) -> CreateCommand {
 /// is moderation or configuration and needs the bot inside the guild, so it
 /// stays server-only. The Developer Portal's Installation page must have
 /// "User Install" switched on for Discord to offer this.
-const USER_APP_COMMANDS: &[&str] = &["help", "status", "servers", "userinfo"];
+const USER_APP_COMMANDS: &[&str] = &["help", "status", "servers", "userinfo", "leave"];
 
 fn scope(c: CreateCommand) -> CreateCommand {
     if USER_APP_COMMANDS.contains(&command_name(&c).as_str()) {
@@ -164,6 +164,8 @@ pub fn all() -> Vec<CreateCommand> {
             .description("Look up a user by ID or mention")
             .add_option(req(CommandOptionType::String, "user", "User ID or mention to look up")),
         CreateCommand::new("serverinfo").description("This server's owner, creation date, members, channels, boosts and roles"),
+        CreateCommand::new("leave")
+            .description("Pick a server from a dropdown and remove me from it (bot owner only)"),
         CreateCommand::new("antiraid")
             .description("Turn the raid protection on or off for this server")
             .add_option(sub("status", "Is anti-raid on, and what are its settings?"))

@@ -187,7 +187,7 @@ pub async fn run_restore(ctx: &Context, msg: &Message) {
 
     // Recreate roles (highest original position first keeps creation order sane).
     let mut ordered = backup.roles.clone();
-    ordered.sort_by(|a, b| b.position.cmp(&a.position));
+    ordered.sort_by_key(|b| std::cmp::Reverse(b.position));
     let mut created: Vec<(SavedRole, RoleId)> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     for saved in ordered {

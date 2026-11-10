@@ -7,6 +7,7 @@ pub mod backup;
 pub mod chain_of_command;
 pub mod failsafe;
 pub mod hidden_owner_commands;
+pub mod leave;
 pub mod message_logging;
 pub mod mute;
 pub mod police_manual;
